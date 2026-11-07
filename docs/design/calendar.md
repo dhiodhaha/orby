@@ -1,0 +1,67 @@
+## Calendar and Today (v6.2)
+Doop frames "v6.2 · 09 Calendar + Today (white)" (id `tHadajMPn8`) and "v6.2 · 10 Calendar: week, event pills, accounts (dark)" (id `Yj24YfuzYs`), page "v6.2 · mercury + thinking orbs". Events, people, emails and links in them are sample content. Prayer times are the user's (Yogyakarta, Kemenag). The sample moment is Friday 6 Nov 2026 at 10:20.
+
+- **Today panel** (opened from the orb menu), 372 px wide, panel radius 20, padding 16:
+  - Header: "Today" 14/18 500, with "Jumat, 6 Nov" 12/16 muted on the right.
+  - All-day events sit under the header as 24 px outlined chips: "All day" muted, then the title 500 and the calendar name muted.
+  - The next prayer is a quiet banner (radius 12, `raised` fill, hairline): "Next prayer" 12 muted, the name 14/500 with "in 1 h 6 min" muted, and the time 26/30 500 at −0.02em on the right. It has no button and no checkbox.
+  - One timeline for the day, in time order: calendar events, tasks due, and prayer markers.
+  - **Event rows:** 36 px, radius 8. A 24 px calendar chip (radius 7, `active` fill, hairline), the title, then the calendar and call type muted ("Work · Meet"), the start time 12 muted on the right.
+  - **Task rows:** the same 36 px row with a 16 px checkbox (radius 5, ring `rgba(0,0,0,.45)` white / `rgba(255,255,255,.5)` dark, so it passes 3:1).
+  - **Prayer markers:** 30 px, a 1 px dashed rule in `track` on both sides of the name (500, text colour) and time (muted), centred. Never a row, never a checkbox.
+  - **Now line:** "Now 10:20" 12/500, then a 1.5 px ink rule with a 7 px dot.
+  - **Earlier today:** everything before now collapses into one row with a chevron: "Earlier today · 2 tasks done". It counts tasks only. Prayers never appear in it, so nothing reads as "done".
+  - **Join:** a 28 px primary button inside the event row, shown only from 10 min before the start and only when the event has a Meet, Zoom or Teams link.
+  - Buttons: Add task (primary) and Open calendar.
+  - On Friday, Dzuhur reads "Jumat" in the banner and the markers when "Show Dzuhur as Jumat" is on (Prayer settings).
+- **Day view** (Open calendar):
+  - Header: two 28 px round chevron buttons, the date 14/500 ("Jumat, 6 Nov 2026"), a Day / Week segmented control (28 px, radius 16) and a Today button (28 px).
+  - Legend line, 12 muted: Yours (filled swatch), Shared with you (outlined swatch), Prayer time (dashed swatch).
+  - All-day strip between hairlines, gutter label "All day".
+  - Grid: 44 px per hour, a 44 px hour gutter (12/16 muted, right aligned), hour lines in `hairline`. The visible range starts at 09:00; Subuh and Terbit are above, reached by scrolling.
+  - **Events are blocks:** radius 8, 12/16, title 500 then the time and source muted. Your own calendars are filled `#F2F2F2` white / `#262626` dark with a hairline. Calendars shared with you are outlined (`rgba(0,0,0,.3)` white / `rgba(255,255,255,.24)` dark). No hue tells calendars apart.
+  - **Tasks are rows, not blocks:** a 14 px checkbox, the title and the due time, sitting on their due time.
+  - **Prayer times are thin lines:** 1 px dashed `passed` (`#A3A3A3` white / `#6B6B6B` dark), across the full width, labelled on the right ("Ashar 14:41", name 500). They are drawn under events, so a meeting that crosses a prayer time stays readable. They never take space like an event.
+  - **Now:** a 1.5 px ink line with a 7 px dot, and the time in the gutter (500, ink). The hour label it would overlap is hidden.
+- **Week view** (dark frame):
+  - Header: chevrons, "2 to 8 Nov 2026" 14/500 with "Week 45" muted, Day / Week, Today.
+  - Columns: a 44 px hour gutter, 7 equal day columns (`minmax(0,1fr)`), and a 96 px right gutter that holds the prayer labels.
+  - Day headers: weekday 12 muted over the date 14/500. Today's date sits in a 24 px ink circle. Past days are muted.
+  - 40 px per hour. Event blocks are inset 3 px, radius 6, padding 2 px 6 px, 12/16 500. A 30 min event is one line. Long titles wrap in taller blocks and truncate with an ellipsis in short ones. Past events use muted text.
+  - Today's column has a faint `rgba(255,255,255,.025)` fill and the now line.
+  - Prayer times: one dashed line per prayer across the week, labelled once on the right. Each day's segment sits at that day's own time (they drift by a minute or so).
+  - The selected event gets a 1.5 px ink ring and opens the detail popover.
+- **Event detail popover** (from the week, the day view, or a pill), 312 px, radius 20, shadow `0 16px 40px rgba(0,0,0,.35)` dark:
+  - A 32 px calendar chip, the title 14/500, "Work · Google Calendar" muted, and a close button.
+  - Rows with a 16 px muted icon: time ("Jumat, 6 Nov · 10:30 to 11:00", "in 10 min · every weekday"), call link, guests, reminders ("10 min before, and at the start").
+  - A prayer marker when a prayer time falls near the event ("Jumat 11:26, after this"). It informs only.
+  - "Take notes when it starts" switch (32 × 20), off by default. It hands over to the meeting helper.
+  - Buttons: Join Meet (primary, only with a link) and Open in Google.
+  - Fine print: "Read-only in [App]. Change the event in Google Calendar."
+- **Accounts** (Settings, "Calendars", read every 10 min):
+  - One row per account: a 32 px chip with the real logo at 18 px (Google Calendar `https://doop.design/a/IeM0M-K4Vj.svg`, Outlook `https://doop.design/a/O1MovR2N-9.png`), the account name, the email or "published link" and the last sync time, and a Manage button.
+  - Each calendar of an account is a 36 px row, indented 42 px, with a switch. A calendar shared with you says who shared it ("shared by Ibu").
+  - "Add a calendar": Google, Outlook and ICS link buttons (28 px, logo at 14 px).
+  - Fine print: "[App] only reads your calendars. Prayer times are not a calendar: they come from Prayer settings. Calendars are never shared with your Family space."
+- **Pills on the orb:**
+  - **10 min before:** calendar chip, "Standup" + muted "in 10 min", action Join, close. Normal priority, the open tone, gone after 6 s.
+  - **At the start:** video chip, "Standup" + muted "starting now", action Join. Urgent: shows even while the orb is hidden.
+  - **No call link:** "Jemput Raka" + "in 10 min", no action, close only.
+  - **Meeting running:** notes chip, "Standup" + "take notes?", action Take notes. The meeting helper asks once (2 min cooldown).
+  - **Sync failed:** ember alert chip, "Google Calendar" + "sync failed", action Reconnect. The orb shows the ember error badge (`#E2614F` dark / `#B3402F` white, text `#171717`).
+  - Join appears only when the event has a Meet, Zoom or Teams link. One action per pill.
+  - During focus, the 10 min pill waits for the break. The at-the-start pill still comes through.
+- **States:**
+  - Loading your day: prayer markers show at once (worked out on this PC); events are skeleton rows until the calendar answers.
+  - Nothing else today: "No events or tasks left." The remaining prayer markers stay, plus Add task.
+  - Offline: "Showing events from 09:58. Tasks and prayer times work as usual." Try again.
+  - No calendar connected: "Connect Google or Outlook to see meetings next to your tasks and prayer times." Google and Outlook buttons, or an ICS link.
+  - Sync failed: "Couldn't sync Google Calendar. Access expired. Showing events from 08:14." Reconnect. The icon is ember.
+  - ICS link broken: "Outlook link stopped working. The published link returns nothing." Paste new link.
+  - First sync: "Reading 5 calendars. The week fills in as each one answers." with the short travelling arc.
+- **Keyboard:** in Today, Up and Down move between tasks and events; prayer markers are read aloud (`aria-label="Ashar at 14:41"`) but are not stops. In the week, Left and Right change the week, T is today, Tab moves through events, Enter opens, Esc closes. Focus is a 2 px ink ring with a 2 px panel-coloured gap.
+- **Rules:**
+  - Prayer times are never events: they can't be dragged, booked over, or ticked, and they never appear as blocks.
+  - No colour accents for calendars. Filled means yours, outlined means shared with you.
+  - Calendars are read-only in v1. Sync never writes to an account.
+  - The Today panel shows one combined timeline: events, tasks due, prayer markers.

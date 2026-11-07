@@ -1,0 +1,22 @@
+- [done 2026-11-07] focus-drink: focus_panel.rs:90 holding() should be false for Run::Paused with a prayer; hide or reword the banner then (verify-focus-drink-20).
+- tasks: ellipsize the empty-state hint line for long list names (clipped_text).
+- tasks: README.md line 148 has a literal TAB where .audit/tasksfix-data should be.
+- [done 2026-11-07] all panels: pills (task due, drink) are drawn under an open panel; a pill must show above panels (z-order on show_pill).
+- calendar-today: after Enter ticks a task the focus ring lands on the previous row (calendar.rs act() keeps the old line index while an Earlier row is inserted above).
+- calendar-today: after sleep or resume, cues_between(fired_until, now) can fire "starting now" for events that already ended; drop Start cues for events whose end is past.
+- [done 2026-11-07] all panels (seen again): a pill offered while a panel is open is hidden and its ttl runs out; show pills above panels or hold them until the panel closes.
+- downloads: the hover pill "Downloading N of M · NN%" is computed once in downloads.rs on_orb_near (line 553); refresh it with the ring while the pill is up.
+- [done 2026-11-07] disk (important): crates/disk/tests/recycle.rs sends app-disk-test-* files to the real Recycle Bin on every cargo test run (135 so far). Make that test opt-in (#[ignore] or an env var) and ask the user before clearing those test items from the bin.
+- disk: "Scan stopped at 73%" uses allocated bytes but the GB figure is logical size; use one measure.
+- disk: items restored from the Recycle Bin by hand stay hidden until Scan again; recheck the moved ledger against the disk.
+- disk: a new scan opens on the last tab (Types) and arrows do nothing until a tab switch; open on Folders.
+- disk: run cargo fmt on apps/orb-proto/src/disk.rs (line 862).
+- history: the year view day detail for today covers the legend row; keep it over the grid.
+- history: Average a day rounds down; round to nearest.
+- notices: undoing a mute leaves the auto-seen rows seen (badge 2, not 3); restore their unseen state.
+- notices: the prayer pill ttl is 10 s but the third shake is at 11 s; never schedule a shake past the ttl.
+- notices: README lines 94, 134, 184 still say HeldNotices; update to the notice queue.
+- notices: tray 66 sample drink has no replacing key, so samples pile up.
+- notices: the break pill uses a bell icon; the frame shows a check chip.
+- notices: over 8 waiting rows the extra ones are counted as earlier and cannot be reached; add scrolling.
+- notices: low-space notices for different drives share one cooldown; key the cooldown per drive.

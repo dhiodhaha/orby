@@ -1,0 +1,11 @@
+[package]
+name = "app-calendar"
+version = "0.1.0"
+edition = "2021"
+description = "Calendar engine: ICS parsing, recurrence expansion and the Today timeline. No I/O, no clock."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+
+# Its own workspace, so it builds apart from the repo workspace until the app owner wires it in.

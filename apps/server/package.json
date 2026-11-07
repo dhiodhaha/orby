@@ -1,0 +1,19 @@
+{
+  "name": "app-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sync relay, membership and invites for shared spaces. Cloudflare Worker with one Durable Object per space.",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.6.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.12",
+    "wrangler": "4.158.0"
+  }
+}

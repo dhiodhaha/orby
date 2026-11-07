@@ -1,0 +1,19 @@
+[package]
+name = "app-disk"
+version = "0.1.0"
+edition = "2021"
+description = "Disk scanner (Arbor): multi-threaded walk into an arena tree, size queries, safe-to-clean candidates, Recycle Bin moves."
+license = "Apache-2.0"
+publish = false
+
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+] }

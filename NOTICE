@@ -1,0 +1,12 @@
+Orby
+Copyright 2026 dhiodhaha
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes software adapted from Paper Shaders (the liquidMetal shader),
+Copyright Paper Design, licensed under the Apache License, Version 2.0.
+https://github.com/paper-design/shaders
+The HLSL port is in apps/orb-proto/src/metal.hlsl, and the parameters follow the silver
+preset of metal-fx (MIT, Jakub Antalik).
+
+Other third-party credits are listed in THIRD-PARTY-NOTICES.md.

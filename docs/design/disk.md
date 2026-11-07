@@ -1,0 +1,72 @@
+## Disk (v6.2)
+Doop frames "v6.2 · 13 Disk: low space, scan, results (white)" and "v6.2 · 14 Disk: big folders, clean up safely (dark)". Drive sizes, folder and file names, dates and counts in them are sample content.
+
+The scanner is Arbor (`~/treesize-rea`, code name only). [App] shows its results in a small panel. It never cleans anything by itself.
+
+- **Layout:**
+  - Frame 13 has two columns: on the left, the orb stage (pills) above the Scanning panel (400 px wide). On the right, the Results panel (756 px) with two state cards under it.
+  - Frame 14 has three columns: the drill-down panel and orb stage (404 px), the confirm dialog and three state cards (340 px), and the Safe to clean panel (384 px) with its empty state.
+- **Scanning panel:**
+  - Header: "Scanning C:" (14/18, 500) with a small Stop button (28 px) on the right. Stop keeps what was counted.
+  - Big number "41%" (26/30, 500, -0.02em) with "of the 438 GB in use on C:" (12/16, muted). The percentage is bytes counted over the volume's used bytes, so it is honest without knowing the file count in advance.
+  - A 4 px progress bar: track `#D4D4D4` / `#3A3A3A`, fill ink, radius 2.
+  - Three stat cells in `raised`, radius 12: files, folders, time so far. Numbers are 500, labels muted.
+  - The current path in 12/16 muted with a folder icon, cut with an ellipsis at the end.
+  - "Biggest so far": three 36 px rows (folder chip, name, a 64 × 4 px size bar, size). It fills in while the scan runs.
+- **Results panel:**
+  - Header: a 32 px drive chip, "C: Windows" (14/18, 500), "Scanned today at 09:12 · 1,204,318 files in 0:52" (12/16 muted), and Scan again (28 px, refresh icon).
+  - Capacity bar, 8 px, radius 4: used in ink, free in `track`. Under it: "**438 GB** used, 92%" and "**38 GB** free of 476 GB".
+  - Toolbar: a 28 px back button, the breadcrumb (previous levels muted with 12 px chevrons in `passed`, the current level in 500 ink, then its size muted), and a segmented control: Folders, Files, Types.
+  - Treemap, 336 × 252, squarified, 2 px gaps, tile radius 6. Area is size. Tiles are neutral grey only (`rgba(0,0,0,.10)` down to `.035` on white; white alpha on dark), darker for bigger. No hue, no cushion shading. Labels are name (500) over size (400), both in text colour, because muted grey fails AA on the darker tiles. Nested levels show as inner tiles in `rgba(255,255,255,.45)` with a hairline. The selected tile has a 2 px ink inset ring.
+  - Folder list beside it: 36 px rows, radius 8. A 24 px folder chip (radius 7), name in 500 (with "hidden" muted when the folder is hidden), a 64 × 4 px bar relative to the biggest sibling, size (right aligned, `tnum`) and percent of the parent (muted). The tail row is "6 more items".
+  - The treemap and list share one selection. Hover or keyboard focus on a row swaps the bar for two 28 px icon buttons: Open in Explorer and Move to Recycle Bin.
+  - File types: a 10 px stacked bar of six greys (`#171717`, `#525252`, `#8A8A8A`, `#B5B5B5`, `#D4D4D4`, and `#E5E5E5` with a hairline for Other). A six-column legend with an 8 px swatch, name in 500 and size muted. Grey order goes from biggest to smallest, so the legend never relies on telling hues apart.
+- **Drill-down (Files tab):**
+  - Breadcrumb "C: › Users › You › Downloads", with Open in Explorer as a 28 px icon button at the right end.
+  - "214 files · 33.5 GB" next to the tabs.
+  - Rows are 36 px with a 4 px gap: a 16 px checkbox (radius 5), a type chip (archive, video or file), the name (500, ellipsis at the end), the modified month (muted, 58 px) and the size (56 px, right aligned). Selected rows have the `active` fill and a filled checkbox.
+  - The tail row is "208 more files", muted, with no checkbox.
+  - The selection bar under a hairline: "**2 selected** 11.3 GB", a keyboard hint, then two equal 28 px buttons: Open in Explorer and Move to Recycle Bin.
+  - Keyboard: Space selects, Enter opens a folder, Backspace goes up, Delete opens the confirm. Every row and tile takes a visible 2 px focus ring (ink on white, `#FAFAFA` on dark, offset 2 px).
+- **Confirm dialog:**
+  - Title "Move 2 items to the Recycle Bin?" with a 32 px trash chip.
+  - A sunken well (`raised`, radius 12) lists each item with its size. More than 5 items collapse to "and 12 more".
+  - Body: "You can put them back from the Recycle Bin until it is emptied."
+  - Honest muted line: "The 11.3 GB comes back only when the Recycle Bin is emptied. [App] never empties it for you, and has no permanent delete."
+  - Buttons: Cancel (quiet) and Move to Recycle Bin (primary). Focus starts on Cancel, so a stray Enter does nothing harmful.
+  - The move uses the shell (`IFileOperation` with `FOFX_RECYCLEONDELETE`). Shift+Delete opens the same confirm and still recycles.
+- **Safe to clean panel:**
+  - Header "Safe to clean" and "C:, from the 09:12 scan". The big number "23.0 GB" with "to review, nothing goes until you confirm".
+  - Each suggestion is a row with a 32 px round chip, a title (500), one or two lines of plain truth (12/16 muted), an honesty tag (20 px pill, 11 px 500), and on the right the size (500) over a Review button (28 px).
+  - Tags: "Check first" is an outline pill and is used for the user's own files. "Safe to remove" is a filled `active` pill and is used for things Windows or apps rebuild. Tags are words, never colours.
+  - Suggestions:
+    - **Downloads older than 90 days.** "38 files downloaded before 8 Aug. They are yours, so look first." Check first. Age uses the file's created or modified date, not last access, because Windows does not always update last access.
+    - **Windows temp files** (`%TEMP%` and `C:\Windows\Temp`). "Windows makes new ones when it needs them. Files in use are skipped." Safe to remove.
+    - **Browser caches** (Edge and Chrome cache folders only, never cookies, history or passwords). "Sites load a bit slower for a day. You stay signed in." Safe to remove. If the browser is open, Review says to close it first.
+  - "Not counted above" (a muted label under a hairline):
+    - **Recycle Bin**, 1.6 GB. "Already deleted. Emptying it is permanent, so that stays your call." The button is Open, which opens the Recycle Bin in Explorer.
+    - **System files.** "Update leftovers and restore points. Windows manages these itself." The button is Settings (`ms-settings:storagesense`). No size is shown, because [App] does not measure them.
+  - Footer with a shield icon: "Everything goes to the Recycle Bin. [App] never cleans by itself."
+  - Review opens the drill-down list filtered to that suggestion, with nothing pre-selected, and then the same confirm.
+- **On the orb (pills):**
+  - **Low space:** a drive chip, "**C:** has 38 GB left", one action, Find big folders (which starts the scan and opens the Scanning panel). Normal priority, the open tone, gone after 6 s. It fires when C: free space drops below 10%, checked every 10 min. It shows once, then only again after free space drops by another 5 points. It never shows while the orb is hidden or in full screen.
+  - **Scanning:** the thin progress ring around the drop (svg 64, r 30, 1.5 px hairline track, 2 px ink arc from 12 o'clock) shows bytes counted over used bytes. Hovering shows "**Scanning C:** 41% · 512,340 files" with no action. No sound.
+  - **Scan done:** "**Scan done** C: 438 GB used" with Open. It shows only if the panel is closed. The ring closes with one ripple and the done tone plays.
+  - **Moved:** "**In Recycle Bin** 2 items" with Undo, which restores the items to where they were. Normal, no sound.
+  - **Error:** an ember chip icon, "**D:** is not ready" with Retry. The orb gets the ember badge, and the pill stays 8 s. It shows only for a scan the user started.
+  - Pill text stays short so every pill fits within 300 px next to the orb.
+- **States:**
+  - Loading: the Scanning panel itself. Results fill in live; nothing waits for the end.
+  - Scan stopped: "Scan stopped at 41%. Showing the 182 GB counted so far, so some folders look smaller than they are." with Scan again.
+  - Access denied: "3 folders were skipped. Windows keeps them private, so about 0.9 GB is not counted." with Restart as admin. The scan always continues past them.
+  - Drive not ready: "Plug the drive back in, or unlock it in Explorer, then scan again." with Try again.
+  - No Recycle Bin (USB and network drives): "Files on this USB drive would be gone for good, so [App] only opens them in Explorer." Move to Recycle Bin is not offered on these drives.
+  - File in use: "Win11_24H2_x64.iso is open in another app. The other file was moved." with Try again. A partial move reports what did move.
+  - Nothing to clean: "Temp files and caches are already small. Big folders are still in Results."
+- **Rules:**
+  - Never delete automatically, never on a schedule, never permanently. The only remove action is Move to Recycle Bin, and it always confirms.
+  - [App] never empties the Recycle Bin.
+  - Labels say what removing something really costs (a slower first page load, or space that comes back only after emptying the bin). No "junk" and no scare numbers.
+  - Cloud placeholder files (OneDrive) count at their logical size but are never opened, so a scan never downloads them. Reparse points are not followed.
+  - No hue anywhere in the feature. Ember is only for errors. Sizes use `tnum`.
+  - The disk log stays on this PC. Nothing about files is synced or shared with Family.

@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "app-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "durable_objects": {
+    "bindings": [{ "name": "SPACE", "class_name": "SpaceObject" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SpaceObject"] }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "app-server",
+      // Placeholder until the real database is created; local dev and tests never read it.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // HMAC key for device tokens. Set with `wrangler secret put DEVICE_TOKEN_SECRET` in production,
+  // `.dev.vars` for `wrangler dev`; tests bind a fixed value in vitest.config.ts.
+  "secrets": { "required": ["DEVICE_TOKEN_SECRET"] }
+}

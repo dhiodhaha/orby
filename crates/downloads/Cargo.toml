@@ -1,0 +1,13 @@
+[package]
+name = "app-downloads"
+version = "0.1.0"
+edition = "2021"
+description = "Downloads engine around a yt-dlp sidecar: link detection, arguments, output parsing, queue, runner."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# Parses the JSON progress lines that yt-dlp prints from our --progress-template.
+serde_json = "1"
+
+# Its own workspace, so it builds apart from the repo workspace.

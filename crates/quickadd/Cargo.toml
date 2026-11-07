@@ -1,0 +1,10 @@
+[package]
+name = "app-quickadd"
+version = "0.1.0"
+edition = "2021"
+description = "Quick-add parser for tasks: dates, times, repeats, #list, /folder and @person, in Indonesian and English."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+

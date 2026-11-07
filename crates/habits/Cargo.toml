@@ -1,0 +1,11 @@
+[package]
+name = "app-habits"
+version = "0.1.0"
+edition = "2021"
+description = "OS-free habit engines: the focus timer (pomodoro), held notices and drink pacing."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+
+# Its own workspace, so it builds and locks apart from the repo root.

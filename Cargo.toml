@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["apps/orb-proto", "crates/core", "crates/habits", "crates/store", "crates/quickadd", "crates/calendar", "crates/downloads", "crates/disk"]
+# Wave 1 crates are built in parallel as their own workspaces (own Cargo.lock and target),
+# then moved into `members` one at a time once each is green.
+exclude = ["apps/server"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,12 @@
+# build output
+target/
+**/target/
+node_modules/
+.wrangler/
+
+# local run data, logs and audit artefacts (screenshots of the dev desktop)
+.audit/
+*.log
+orb-proto-*.txt
+.dev.vars
+.env
