@@ -20,3 +20,10 @@
 - notices: the break pill uses a bell icon; the frame shows a check chip.
 - notices: over 8 waiting rows the extra ones are counted as earlier and cannot be reached; add scrolling.
 - notices: low-space notices for different drives share one cooldown; key the cooldown per drive.
+- [done 2026-11-08] prayer: Muhammadiyah KHGT months now come from the official API (api-khgt.muhammadiyah.or.id/api/calendar/{H}?type=hijriah&end_year={H+1}, Majelis Tarjih), parsed in crates/core/src/khgt.rs, fetched by apps/orb-proto/src/khgt.rs (at launch when the cache %APPDATA%\orb-proto\khgt-calendar.json is missing or over 7 days old, then daily; no user data sent) and merged over the built-in table. Nothing reads it yet: wire puasa mode and a Hijri date line to khgt::muhammadiyah().
+- prayer: show the Hijri date (proposal): the Prayer panel header line, "Minggu, 8 Nov · 28 Jumadilawal 1448 H", plain secondary text, no badge; in Ramadan the same line reads "Ramadan, hari ke-12". Only from the fetched or built-in table, never guessed; hidden when unknown.
+- prayer: Kemenag Hijri months are still the built-in table only (Kemenag 1447). Refresh it after each sidang isbat. Follow-up: compute MABIMS ourselves (altitude 3 deg, elongation 6.4 deg in Indonesia) as a forecast, validated against the announced dates (KHGT no longer needs computing: the official API covers years ahead). Then wire puasa mode (habits.rs fasting is hard-coded false) and a "Hijri calendar: Kemenag / Muhammadiyah" choice in Settings, Prayer.
+- prayer: Muhammadiyah offsets are fitted on one Ramadan table (Feb-Mar 2026, Yogyakarta). Check them against a Muhammadiyah schedule for another season (June, November) when one is published.
+- prayer: screen sharing is not detected; only Windows presentation mode holds prayer reminders and silences the adzan (full screen silences it too). Detect a Zoom/Meet/Teams share if a reliable signal exists.
+- prayer: adzan volume (DESIGN mentions its own volume) and silence during a detected meeting.
+- prayer: a sticky "10 menit lagi" covered by the dial reappears over the open dial; consider holding it until the dial closes.

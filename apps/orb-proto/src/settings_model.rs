@@ -523,12 +523,109 @@ impl Locate {
     pub fn words(self) -> String {
         match self {
             Locate::Idle => "Uses this PC's location".into(),
-            Locate::Finding => "Finding your location...".into(),
+            Locate::Finding => "Finding your location…".into(),
             Locate::Found { lat, lng } => format!("{} · follows you", near_words(lat, lng)),
             Locate::Off => "Location is off in Windows".into(),
             Locate::Failed => "Couldn't find it just now".into(),
         }
     }
+}
+
+// ---- the prayer method and the sound at the time ----
+
+/// Whose schedule the times follow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrayerMethod {
+    #[default]
+    Kemenag,
+    Muhammadiyah,
+}
+
+impl PrayerMethod {
+    pub const ALL: [PrayerMethod; 2] = [PrayerMethod::Kemenag, PrayerMethod::Muhammadiyah];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PrayerMethod::Kemenag => "Kemenag RI",
+            PrayerMethod::Muhammadiyah => "Muhammadiyah",
+        }
+    }
+
+    /// The Prayer panel's header: "Yogyakarta · Kemenag".
+    pub fn short(self) -> &'static str {
+        match self {
+            PrayerMethod::Kemenag => "Kemenag",
+            PrayerMethod::Muhammadiyah => "Muhammadiyah",
+        }
+    }
+
+    pub fn words(self) -> &'static str {
+        match self {
+            PrayerMethod::Kemenag => "Subuh 20°, Isya 18°, +2 min ihtiyat",
+            PrayerMethod::Muhammadiyah => "Majelis Tarjih: Subuh 18°, Isya 18°",
+        }
+    }
+
+    pub fn method(self) -> app_core::prayer::Method {
+        match self {
+            PrayerMethod::Kemenag => app_core::prayer::Method::KEMENAG,
+            PrayerMethod::Muhammadiyah => app_core::prayer::Method::MUHAMMADIYAH,
+        }
+    }
+}
+
+/// What "Memasuki waktu" sounds like. Never a sound while full screen or presenting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AtTimeSound {
+    /// Diam: the pill only.
+    Silent,
+    /// Bunyi: Windows' short notification sound.
+    #[default]
+    Chime,
+    /// Adzan: an audio file you choose (nothing is bundled or downloaded).
+    Adzan,
+}
+
+impl AtTimeSound {
+    pub const ALL: [AtTimeSound; 3] = [AtTimeSound::Silent, AtTimeSound::Chime, AtTimeSound::Adzan];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AtTimeSound::Silent => "Diam",
+            AtTimeSound::Chime => "Bunyi",
+            AtTimeSound::Adzan => "Adzan",
+        }
+    }
+}
+
+/// The most a manual adjustment moves one prayer, either way.
+pub const ADJUST_MAX: i32 = app_core::prayer::MAX_ADJUST_MIN;
+
+/// "+2", "0", "−3".
+pub fn adjust_words(m: i32) -> String {
+    match m {
+        0 => "0".into(),
+        m if m > 0 => format!("+{m}"),
+        m => format!("\u{2212}{}", -m),
+    }
+}
+
+/// The file name a path ends in ("Adzan Makkah.mp3").
+pub fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Audio the adzan can play (winmm MCI opens these by extension).
+pub fn is_audio(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    matches!(ext.as_deref(), Some("mp3" | "wav"))
 }
 
 // ---- what is kept ----
@@ -542,6 +639,13 @@ pub struct Prefs {
     pub place: Place,
     /// −30 min, −10 min, at the time.
     pub prayer_reminders: [bool; 3],
+    pub prayer_method: PrayerMethod,
+    /// Minutes added to [subuh, dzuhur, ashar, maghrib, isya], −10 to +10 (a local mosque).
+    pub prayer_adjust: [i32; 5],
+    pub at_time_sound: AtTimeSound,
+    /// The adzan file, and an optional one for Subuh (its adzan differs).
+    pub adzan_file: Option<String>,
+    pub adzan_subuh_file: Option<String>,
 }
 
 impl Default for Prefs {
@@ -553,17 +657,39 @@ impl Default for Prefs {
             shortcut: Shortcut::DEFAULT,
             place: Place::default(),
             prayer_reminders: [true, true, true],
+            prayer_method: PrayerMethod::Kemenag,
+            prayer_adjust: [0; 5],
+            at_time_sound: AtTimeSound::Chime,
+            adzan_file: None,
+            adzan_subuh_file: None,
         }
     }
 }
 
-const KEYS: [&str; 6] = [
+impl Prefs {
+    /// The adzan for this prayer: Subuh's own file if there is one, else the main one.
+    pub fn adzan_for(&self, subuh: bool) -> Option<&str> {
+        let own = if subuh {
+            self.adzan_subuh_file.as_deref()
+        } else {
+            None
+        };
+        own.or(self.adzan_file.as_deref())
+    }
+}
+
+const KEYS: [&str; 11] = [
     "first_run_done",
     "show_orb_at_start",
     "theme",
     "shortcut",
     "place",
     "prayer_reminders",
+    "prayer_method",
+    "prayer_adjust",
+    "at_time_sound",
+    "adzan_file",
+    "adzan_subuh_file",
 ];
 
 fn get<T: DeserializeOwned>(m: &Map<String, Value>, key: &str) -> Option<T> {
@@ -583,6 +709,13 @@ impl Prefs {
             shortcut: get(m, "shortcut").unwrap_or(d.shortcut),
             place: get(m, "place").unwrap_or(d.place),
             prayer_reminders: get(m, "prayer_reminders").unwrap_or(d.prayer_reminders),
+            prayer_method: get(m, "prayer_method").unwrap_or(d.prayer_method),
+            prayer_adjust: get::<[i32; 5]>(m, "prayer_adjust")
+                .map(|a| a.map(|v| v.clamp(-ADJUST_MAX, ADJUST_MAX)))
+                .unwrap_or(d.prayer_adjust),
+            at_time_sound: get(m, "at_time_sound").unwrap_or(d.at_time_sound),
+            adzan_file: get(m, "adzan_file").unwrap_or(d.adzan_file),
+            adzan_subuh_file: get(m, "adzan_subuh_file").unwrap_or(d.adzan_subuh_file),
         }
     }
 
@@ -595,6 +728,11 @@ impl Prefs {
             serde_json::to_value(self.shortcut).unwrap_or(Value::Null),
             serde_json::to_value(&self.place).unwrap_or(Value::Null),
             serde_json::to_value(self.prayer_reminders).unwrap_or(Value::Null),
+            serde_json::to_value(self.prayer_method).unwrap_or(Value::Null),
+            serde_json::to_value(self.prayer_adjust).unwrap_or(Value::Null),
+            serde_json::to_value(self.at_time_sound).unwrap_or(Value::Null),
+            serde_json::to_value(&self.adzan_file).unwrap_or(Value::Null),
+            serde_json::to_value(&self.adzan_subuh_file).unwrap_or(Value::Null),
         ];
         for (k, v) in KEYS.iter().zip(vals) {
             m.insert((*k).to_string(), v);
@@ -735,6 +873,10 @@ mod tests {
                 name: "Makassar".into(),
             },
             prayer_reminders: [false, true, true],
+            prayer_method: PrayerMethod::Muhammadiyah,
+            prayer_adjust: [2, 0, 0, 1, -3],
+            at_time_sound: AtTimeSound::Adzan,
+            adzan_file: Some(r"C:\Users\me\Music\adzan.mp3".into()),
             ..p
         };
         done.write_into(&mut m);
@@ -743,6 +885,36 @@ mod tests {
         let text = serde_json::to_string(&m).unwrap();
         let back = Prefs::from_map(&serde_json::from_str(&text).unwrap());
         assert_eq!(back, done);
+    }
+
+    #[test]
+    fn prayer_choices_default_to_kemenag_and_bunyi_and_adjustments_are_clamped() {
+        let p = Prefs::default();
+        assert_eq!(p.prayer_method, PrayerMethod::Kemenag);
+        assert_eq!(p.at_time_sound, AtTimeSound::Chime);
+        assert_eq!(p.at_time_sound.name(), "Bunyi");
+        let m: Map<String, Value> = serde_json::from_str(
+            r#"{"prayer_method":"muhammadiyah","prayer_adjust":[30,-2,0,0,-99],"at_time_sound":"adzan","adzan_file":"a.mp3","adzan_subuh_file":"s.wav"}"#,
+        )
+        .unwrap();
+        let p = Prefs::from_map(&m);
+        assert_eq!(p.prayer_method, PrayerMethod::Muhammadiyah);
+        assert_eq!(p.prayer_adjust, [10, -2, 0, 0, -10]);
+        assert_eq!(p.adzan_for(true), Some("s.wav"));
+        assert_eq!(p.adzan_for(false), Some("a.mp3"));
+        let only_main = Prefs {
+            adzan_subuh_file: None,
+            ..p
+        };
+        assert_eq!(
+            only_main.adzan_for(true),
+            Some("a.mp3"),
+            "Subuh falls back to the main file"
+        );
+        assert_eq!(adjust_words(2), "+2");
+        assert_eq!(adjust_words(-3), "\u{2212}3");
+        assert_eq!(file_name(r"C:\Music\Adzan Makkah.mp3"), "Adzan Makkah.mp3");
+        assert!(is_audio("x.MP3") && is_audio("y.wav") && !is_audio("z.ogg"));
     }
 
     #[test]

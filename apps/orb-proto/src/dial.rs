@@ -130,7 +130,20 @@ fn place_dial(app: &App) {
     }
 }
 
+/// Value tags leave fast when a branch parent is aimed and come back slowly, so a slide from
+/// Drink to Focus keeps them away instead of flashing Subuh and 1250/2000 in between.
+fn aim_tags(app: &mut App) {
+    let hide = app.dial_branch.is_some() || app.dial_aim.is_some_and(has_branch);
+    let want = if hide { 0.0 } else { 1.0 };
+    if app.dial_tags.target != want {
+        (app.dial_tags.k, app.dial_tags.c) = if hide { (600.0, 50.0) } else { (110.0, 21.0) };
+        app.dial_tags.target = want;
+        start_anim(app);
+    }
+}
+
 fn render_dial(app: &mut App) {
+    aim_tags(app);
     let (w, h) = (
         px(app, ui::DIAL_W).ceil() as u32,
         px(app, ui::DIAL_H).ceil() as u32,
@@ -166,6 +179,7 @@ fn render_dial(app: &mut App) {
         app.dial_keyboard,
         branch.as_ref(),
         ring,
+        app.dial_tags.pos,
     );
     s.end(&app.g);
 }
@@ -188,6 +202,7 @@ pub fn open_dial(app: &mut App, keyboard: bool) {
     app.dial_branch = None;
     app.dial_child = None;
     app.branch_reveal.snap(0.0);
+    app.dial_tags.snap(1.0);
     app.dial_reveal.k = 190.0; // "settle"
     app.dial_reveal.c = 26.0;
     app.dial_reveal.target = 1.0;
@@ -249,6 +264,7 @@ fn close_branch(app: &mut App) {
 /// itself it opens its only child so far, Downloads.
 fn pick(app: &mut App, i: usize) {
     close_dial(app);
+    crate::orb::kick(app, 1.0);
     let name = ["tasks", "today", "prayer", "focus", "drink", "more"]
         .get(i)
         .copied()
@@ -267,6 +283,7 @@ fn pick(app: &mut App, i: usize) {
 /// A branch child does its action at once: start a session, or log a glass.
 fn pick_child(app: &mut App, parent: usize, j: usize) {
     close_dial(app);
+    crate::orb::kick(app, 1.0);
     let name = match parent {
         FOCUS => "focus",
         DRINK => "drink",
@@ -439,6 +456,7 @@ pub fn tick(app: &mut App, dt: f32) {
     let dial_was_visible = app.dial_open || app.dial_reveal.pos > 0.02;
     app.dial_reveal.step(dt);
     app.branch_reveal.step(dt);
+    app.dial_tags.step(dt);
     if dial_was_visible {
         place_dial(app);
         if !app.dial_open && app.dial_reveal.pos <= 0.02 {
@@ -455,6 +473,7 @@ pub fn tick(app: &mut App, dt: f32) {
 pub fn is_animating(app: &App) -> bool {
     !app.dial_reveal.settled(0.002)
         || (app.dial_branch.is_some() && !app.branch_reveal.settled(0.002))
+        || (app.dial_open && !app.dial_tags.settled(0.002))
 }
 
 pub unsafe extern "system" fn dial_proc(

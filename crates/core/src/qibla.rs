@@ -20,7 +20,10 @@ pub fn distance_km(lat: f64, lng: f64) -> f64 {
 
 /// 16-point compass name, e.g. "WNW".
 pub fn compass(deg: f64) -> &'static str {
-    const N: [&str; 16] = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+    const N: [&str; 16] = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+        "NW", "NNW",
+    ];
     N[(((deg % 360.0) / 22.5) + 0.5) as usize % 16]
 }
 

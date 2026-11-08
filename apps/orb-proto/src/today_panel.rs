@@ -277,6 +277,7 @@ fn button(
                 &rrect(r.0, r.1, r.2, r.3, 14.0),
                 &brush(dc, if hover { t.button_hover } else { t.button }),
             );
+            crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 14.0, 1.0);
         } else {
             dc.DrawRoundedRectangle(
                 &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 13.5),
@@ -359,205 +360,214 @@ fn draw_lines(
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
         )
     };
+    let mut shown = 0;
     for (i, ((top, h), line)) in line_tops(v).into_iter().zip(&v.lines).enumerate() {
         if top + h < geo.list_top || top > geo.list_bottom {
             continue;
         }
-        let cy = top + h / 2.0;
-        let row_hover = match hover {
-            Some(Hit::Row(j) | Hit::Check(j) | Hit::Join(j)) => j == i,
-            Some(Hit::Earlier) => matches!(line, Line::Earlier { .. }),
-            _ => false,
-        };
-        if row_hover && line.is_stop() {
-            unsafe {
-                dc.FillRoundedRectangle(&rrect(X0, top, X1, top + h, 8.0), &brush(dc, t.raised))
+        // Rows ripple in when the panel opens, top row first (motion.rs).
+        let fx = crate::motion::ripple_row("today.rows", shown);
+        shown += 1;
+        crate::motion::with_row(dc, fx, || {
+            let cy = top + h / 2.0;
+            let row_hover = match hover {
+                Some(Hit::Row(j) | Hit::Check(j) | Hit::Join(j)) => j == i,
+                Some(Hit::Earlier) => matches!(line, Line::Earlier { .. }),
+                _ => false,
             };
-        }
-        if v.focus == Some(i) {
-            // A 2 px ink ring with a 2 px panel-coloured gap.
-            unsafe {
-                dc.DrawRoundedRectangle(
-                    &rrect(X0 - 3.0, top - 3.0, X1 + 3.0, top + h + 3.0, 11.0),
-                    &ink,
-                    2.0,
-                    None,
-                )
-            };
-        }
-        match line {
-            Line::Earlier { label, open } => {
-                draw_icon(
-                    g,
-                    dc,
-                    if *open {
-                        Icon::ChevronDown
-                    } else {
-                        Icon::ChevronRight
-                    },
-                    X0 + 20.0,
-                    cy,
-                    14.0,
-                    &muted,
-                );
-                let tw = g.text_width("Earlier today", &f.body);
-                text(
-                    dc,
-                    "Earlier today",
-                    &f.body,
-                    X0 + 42.0,
-                    top,
-                    tw + 2.0,
-                    h,
-                    &ink,
-                );
-                text(
-                    dc,
-                    label,
-                    &f.body,
-                    X0 + 48.0 + tw,
-                    top,
-                    X1 - X0 - 60.0 - tw,
-                    h,
-                    &muted,
-                );
-            }
-            Line::Now(label) => {
-                let tw = g.text_width(label, &f.small_medium);
-                text(dc, label, &f.small_medium, X0 + 8.0, top, tw + 2.0, h, &ink);
-                let x = X0 + 16.0 + tw;
+            if row_hover && line.is_stop() {
                 unsafe {
-                    dc.DrawLine(pt(x, cy), pt(X1 - 8.0, cy), &ink, 1.5, None);
-                    dc.FillEllipse(&ellipse(x + 3.5, cy, 3.5), &ink);
-                }
+                    dc.FillRoundedRectangle(&rrect(X0, top, X1, top + h, 8.0), &brush(dc, t.raised))
+                };
             }
-            Line::Event {
-                title,
-                sub,
-                time,
-                join,
-                past,
-            } => {
+            if v.focus == Some(i) {
+                // A 2 px ink ring with a 2 px panel-coloured gap.
                 unsafe {
-                    let chip = rrect(X0 + 8.0, cy - 12.0, X0 + 32.0, cy + 12.0, 7.0);
-                    dc.FillRoundedRectangle(&chip, &brush(dc, t.button));
                     dc.DrawRoundedRectangle(
-                        &rrect(X0 + 8.5, cy - 11.5, X0 + 31.5, cy + 11.5, 6.5),
-                        &brush(dc, t.hair),
-                        1.0,
+                        &rrect(X0 - 3.0, top - 3.0, X1 + 3.0, top + h + 3.0, 11.0),
+                        &ink,
+                        2.0,
                         None,
+                    )
+                };
+            }
+            match line {
+                Line::Earlier { label, open } => {
+                    draw_icon(
+                        g,
+                        dc,
+                        if *open {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        },
+                        X0 + 20.0,
+                        cy,
+                        14.0,
+                        &muted,
                     );
-                }
-                draw_icon(g, dc, Icon::Today, X0 + 20.0, cy, 12.0, &muted);
-                let tw = g.text_width(time, &f.small);
-                right_text(g, dc, time, &f.small, X1 - 8.0, top, h, &muted);
-                let mut lane = X1 - 8.0 - tw - 10.0;
-                if *join {
-                    let r = join_rect(g, f, time, top, h);
-                    let fill = if hover == Some(Hit::Join(i)) {
-                        with_alpha(t.text, 0.85)
-                    } else {
-                        t.text
-                    };
-                    unsafe {
-                        dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, fill))
-                    };
-                    let on = brush(dc, t.panel);
-                    draw_icon(g, dc, Icon::Video, r.0 + 18.0, cy, 12.0, &on);
+                    let tw = g.text_width("Earlier today", &f.body);
                     text(
                         dc,
-                        "Join",
-                        &f.small_medium,
-                        r.0 + 30.0,
-                        r.1,
-                        r.2 - r.0 - 30.0,
-                        28.0,
-                        &on,
+                        "Earlier today",
+                        &f.body,
+                        X0 + 42.0,
+                        top,
+                        tw + 2.0,
+                        h,
+                        &ink,
                     );
-                    lane = r.0 - 8.0;
+                    text(
+                        dc,
+                        label,
+                        &f.body,
+                        X0 + 48.0 + tw,
+                        top,
+                        X1 - X0 - 60.0 - tw,
+                        h,
+                        &muted,
+                    );
                 }
-                draw_title_sub(
-                    g,
-                    dc,
-                    f,
+                Line::Now(label) => {
+                    let tw = g.text_width(label, &f.small_medium);
+                    text(dc, label, &f.small_medium, X0 + 8.0, top, tw + 2.0, h, &ink);
+                    let x = X0 + 16.0 + tw;
+                    unsafe {
+                        dc.DrawLine(pt(x, cy), pt(X1 - 8.0, cy), &ink, 1.5, None);
+                        dc.FillEllipse(&ellipse(x + 3.5, cy, 3.5), &ink);
+                    }
+                }
+                Line::Event {
                     title,
                     sub,
-                    X0 + 42.0,
-                    lane,
-                    top,
-                    h,
-                    if *past { &muted } else { &ink },
-                    &muted,
-                );
-            }
-            Line::Task {
-                title,
-                sub,
-                time,
-                done,
-                overdue,
-            } => {
-                checkbox(g, dc, t, X0 + 20.0, cy, *done, hover == Some(Hit::Check(i)));
-                let fmt = if *overdue { &f.small_medium } else { &f.small };
-                let tw = g.text_width(time, fmt);
-                right_text(
-                    g,
-                    dc,
                     time,
-                    fmt,
-                    X1 - 8.0,
-                    top,
-                    h,
-                    if *overdue { &ink } else { &muted },
-                );
-                draw_title_sub(
-                    g,
-                    dc,
-                    f,
+                    join,
+                    past,
+                } => {
+                    unsafe {
+                        let chip = rrect(X0 + 8.0, cy - 12.0, X0 + 32.0, cy + 12.0, 7.0);
+                        dc.FillRoundedRectangle(&chip, &brush(dc, t.button));
+                        dc.DrawRoundedRectangle(
+                            &rrect(X0 + 8.5, cy - 11.5, X0 + 31.5, cy + 11.5, 6.5),
+                            &brush(dc, t.hair),
+                            1.0,
+                            None,
+                        );
+                    }
+                    draw_icon(g, dc, Icon::Today, X0 + 20.0, cy, 12.0, &muted);
+                    let tw = g.text_width(time, &f.small);
+                    crate::ui::text_num(g, dc, time, &f.small, X1 - 8.0, top, h, &muted);
+                    let mut lane = X1 - 8.0 - tw - 10.0;
+                    if *join {
+                        let r = join_rect(g, f, time, top, h);
+                        let fill = if hover == Some(Hit::Join(i)) {
+                            with_alpha(t.text, 0.85)
+                        } else {
+                            t.text
+                        };
+                        unsafe {
+                            dc.FillRoundedRectangle(
+                                &rrect(r.0, r.1, r.2, r.3, 14.0),
+                                &brush(dc, fill),
+                            )
+                        };
+                        let on = brush(dc, t.panel);
+                        draw_icon(g, dc, Icon::Video, r.0 + 18.0, cy, 12.0, &on);
+                        text(
+                            dc,
+                            "Join",
+                            &f.small_medium,
+                            r.0 + 30.0,
+                            r.1,
+                            r.2 - r.0 - 30.0,
+                            28.0,
+                            &on,
+                        );
+                        lane = r.0 - 8.0;
+                    }
+                    draw_title_sub(
+                        g,
+                        dc,
+                        f,
+                        title,
+                        sub,
+                        X0 + 42.0,
+                        lane,
+                        top,
+                        h,
+                        if *past { &muted } else { &ink },
+                        &muted,
+                    );
+                }
+                Line::Task {
                     title,
                     sub,
-                    X0 + 42.0,
-                    X1 - 8.0 - tw - 10.0,
-                    top,
-                    h,
-                    if *done { &muted } else { &ink },
-                    &muted,
-                );
-            }
-            Line::Marker { name, time } => {
-                let nw = g.text_width(name, &f.small_medium);
-                let tw = g.text_width(time, &f.small);
-                let total = nw + 6.0 + tw;
-                let mid = (X0 + X1) / 2.0;
-                let (l, r) = (mid - total / 2.0 - 10.0, mid + total / 2.0 + 10.0);
-                let rule = brush(dc, t.track);
-                unsafe {
-                    dc.DrawLine(pt(X0 + 8.0, cy), pt(l, cy), &rule, 1.0, &dashed_stroke(g));
-                    dc.DrawLine(pt(r, cy), pt(X1 - 8.0, cy), &rule, 1.0, &dashed_stroke(g));
-                }
-                text(
-                    dc,
-                    name,
-                    &f.small_medium,
-                    mid - total / 2.0,
-                    top,
-                    nw + 2.0,
-                    h,
-                    &ink,
-                );
-                text(
-                    dc,
                     time,
-                    &f.small,
-                    mid - total / 2.0 + nw + 6.0,
-                    top,
-                    tw + 2.0,
-                    h,
-                    &muted,
-                );
+                    done,
+                    overdue,
+                } => {
+                    checkbox(g, dc, t, X0 + 20.0, cy, *done, hover == Some(Hit::Check(i)));
+                    let fmt = if *overdue { &f.small_medium } else { &f.small };
+                    let tw = g.text_width(time, fmt);
+                    right_text(
+                        g,
+                        dc,
+                        time,
+                        fmt,
+                        X1 - 8.0,
+                        top,
+                        h,
+                        if *overdue { &ink } else { &muted },
+                    );
+                    draw_title_sub(
+                        g,
+                        dc,
+                        f,
+                        title,
+                        sub,
+                        X0 + 42.0,
+                        X1 - 8.0 - tw - 10.0,
+                        top,
+                        h,
+                        if *done { &muted } else { &ink },
+                        &muted,
+                    );
+                }
+                Line::Marker { name, time } => {
+                    let nw = g.text_width(name, &f.small_medium);
+                    let tw = g.text_width(time, &f.small);
+                    let total = nw + 6.0 + tw;
+                    let mid = (X0 + X1) / 2.0;
+                    let (l, r) = (mid - total / 2.0 - 10.0, mid + total / 2.0 + 10.0);
+                    let rule = brush(dc, t.track);
+                    unsafe {
+                        dc.DrawLine(pt(X0 + 8.0, cy), pt(l, cy), &rule, 1.0, &dashed_stroke(g));
+                        dc.DrawLine(pt(r, cy), pt(X1 - 8.0, cy), &rule, 1.0, &dashed_stroke(g));
+                    }
+                    text(
+                        dc,
+                        name,
+                        &f.small_medium,
+                        mid - total / 2.0,
+                        top,
+                        nw + 2.0,
+                        h,
+                        &ink,
+                    );
+                    text(
+                        dc,
+                        time,
+                        &f.small,
+                        mid - total / 2.0 + nw + 6.0,
+                        top,
+                        tw + 2.0,
+                        h,
+                        &muted,
+                    );
+                }
+                Line::Quiet(s) => center_text(g, dc, s, &f.small, (X0 + X1) / 2.0, top, h, &muted),
             }
-            Line::Quiet(s) => center_text(g, dc, s, &f.small, (X0 + X1) / 2.0, top, h, &muted),
-        }
+        });
     }
     unsafe { dc.PopAxisAlignedClip() };
     let ms = max_scroll(v);
@@ -683,6 +693,7 @@ pub fn draw(
             None,
         );
     }
+    crate::depth::lip(g, dc, t, X0, y, X1, y + 54.0, 12.0, 1.0);
     let (name, when, at) = &v.banner;
     text(
         dc,
@@ -715,7 +726,7 @@ pub fn draw(
         18.0,
         &muted,
     );
-    right_text(g, dc, at, &f.big, X1 - 14.0, y + 12.0, 30.0, &ink);
+    crate::ui::text_num(g, dc, at, &f.big, X1 - 14.0, y + 12.0, 30.0, &ink);
 
     if let Some(c) = &v.card {
         let y = geo.card;

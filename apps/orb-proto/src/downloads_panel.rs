@@ -645,6 +645,7 @@ fn draw_card(
             None,
         );
     }
+    crate::depth::lip(g, dc, t, X0, y, X1, y + h, 14.0, 1.0);
     let title = if matches!(v.engine, EngineCard::Failed(_)) {
         "Couldn't fetch the engine"
     } else {
@@ -954,7 +955,19 @@ pub fn draw(
         );
     }
     text(dc, "Downloads", &f.panel_title, X0, 16.0, 140.0, 18.0, &ink);
-    right_text(g, dc, &v.count, &f.small, X1, 17.0, 16.0, &muted);
+    // "2 of 5 · 42%": the count and percent roll on the quick spring as downloads move.
+    crate::motion::rolling_text_right(
+        g,
+        dc,
+        "downloads.count",
+        &v.count,
+        crate::motion::Roll::Quick,
+        &f.small,
+        X1,
+        17.0,
+        16.0,
+        &muted,
+    );
     if v.engine != EngineCard::None {
         draw_card(g, dc, t, f, v, hover);
     }

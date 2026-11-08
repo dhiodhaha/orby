@@ -16,6 +16,9 @@ pub enum RecycleError {
     AccessDenied,
     /// Not an absolute path to a file or folder below a drive root.
     InvalidPath,
+    /// Refused before the shell saw it: on the never-touch list, outside its cleaning rule,
+    /// through a junction, or the profile, AppData, Windows or Program Files folder itself.
+    Refused,
     /// The user said no at a shell prompt, for example when an item is too big to recycle.
     Aborted,
     /// Any other shell result code.
@@ -59,6 +62,9 @@ fn recycle_one(p: &Path) -> Result<(), RecycleError> {
     // understood by SHFileOperationW, so either would make it act on the wrong thing.
     if !p.is_absolute() || p.parent().is_none() || s.contains(['*', '?']) || s.starts_with(r"\\?\") {
         return Err(RecycleError::InvalidPath);
+    }
+    if crate::rules::holds_system_folder(p) {
+        return Err(RecycleError::Refused);
     }
     match p.symlink_metadata() {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(RecycleError::NotFound),

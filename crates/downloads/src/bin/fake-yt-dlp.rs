@@ -6,6 +6,7 @@
 //! - `private0001`: a private video (exit 1)
 //! - `diskfull001`: disk full part way through (exit 1)
 //! - `slowslow001`: a long download for pause and cancel tests (exit 0 if left alone)
+//! - `flakyflaky0`: warnings, then an exit without an ERROR line (exit 1)
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -55,6 +56,11 @@ fn main() {
             println!("[info] {id}: Downloading 1 format(s): 18");
             download(&args, title, &id, "mp4", 25_000, 41_200, 5);
             eprintln!("ERROR: unable to write data: [Errno 28] No space left on device");
+            exit(1);
+        }
+        "flakyflaky0" => {
+            eprintln!("WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to the command line. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one");
+            eprintln!("WARNING: [youtube] {id}: Some web client https formats have been skipped as they are missing a url");
             exit(1);
         }
         "slowslow001" => {

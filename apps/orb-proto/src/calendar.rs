@@ -150,7 +150,7 @@ fn fetch(src: &Source) -> Result<String, (Fail, String)> {
                 .map_err(|e| {
                     (
                         Fail::Broken,
-                        format!("Could not open {} ({})", src.label(), e.kind()),
+                        format!("Couldn't open {} ({})", src.label(), e.kind()),
                     )
                 })
         }
@@ -175,7 +175,7 @@ fn fetch(src: &Source) -> Result<String, (Fail, String)> {
                 Err(ureq::Error::Status(code, _)) => {
                     Err((Fail::Broken, format!("The link answered {code}")))
                 }
-                Err(_) => Err((Fail::Offline, "Could not reach the calendar".to_string())),
+                Err(_) => Err((Fail::Offline, "Couldn't reach the calendar".to_string())),
             }
         }
     }
@@ -524,7 +524,7 @@ fn card(sync: &Sync, reading: bool, offset: i32) -> Option<Card> {
         }),
         Sync::Loading => Some(Card {
             icon: Icon::Clock,
-            title: "Loading your day".into(),
+            title: "Loading your day…".into(),
             body: vec![
                 "Prayer times are worked out on this PC.".into(),
                 "Events fill in when the calendar answers.".into(),
@@ -540,11 +540,12 @@ fn card(sync: &Sync, reading: bool, offset: i32) -> Option<Card> {
             icon: Icon::CloudOff,
             title: "Offline".into(),
             body: vec![
-                last_ok.map_or("Could not reach the calendar.".into(), from),
+                last_ok.map_or("Couldn't reach the calendar.".into(), from),
                 "Tasks and prayer times work as usual.".into(),
             ],
+            // While it reads again the button stays, quiet, as "Retrying…".
             buttons: if reading {
-                Vec::new()
+                vec![(None, "Retrying…".into())]
             } else {
                 vec![(Some(Hit::Retry), "Try again".into())]
             },
@@ -555,13 +556,13 @@ fn card(sync: &Sync, reading: bool, offset: i32) -> Option<Card> {
             last_ok,
         } => Some(Card {
             icon: Icon::Info,
-            title: "The calendar link stopped working".into(),
+            title: "Couldn't read the calendar link".into(),
             body: vec![
                 format!("{detail}."),
                 last_ok.map_or("Paste a new link, or try again later.".into(), from),
             ],
             buttons: if reading {
-                Vec::new()
+                vec![(None, "Retrying…".into())]
             } else {
                 vec![
                     (Some(Hit::Retry), "Try again".into()),
@@ -775,7 +776,7 @@ pub fn click(app: &mut App, h: Hit) {
             }
         }
         Hit::Row(_) => {}
-        Hit::AddTask => tasks::open(app, Some(Selection::Today)),
+        Hit::AddTask => tasks::add_from_today(app),
         Hit::Paste => add_link_from_clipboard(app),
         Hit::Retry => read_now(app),
     }

@@ -26,30 +26,42 @@ Everything is pure logic except `runner`, which spawns the process. The only tim
 - `FormatPrefs { save_as, max_height, audio }` with `for_link(&link)` (music sites always start as audio), `video()`, `audio()`
 
 **args**: the yt-dlp command line.
-- `Request { link, format, folder }`, `build_args(&Request, ffmpeg: &Path) -> Vec<OsString>`
+- `Request { link, format, folder }`, `build_args(&Request, ffmpeg: &Path, js: Option<&JsRuntime>) -> Vec<OsString>`
 - Format selectors with `height<=N` (falls back to the next lower height), MP4 merge and remux, or
-  `-x --audio-format`; `--newline`, `--no-playlist`, `--no-colors`, a JSON `--progress-template`
-  (`[orb] {"title":..,"progress":..}`), `--ffmpeg-location`, `-P folder`,
+  `-x --audio-format`; `--newline`, `--no-playlist`, `--no-colors`, `--encoding utf-8` (the exe ignores
+  PYTHONUTF8 when piped), a JSON `--progress-template` (`[orb] {"title":..,"progress":..}`), backing-off
+  retries (`RETRY_ARGS`: `--extractor-retries 5`, `--retry-sleep` exp=1:8 for http, fragment and
+  extractor), `--js-runtimes NAME:PATH` when one was found, `--ffmpeg-location`, `-P folder`,
   `-o "%(title).150B [%(id)s].%(ext)s"`, then `--` and the URL.
+
+**js**: a JavaScript runtime for YouTube (yt-dlp wiki "EJS"; without one formats go missing).
+- `find_js_runtime(bin, PATH) -> Option<JsRuntime { kind: Deno | Node | Bun, path }>`: deno next to
+  yt-dlp, else deno, node, bun on PATH (fnm's per-shell folders skipped). `JsRuntime::arg()` is `node:C:\Program Files\nodejs\node.exe`.
 
 **parse**: reading yt-dlp output.
 - `parse_line(&str) -> Line { Progress, Destination, AlreadyDownloaded, Error(ErrorKind), Other }`
 - `classify_error(&str) -> ErrorKind { Private, Removed, Unsupported, DiskFull, Offline, FfmpegMissing, Other }`
 - `Tracker::feed(line) -> Vec<Update>` adds up a merge's separate video and audio files into job
-  progress; `Tracker::finish(exit_ok, size_of) -> Outcome { Done { path, size }, Failed(kind) }`
-- `Update { Title, Progress(Progress { downloaded, total, speed, eta }), Destination, Finished(Outcome) }`
+  progress; `Tracker::finish(exit_ok, size_of) -> Outcome { Done { path, size }, Failed(kind) }`;
+  `Tracker::error_text()` is the first ERROR line, else the last two WARNING lines (capped at 400 chars)
+- `Update { Title, Progress(Progress { downloaded, total, speed, eta }), Destination, ErrorText(String), Finished(Outcome) }`;
+  the runner sends `ErrorText` (yt-dlp's words, or the exit status) right before every failed `Finished`
 
 **queue**: the state machine.
 - `JobState { Waiting, Reading, Running(Progress), Paused { .. }, Done { path, size, at }, Failed { kind, downloaded, total } }`
 - `Queue::add`, `start_ready() -> Vec<(JobId, Request)>` (at most `MAX_RUNNING = 2` active),
-  `apply(id, Update, now)`, `pause`, `resume`, `retry`, `retry_offline`, `cancel -> Cancelled { stop_process, delete }`,
+  `apply(id, Update, now) -> bool`, `pause`, `resume`, `retry`, `retry_offline`, `cancel -> Cancelled { stop_process, delete }`,
   `set_format` (waiting only), `set_folder` (disk full: Change folder), `clear_done`, `saved(&link)`,
   `counts()`, `overall() -> Overall { files_done, files, bytes_done, bytes_total }` with `fraction()`,
   and `ring() -> Ring { Hidden, Reading, Progress { fraction, tone: Ink | Grey | Ember } }`.
 - Updates for jobs that are no longer active are ignored, so a killed process cannot undo a pause.
+- A run's first `Failed(Other)` does not fail the job: `apply` returns true, the job stays active with
+  its progress, and the caller starts the process again after a short pause. A second one in a row
+  fails it. Each start from Waiting (including Retry) earns one such silent retry. `Job::error_text`
+  keeps the last failure's words for the log.
 
 **runner**: the only I/O.
-- `Sidecar { yt_dlp, ffmpeg }`, `start(&Sidecar, &Request, on_update) -> io::Result<Download>`;
+- `Sidecar { yt_dlp, ffmpeg, js: Option<JsRuntime> }` (a runtime gone since is skipped), `start(&Sidecar, &Request, on_update) -> io::Result<Download>`;
   `on_update` runs on a background thread and always ends with one `Update::Finished`.
 - `Download::stop()` kills the process tree (`taskkill /T` on Windows, since the PyInstaller exe and
   ffmpeg are child processes). `delete_partial(&files)` removes a cancelled job's files and their `.part` and `.ytdl`.
@@ -64,7 +76,7 @@ Everything is pure logic except `runner`, which spawns the process. The only tim
 
 ## Verified
 `src/bin/fake-yt-dlp.rs` checks the arguments and replays recorded yt-dlp output (success with a
-merge, private video, disk full, and a slow download for pause and cancel). The integration tests in
+merge, private video, disk full, warnings then exit 1 without an ERROR, and a slow download for pause and cancel). The integration tests in
 `tests/runner.rs` run it as a real child process through `runner::start` and the queue. Nothing real
 is downloaded; test files live under `target/tmp`.
 
@@ -72,4 +84,4 @@ is downloaded; test files live under `target/tmp`.
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"; $env:CARGO_TARGET_DIR = "C:\Users\dopamine\dev\clippy\crates\downloads\target"; Set-Location C:\Users\dopamine\dev\clippy\crates\downloads; cargo test; cargo clippy --all-targets -- -D warnings
 ```
 
-Result: 40 tests pass (34 unit, 6 end to end), clippy clean with `-D warnings`.
+Result: 50 tests pass (43 unit, 7 end to end), clippy clean with `-D warnings`.

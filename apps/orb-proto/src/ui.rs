@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
-//! Pill and dial drawing, on the v6.2 tokens (true neutral, Segoe UI Variable until Inter is bundled).
+//! Pill and dial drawing on the v6.3 tokens: true neutral, Inter Variable (bundled, gfx.rs) with
+//! tabular figures everywhere, and the shared number column helper `text_num`.
 
 use windows::core::w;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -155,6 +156,36 @@ impl Fonts {
     }
 }
 
+// ---- numbers ----
+
+/// The frame's percent column: 44 px, 12/16 muted, right aligned.
+#[allow(dead_code)] // for the Disk lists (another module owns them)
+pub const NUM_COL_PCT: f32 = 44.0;
+/// The frame's size column: 64 px, 13/16 500, right aligned.
+#[allow(dead_code)] // for the Disk lists (another module owns them)
+pub const NUM_COL_SIZE: f32 = 64.0;
+/// The gap between number columns.
+pub const NUM_COL_GAP: f32 = 10.0;
+
+/// Draws a number (a size, time, count or percent) with its right edge at `right`, so digits line
+/// up row to row. All text has tabular figures on (gfx.rs applies `tnum` to every layout), so a
+/// right-aligned column is all a number needs. Use one of the `NUM_COL_*` widths to lay out the
+/// column; for a value that should roll when it changes, use `motion::rolling_text_right`.
+///
+/// `text_num(g, dc, "182 GB", &f.title, right, y, h, &ink)`
+pub fn text_num(
+    g: &Shared,
+    dc: &ID2D1DeviceContext,
+    s: &str,
+    fmt: &IDWriteTextFormat,
+    right: f32,
+    y: f32,
+    h: f32,
+    b: &ID2D1SolidColorBrush,
+) {
+    right_text(g, dc, s, fmt, right, y, h, b);
+}
+
 // ---- icons (Lucide-style, drawn on a 24 grid, stroke 1.6) ----
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -223,6 +254,8 @@ pub enum Icon {
     /// A map pin: the place for prayer times.
     Pin,
     Keyboard,
+    /// A cog: Settings.
+    Gear,
 }
 
 impl Icon {
@@ -656,6 +689,32 @@ pub fn draw_icon(
                     line((x - 2.5, knob + 2.0), (x + 2.5, knob + 2.0));
                 }
             }
+            Icon::Gear => {
+                // Eight teeth with flat tops and an open hub, closed by hand so the stroke has no seam.
+                let pts: Vec<(f32, f32)> = (0..8)
+                    .flat_map(|i| {
+                        let a = i as f32 * 45.0;
+                        [
+                            (7.2, a - 19.0),
+                            (9.6, a - 9.0),
+                            (9.6, a + 9.0),
+                            (7.2, a + 19.0),
+                        ]
+                    })
+                    .map(|(r, d): (f32, f32)| {
+                        let t = d.to_radians();
+                        (12.0 + r * t.sin(), 12.0 - r * t.cos())
+                    })
+                    .collect();
+                let geo = path(g, p(pts[0].0, pts[0].1), false, |k| {
+                    for &(x, y) in pts.iter().skip(1) {
+                        line_to(k, p(x, y));
+                    }
+                    line_to(k, p(pts[0].0, pts[0].1));
+                });
+                dc.DrawGeometry(&geo, b, sw, &st);
+                dc.DrawEllipse(&ellipse(cx, cy, 3.0 * s), b, sw, &st);
+            }
             Icon::Layers => {
                 let geo = path(g, p(12.0, 3.5), false, |k| {
                     line_to(k, p(21.0, 8.0));
@@ -806,6 +865,8 @@ pub enum PillAction {
     OpenSettings,
     /// Puts the shortcut back to the one before the last Save.
     UndoShortcut,
+    /// "Memasuki waktu": stops the adzan that is playing (Hentikan).
+    StopAdzan,
 }
 
 impl PillAction {
@@ -942,6 +1003,7 @@ pub fn draw_pill(
             PILL_H / 2.0 - 0.5,
         );
         dc.DrawRoundedRectangle(&hair, &brush(dc, t.hair), 1.0, None);
+        crate::depth::lip(g, dc, t, left, top, right, top + PILL_H, PILL_H / 2.0, 1.0);
         if ca <= 0.0 {
             return;
         }
@@ -1015,6 +1077,17 @@ pub fn draw_pill(
             dc.FillRoundedRectangle(
                 &rrect(ox + ax, top + 8.0, ox + ax + aw, top + 40.0, 16.0),
                 &brush(dc, with_alpha(bg, ca)),
+            );
+            crate::depth::lip(
+                g,
+                dc,
+                t,
+                ox + ax,
+                top + 8.0,
+                ox + ax + aw,
+                top + 40.0,
+                16.0,
+                ca,
             );
             text(
                 dc,
@@ -1090,7 +1163,7 @@ pub struct DialBranch<'a> {
     pub reveal: f32,
 }
 
-pub const DIAL_W: f32 = 360.0;
+pub const DIAL_W: f32 = 440.0;
 pub const DIAL_H: f32 = 360.0;
 pub const DIAL_R: f32 = 92.0; // chip centres
 pub const DIAL_BAND: f32 = 46.0;
@@ -1288,6 +1361,7 @@ pub fn draw_dial(
     keyboard: bool,
     branch: Option<&DialBranch>,
     focus_ring: Option<f32>,
+    tags: f32,
 ) {
     let (cx, cy) = dial_center(mirrored);
     let rv = reveal.clamp(0.0, 1.1);
@@ -1371,10 +1445,12 @@ pub fn draw_dial(
             );
 
             // Tag outside the band: the live value, or the name and value when aimed.
-            // While a branch is open the main tags step aside for it.
-            if branch.is_some() {
+            // While a branch parent is aimed or open the main tags step aside for it.
+            let tag_e = e * tags.clamp(0.0, 1.0);
+            if tag_e <= 0.01 {
                 continue;
             }
+            let e = tag_e;
             let show_name = on || keyboard;
             if it.value.is_empty() && !show_name {
                 continue;

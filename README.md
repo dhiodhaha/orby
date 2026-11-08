@@ -120,6 +120,7 @@ Apache License 2.0. See [`LICENSE`](LICENSE), [`NOTICE`](NOTICE) and [`THIRD-PAR
 
 Orby stands on other people's work. Full notices are in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
+- **[Inter](https://github.com/rsms/inter)** by Rasmus Andersson and the Inter Project Authors (SIL OFL 1.1): the typeface, bundled with the app.
 - **[Paper Shaders](https://github.com/paper-design/shaders)** (Apache-2.0): the liquid-metal shader is a port of `liquidMetal`.
 - **metal-fx** by Jakub Antalik (MIT): the silver preset the metal parameters follow.
 - **[Libraries.dev](https://github.com/Jakubantalik/Libraries.dev)** by Jakub Antalik (MIT): the spring presets and the liquid "bud" idea, and a high bar for craft.

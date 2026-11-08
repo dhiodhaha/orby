@@ -72,7 +72,7 @@ pub fn add_tray(hwnd: HWND) {
             hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
             ..Default::default()
         };
-        let tip: Vec<u16> = "[App] orb prototype".encode_utf16().collect();
+        let tip: Vec<u16> = "Orby".encode_utf16().collect();
         nid.szTip[..tip.len()].copy_from_slice(&tip);
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
     }

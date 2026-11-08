@@ -84,6 +84,7 @@ This section is meant to replace "Notice stack (v3.1)" in DESIGN.md. The v3.1 nu
 - **No loading or error state:** the list is local. If the notice store fails to open, the panel shows the empty state and the error goes to the log.
 
 ### Quiet rules
+- **Prayer reminders (2026-11-07, the user's rule).** "30 menit lagi" and "10 menit lagi" pass every quiet time except presenting: focus, full screen (silently, the orb shows for the pill and hides again), a pause, and the orb hidden for a full-screen app. Presenting (Windows presentation mode) holds them; one that cannot show within 2 min of its moment is dropped, and a newer one for the same prayer replaces it, so a reminder is never shown late. "10 menit lagi" stays until you close it: covered by a panel or the dial it comes back, and a new normal notice takes the front for its turn and then gives it back. Hidden by you, prayer reminders are skipped. Screen sharing is not detected yet (see followups).
 - **Full screen or presenting.** This applies when `SHQueryUserNotificationState` reports busy, presentation mode or Do not disturb, or when the foreground window is full screen. It is checked on every foreground change. Only a full-screen window on the orb's own monitor counts.
   - The orb hides itself. Normal and quiet notices queue without a sound.
   - Urgent still shows, with no sound and no shake. Adzan stays silent. The orb hides again when the pill closes.
@@ -112,6 +113,7 @@ This section is meant to replace "Notice stack (v3.1)" in DESIGN.md. The v3.1 nu
 |---|---|---|---|
 | Prayer at the time (urgent) | Shows | Silent | Shows |
 | Meeting starting (urgent) | Shows | Silent | Shows |
+| Prayer −30 / −10 min (normal) | Shows | Silent | Skipped if you hid the orb |
 | Task due, drink (normal) | Waits | Waits | Badge |
 | Family activity (quiet) | List | List | List |
 | A muted source | Off | Off | Off |

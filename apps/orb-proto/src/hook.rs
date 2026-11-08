@@ -81,6 +81,23 @@ fn window_rect(h: HWND) -> RECT {
     r
 }
 
+/// A window rect cut to the window's region: mid-switch the panel window is larger than the shape
+/// on screen, and a click beside that shape is outside.
+fn shaped_rect(h: HWND) -> RECT {
+    let r = window_rect(h);
+    let mut b = RECT::default();
+    // SIMPLEREGION or COMPLEXREGION; no region (or an error) keeps the whole window.
+    if unsafe { windows::Win32::Graphics::Gdi::GetWindowRgnBox(h, &mut b) }.0 < 2 {
+        return r;
+    }
+    RECT {
+        left: r.left + b.left,
+        top: r.top + b.top,
+        right: (r.left + b.right).min(r.right),
+        bottom: (r.top + b.bottom).min(r.bottom),
+    }
+}
+
 /// Keeps the hook's copy of the drop centre and our window rects current.
 pub fn update_hook(app: &App) {
     let (cx, cy) = orb_center(app);
@@ -90,7 +107,7 @@ pub fn update_hook(app: &App) {
             window_rect(app.hwnd),
             window_rect(app.dial_hwnd),
             window_rect(app.pill_hwnd),
-            window_rect(app.panel_hwnd),
+            shaped_rect(app.panel_hwnd),
             window_rect(app.dl.menu_hwnd()),
         ];
     }

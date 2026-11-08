@@ -16,6 +16,25 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 pub use windows_numerics::Vector2;
 
+use std::cell::RefCell;
+
+/// Inter Variable 4.1 (SIL OFL 1.1, assets/fonts/OFL.txt), bundled so every machine draws the
+/// same type. Loaded from memory by `load_inter`; nothing is installed on the system.
+static INTER_TTF: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
+/// The family names DirectWrite may give the bundled font. With its weight-width-slope model it
+/// names the family after the optical size instances ("Inter Variable Text"); the font's own
+/// name ID 1 is "Inter Variable".
+const INTER_FAMILIES: [windows::core::PCWSTR; 2] =
+    [w!("Inter Variable Text"), w!("Inter Variable")];
+const FALLBACK_FAMILY: windows::core::PCWSTR = w!("Segoe UI Variable Text");
+
+thread_local! {
+    /// The factory and the shared typography (tnum + cv11) for `text`, which has no `Shared`.
+    /// Every window draws on the one UI thread.
+    static TEXT: RefCell<Option<(IDWriteFactory, Option<IDWriteTypography>)>> =
+        const { RefCell::new(None) };
+}
+
 pub struct Shared {
     pub d3d: ID3D11Device,
     pub ctx: ID3D11DeviceContext,
@@ -24,6 +43,89 @@ pub struct Shared {
     pub d2f: ID2D1Factory1,
     pub dc: ID2D1DeviceContext,
     pub dw: IDWriteFactory,
+    /// The bundled Inter, or None when it could not be loaded (then Segoe UI Variable is used).
+    inter: Option<(IDWriteFontCollection, windows::core::PCWSTR)>,
+    /// Tabular figures and the single-storey a (cv11) on every layout.
+    typography: Option<IDWriteTypography>,
+    /// One line for the log: which face text uses and why.
+    pub font_note: String,
+}
+
+/// Loads the embedded Inter Variable through an in-memory font file loader into its own font
+/// collection (IDWriteFactory5, Windows 10 1703 and later).
+fn load_inter(dw: &IDWriteFactory) -> Result<(IDWriteFontCollection, windows::core::PCWSTR)> {
+    unsafe {
+        let f5: IDWriteFactory5 = dw.cast()?;
+        let loader = f5.CreateInMemoryFontFileLoader()?;
+        f5.RegisterFontFileLoader(&loader)?;
+        // The bytes are 'static, so the loader can point at them instead of copying 860 KB; the
+        // factory stands in as the owner object that keeps the reference alive.
+        let owner: windows::core::IUnknown = f5.cast()?;
+        let file = loader.CreateInMemoryFontFileReference(
+            &f5,
+            INTER_TTF.as_ptr() as *const _,
+            INTER_TTF.len() as u32,
+            &owner,
+        )?;
+        let builder = f5.CreateFontSetBuilder()?;
+        builder.AddFontFile(&file)?;
+        let set = builder.CreateFontSet()?;
+        let coll = f5.CreateFontCollectionFromFontSet(&set)?;
+        let coll: IDWriteFontCollection = coll.cast()?;
+        // The family must be there, or every format would silently fall back to the system font.
+        for family in INTER_FAMILIES {
+            let mut index = 0u32;
+            let mut found = windows::core::BOOL::default();
+            coll.FindFamilyName(family, &mut index, &mut found)?;
+            if found.as_bool() {
+                return Ok((coll, family));
+            }
+        }
+        Err(windows::core::Error::from(E_FAIL))
+    }
+}
+
+/// OpenType tag from four ASCII bytes (DWRITE_MAKE_OPENTYPE_TAG).
+const fn ot_tag(t: &[u8; 4]) -> u32 {
+    (t[0] as u32) | (t[1] as u32) << 8 | (t[2] as u32) << 16 | (t[3] as u32) << 24
+}
+
+fn make_typography(dw: &IDWriteFactory) -> Option<IDWriteTypography> {
+    unsafe {
+        let ty = dw.CreateTypography().ok()?;
+        for tag in [DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES.0, ot_tag(b"cv11")] {
+            let _ = ty.AddFontFeature(DWRITE_FONT_FEATURE {
+                nameTag: DWRITE_FONT_FEATURE_TAG(tag),
+                parameter: 1,
+            });
+        }
+        Some(ty)
+    }
+}
+
+/// A text layout with the shared typography applied to all of it.
+fn new_layout(
+    dw: &IDWriteFactory,
+    ty: Option<&IDWriteTypography>,
+    s: &str,
+    fmt: &IDWriteTextFormat,
+    w: f32,
+    h: f32,
+) -> Option<IDWriteTextLayout> {
+    let t: Vec<u16> = s.encode_utf16().collect();
+    unsafe {
+        let l = dw.CreateTextLayout(&t, fmt, w.max(0.0), h.max(0.0)).ok()?;
+        if let Some(ty) = ty {
+            let _ = l.SetTypography(
+                ty,
+                DWRITE_TEXT_RANGE {
+                    startPosition: 0,
+                    length: t.len() as u32,
+                },
+            );
+        }
+        Some(l)
+    }
 }
 
 impl Shared {
@@ -61,6 +163,15 @@ impl Shared {
             let dc = d2dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let (inter, font_note) = match load_inter(&dw) {
+                Ok(c) => (Some(c), "font: Inter Variable 4.1 (bundled)".to_string()),
+                Err(e) => (
+                    None,
+                    format!("font: Inter failed to load ({e:?}), using Segoe UI Variable"),
+                ),
+            };
+            let typography = make_typography(&dw);
+            TEXT.with(|t| *t.borrow_mut() = Some((dw.clone(), typography.clone())));
             Ok(Self {
                 d3d,
                 ctx,
@@ -69,6 +180,9 @@ impl Shared {
                 d2f,
                 dc,
                 dw,
+                inter,
+                typography,
+                font_note,
             })
         }
     }
@@ -121,34 +235,64 @@ impl Shared {
         }
     }
 
+    /// A single-line, vertically centred text format in Inter (Segoe UI Variable if Inter did not
+    /// load). Inter's weight and optical size axes are set exactly: `wght` = `weight`, `opsz` =
+    /// the size clamped to the font's 14 to 32 range, as the browser does in the mockups.
     pub fn format(&self, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
         unsafe {
+            let (family, coll) = match &self.inter {
+                Some((c, family)) => (*family, Some(c)),
+                None => (FALLBACK_FAMILY, None),
+            };
             let f = self.dw.CreateTextFormat(
-                w!("Segoe UI Variable Text"),
-                None,
+                family,
+                coll,
                 weight,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 size,
                 w!("en-us"),
             )?;
+            if self.inter.is_some() {
+                if let Ok(f3) = f.cast::<IDWriteTextFormat3>() {
+                    let _ = f3.SetFontAxisValues(&[
+                        DWRITE_FONT_AXIS_VALUE {
+                            axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
+                            value: weight.0 as f32,
+                        },
+                        DWRITE_FONT_AXIS_VALUE {
+                            axisTag: DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE,
+                            value: size.clamp(14.0, 32.0),
+                        },
+                    ]);
+                }
+            }
             f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             Ok(f)
         }
     }
 
+    /// A layout with tabular figures and cv11 on, like everything `text` draws. Use it instead of
+    /// `dw.CreateTextLayout` when measuring, so measured and drawn widths agree.
+    pub fn layout(
+        &self,
+        s: &str,
+        fmt: &IDWriteTextFormat,
+        w: f32,
+        h: f32,
+    ) -> Option<IDWriteTextLayout> {
+        new_layout(&self.dw, self.typography.as_ref(), s, fmt, w, h)
+    }
+
     pub fn text_width(&self, text: &str, fmt: &IDWriteTextFormat) -> f32 {
-        let t: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            match self.dw.CreateTextLayout(&t, fmt, 2000.0, 100.0) {
-                Ok(l) => {
-                    let mut m = DWRITE_TEXT_METRICS::default();
-                    let _ = l.GetMetrics(&mut m);
-                    m.widthIncludingTrailingWhitespace
-                }
-                Err(_) => 0.0,
-            }
+        match self.layout(text, fmt, 2000.0, 100.0) {
+            Some(l) => unsafe {
+                let mut m = DWRITE_TEXT_METRICS::default();
+                let _ = l.GetMetrics(&mut m);
+                m.widthIncludingTrailingWhitespace
+            },
+            None => 0.0,
         }
     }
 }
@@ -159,6 +303,8 @@ pub struct Surface {
     bmp: Option<ID2D1Bitmap1>,
     _target: IDCompositionTarget,
     _visual: IDCompositionVisual,
+    effect: Option<IDCompositionEffectGroup>,
+    opacity: f32,
     pub w: u32,
     pub h: u32,
     scale: f32,
@@ -173,6 +319,8 @@ impl Surface {
             bmp: None,
             _target: t,
             _visual: v,
+            effect: None,
+            opacity: 1.0,
             w,
             h,
             scale,
@@ -242,6 +390,30 @@ impl Surface {
             let _ = self.swap.Present(1, DXGI_PRESENT(0));
         }
     }
+
+    /// Fade the whole window in the compositor, without redrawing it. 1.0 drops the effect so a
+    /// resting window composes as cheaply as before.
+    pub fn set_opacity(&mut self, g: &Shared, a: f32) {
+        let a = a.clamp(0.0, 1.0);
+        if (a - self.opacity).abs() < 0.001 {
+            return;
+        }
+        self.opacity = a;
+        unsafe {
+            if a >= 0.999 {
+                let _ = self._visual.SetEffect(None);
+            } else {
+                if self.effect.is_none() {
+                    self.effect = g.dcomp.CreateEffectGroup().ok();
+                }
+                if let Some(fx) = &self.effect {
+                    let _ = fx.SetOpacity2(a);
+                    let _ = self._visual.SetEffect(fx);
+                }
+            }
+            let _ = g.dcomp.Commit();
+        }
+    }
 }
 
 // ---- small drawing helpers ----
@@ -294,22 +466,33 @@ pub fn text(
     h: f32,
     b: &ID2D1SolidColorBrush,
 ) {
-    let t: Vec<u16> = s.encode_utf16().collect();
-    let rect = D2D_RECT_F {
-        left: x,
-        top: y,
-        right: x + w,
-        bottom: y + h,
-    };
+    // Through a layout, so the shared typography (tabular figures, cv11) applies everywhere.
+    let layout = TEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|(dw, ty)| new_layout(dw, ty.as_ref(), s, fmt, w, h))
+    });
     unsafe {
-        dc.DrawText(
-            &t,
-            fmt,
-            &rect,
-            b,
-            D2D1_DRAW_TEXT_OPTIONS_NONE,
-            DWRITE_MEASURING_MODE_NATURAL,
-        );
+        match layout {
+            Some(l) => dc.DrawTextLayout(pt(x, y), &l, b, D2D1_DRAW_TEXT_OPTIONS_NONE),
+            None => {
+                let t: Vec<u16> = s.encode_utf16().collect();
+                let rect = D2D_RECT_F {
+                    left: x,
+                    top: y,
+                    right: x + w,
+                    bottom: y + h,
+                };
+                dc.DrawText(
+                    &t,
+                    fmt,
+                    &rect,
+                    b,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        }
     }
 }
 
@@ -480,5 +663,42 @@ pub fn quad_to(sink: &ID2D1GeometrySink, ctrl: Vector2, to: Vector2) {
             point1: ctrl,
             point2: to,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_inter_loads_from_memory_with_tabular_figures() {
+        // The embedded file is the variable TrueType (version 1.0 sfnt header).
+        assert_eq!(&INTER_TTF[..4], &[0, 1, 0, 0]);
+        unsafe {
+            let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            let (coll, family) = load_inter(&dw).expect("Inter loads through the in-memory loader");
+            let f = dw
+                .CreateTextFormat(
+                    family,
+                    &coll,
+                    DWRITE_FONT_WEIGHT_MEDIUM,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    13.0,
+                    w!("en-us"),
+                )
+                .unwrap();
+            let ty = make_typography(&dw);
+            assert!(ty.is_some());
+            // With tnum on, "1111" and "0000" are exactly as wide.
+            let width = |s: &str| {
+                let l = new_layout(&dw, ty.as_ref(), s, &f, 500.0, 50.0).unwrap();
+                let mut m = DWRITE_TEXT_METRICS::default();
+                l.GetMetrics(&mut m).unwrap();
+                m.width
+            };
+            assert!((width("1111") - width("0000")).abs() < 0.01);
+            assert_eq!(ot_tag(b"tnum"), DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES.0);
+        }
     }
 }

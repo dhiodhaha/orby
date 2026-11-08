@@ -17,6 +17,8 @@ pub struct View<'a> {
     pub next: Prayer,
     pub mins_left: f64,
     pub place: &'a str,
+    /// "Kemenag" or "Muhammadiyah", after the place in the header.
+    pub method: &'a str,
     pub qibla: String,
     pub reminders: [bool; 3],
     pub hover: Option<Hit>,
@@ -150,7 +152,7 @@ pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View)
     right_text(
         g,
         dc,
-        &format!("{} · Kemenag", v.place),
+        &format!("{} · {}", v.place, v.method),
         &f.small,
         W - 16.0,
         15.0,
@@ -250,6 +252,7 @@ pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View)
             None,
         );
     }
+    crate::depth::lip(g, dc, t, 16.0, 214.0, W - 16.0, 278.0, 12.0, 1.0);
     text(
         dc,
         &format!("{} in", v.next.name()),
@@ -266,7 +269,18 @@ pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View)
     } else {
         format!("{:02}:{:02}", secs / 60, secs % 60)
     };
-    text(dc, &countdown, &f.big, 30.0, 240.0, 170.0, 32.0, &text_b);
+    crate::motion::rolling_text(
+        g,
+        dc,
+        "prayer.countdown",
+        &countdown,
+        crate::motion::Roll::Quick,
+        &f.big,
+        30.0,
+        240.0,
+        32.0,
+        &text_b,
+    );
     right_text(g, dc, "Reminders", &f.small, W - 30.0, 224.0, 16.0, &muted);
     for (i, (x, w)) in chip_rects(g, f).into_iter().enumerate() {
         let on = v.reminders[i];
@@ -308,6 +322,7 @@ pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View)
                 &brush(dc, if hover { t.button_hover } else { t.button }),
             );
         }
+        crate::depth::lip(g, dc, t, x, 292.0, x + w, 324.0, 16.0, 1.0);
         text(dc, BUTTONS[i], &f.title, x + 12.0, 292.0, w, 32.0, &text_b);
     }
 }

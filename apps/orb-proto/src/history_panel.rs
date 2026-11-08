@@ -731,7 +731,7 @@ fn by_task(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View, 
     };
     let (ink, muted, hair) = (brush(dc, t.text), brush(dc, t.muted), brush(dc, t.hair));
     text(dc, &b.label, &f.small, PAD, y, 220.0, 16.0, &muted);
-    right_text(g, dc, &b.total, &f.small, MONTH_W - PAD, y, 16.0, &muted);
+    crate::ui::text_num(g, dc, &b.total, &f.small, MONTH_W - PAD, y, 16.0, &muted);
     let top = y + 18.0;
     for (i, row) in b.rows.iter().enumerate() {
         let ry = top + i as f32 * ROW_H;
@@ -771,8 +771,8 @@ fn by_task(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View, 
         );
         let value = crate::history_model::minutes_text(row.minutes);
         let vx = MONTH_W - PAD - 4.0;
-        right_text(g, dc, &value, &f.body, vx, ry, ROW_H, &ink);
-        let bar_r = vx - 76.0 - 10.0;
+        crate::ui::text_num(g, dc, &value, &f.body, vx, ry, ROW_H, &ink);
+        let bar_r = vx - 76.0 - crate::ui::NUM_COL_GAP;
         let bar_l = bar_r - 64.0;
         unsafe {
             dc.FillRoundedRectangle(
@@ -1140,7 +1140,7 @@ fn tooltip(
         ty += 16.0;
         for (a, b) in &d.rows {
             text(dc, a, &f.small, tx, ty, w - 24.0, 16.0, &ink);
-            right_text(g, dc, b, &f.small, x + w - 12.0, ty, 16.0, &muted);
+            crate::ui::text_num(g, dc, b, &f.small, x + w - 12.0, ty, 16.0, &muted);
             ty += 20.0;
         }
     }

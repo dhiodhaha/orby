@@ -12,7 +12,7 @@ use app_downloads::{
 };
 
 fn sidecar() -> Sidecar {
-    Sidecar { yt_dlp: PathBuf::from(env!("CARGO_BIN_EXE_fake-yt-dlp")), ffmpeg: PathBuf::from(r"C:\sidecar\ffmpeg.exe") }
+    Sidecar { yt_dlp: PathBuf::from(env!("CARGO_BIN_EXE_fake-yt-dlp")), ffmpeg: PathBuf::from(r"C:\sidecar\ffmpeg.exe"), js: None }
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -84,8 +84,31 @@ fn success_downloads_both_streams_merges_and_reports_done() {
 fn private_video_fails_as_private_without_progress() {
     let dir = temp_dir("private");
     let updates = run(&request("private0001", &dir));
-    assert_eq!(updates, vec![Update::Finished(Outcome::Failed(ErrorKind::Private))]);
+    let [Update::ErrorText(text), Update::Finished(Outcome::Failed(ErrorKind::Private))] = updates.as_slice() else { panic!("{updates:?}") };
+    assert!(text.starts_with("ERROR: [youtube] private0001: Private video."), "{text}");
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+}
+
+#[test]
+fn an_unnamed_failure_keeps_the_warnings_for_the_log_and_goes_on_once_by_itself() {
+    let dir = temp_dir("flaky");
+    let req = request("flakyflaky0", &dir);
+    let updates = run(&req);
+    let [Update::ErrorText(text), Update::Finished(Outcome::Failed(ErrorKind::Other))] = updates.as_slice() else { panic!("{updates:?}") };
+    assert!(text.starts_with("WARNING: [youtube] No supported JavaScript runtime"), "{text}");
+    assert!(text.ends_with("| WARNING: [youtube] flakyflaky0: Some web client https formats have been skipped as they are missing a url"), "{text}");
+
+    let mut q = Queue::new();
+    let id = q.add(req.link.clone(), req.format, dir.clone());
+    q.start_ready();
+    let again: Vec<bool> = updates.iter().cloned().map(|u| q.apply(id, u, now())).collect();
+    assert_eq!(again, [false, true], "the first failure starts it again");
+    assert!(q.get(id).unwrap().state.is_active());
+    for u in run(&req) {
+        assert!(!q.apply(id, u, now()));
+    }
+    assert!(matches!(q.get(id).unwrap().state, JobState::Failed { kind: ErrorKind::Other, .. }));
+    assert_eq!(q.get(id).unwrap().error_text.as_deref(), Some(text.as_str()));
 }
 
 #[test]
@@ -185,7 +208,7 @@ fn a_queue_of_three_runs_at_most_two_at_once_and_finishes_all() {
 
 #[test]
 fn a_missing_sidecar_fails_to_start() {
-    let missing = Sidecar { yt_dlp: temp_dir("missing").join("yt-dlp.exe"), ffmpeg: PathBuf::from("ffmpeg.exe") };
+    let missing = Sidecar { yt_dlp: temp_dir("missing").join("yt-dlp.exe"), ffmpeg: PathBuf::from("ffmpeg.exe"), js: None };
     let err = start(&missing, &request("success0001", Path::new(".")), |_| {}).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }

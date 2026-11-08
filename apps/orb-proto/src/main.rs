@@ -16,7 +16,8 @@
 //! - downloads.rs: the clipboard offer, the download queue on yt-dlp, its ring, pills, panel and
 //!   format menu (downloads_model.rs decides, downloads_panel.rs draws)
 //! - disk.rs: the low-space pill, scans, results, Safe to clean, Move to Recycle Bin and Undo
-//!   (disk_model.rs decides, disk_panel.rs draws, disk_restore.rs puts items back)
+//!   in its own window (disk_window.rs; disk_model.rs decides, disk_panel.rs draws,
+//!   disk_restore.rs puts items back)
 //! - history.rs: the History panel, drink and focus by day (history_model.rs decides,
 //!   history_panel.rs draws)
 //! - notices.rs: the notice queue every pill goes through, quiet times, the badge count and the
@@ -31,11 +32,13 @@
 #![windows_subsystem = "windows"]
 
 mod calendar;
+mod depth;
 mod dial;
 mod disk;
 mod disk_model;
 mod disk_panel;
 mod disk_restore;
+mod disk_window;
 mod downloads;
 mod downloads_model;
 mod downloads_panel;
@@ -47,6 +50,9 @@ mod history;
 mod history_model;
 mod history_panel;
 mod hook;
+mod khgt;
+mod morph;
+mod motion;
 mod notices;
 mod notices_model;
 mod notices_panel;
@@ -104,6 +110,7 @@ const WM_APP_DL: u32 = WM_APP + 6; // a download or the yt-dlp fetch reported fr
 const WM_APP_DISK: u32 = WM_APP + 7; // a scan, the clean-up list or a move reported from its thread
 const WM_APP_FOREGROUND: u32 = WM_APP + 8; // the foreground window changed or moved (full screen?)
 const WM_APP_LOCATE: u32 = WM_APP + 9; // Windows location answered on its worker thread
+const WM_APP_PRAYER: u32 = WM_APP + 20; // Settings asks for the adzan file picker (wparam 1: Subuh's)
 const MSG_CLIPBOARD: u32 = 0x031D; // WM_CLIPBOARDUPDATE
 const TIMER_TUCK: usize = 1;
 const TIMER_STATS: usize = 2;
@@ -117,7 +124,7 @@ const TIMER_TASKS: usize = 9;
 const TIMER_CAL_CUE: usize = 10;
 const TIMER_CAL_READ: usize = 11;
 const TIMER_DISK: usize = 12; // the low-space check, every 10 min
-const TIMER_DISK_RELEASE: usize = 13; // drops a scan's tree a while after the Disk panel closes
+const TIMER_DISK_RELEASE: usize = 13; // drops a scan's tree a while after the Disk window closes
 const TIMER_NOTICES: usize = 14; // the notice queue's next change (pacing, cooldown, stale, midnight, pause end)
 const TIMER_SHAKE: usize = 15; // on the pill window: the urgent pill's next attention shake
 const MSG_INPUT: u32 = 0x00FF; // WM_INPUT, only while away
@@ -147,6 +154,8 @@ struct App {
     y: f32,
     opacity: Spring,
     lean: Spring,
+    /// Press, hover, click pulse, dock wobble and the metal's flow while you use the drop.
+    life: orb::Life,
     sun_angle: f32,
     brightness: f32,
     shader_time: f32,
@@ -176,6 +185,9 @@ struct App {
     dial_branch: Option<usize>,
     dial_child: Option<usize>,
     branch_reveal: Spring,
+    /// The main ring's value tags: hidden while a branch parent is aimed or open, so sliding
+    /// between Focus, Drink and More never flashes them back.
+    dial_tags: Spring,
     keys_on: u32,
     // focus and drink
     habits: habits::Habits,
@@ -191,16 +203,22 @@ struct App {
     times_day: (i32, u32, u32),
     tomorrow_subuh: u32,
     next_reminder: Option<(Prayer, i32)>,
+    /// The adzan file is playing (winmm MCI, alias orb_adzan).
+    adzan_playing: bool,
     // the panel window (Prayer, Focus or Drink)
     panel_hwnd: HWND,
     panel_surface: Option<Surface>,
     panel_kind: panels::Kind,
     panel_open: bool,
     panel_reveal: Spring,
+    /// The open panel steps back (fades) while the dial is open over it.
+    panel_dim: Spring,
+    /// A switch between two panels while the window is open (see morph.rs).
+    panel_morph: morph::Morph<panels::Kind>,
     panel_hover: Option<panels::Hit>,
     panel_tracking: bool,
     knob_drag: bool,
-    /// The window that had the keyboard before a panel that types (Tasks, Disk) took it.
+    /// The window that had the keyboard before a panel that types took it.
     panel_prev_fg: HWND,
     // stats
     anim_start: Option<Instant>,
@@ -263,15 +281,20 @@ fn tick(app: &mut App) -> bool {
     let now = Instant::now();
     let dt = (now - app.last_frame).as_secs_f32().min(1.0 / 30.0);
     app.last_frame = now;
+    // The drop's active loop alone redraws only the drop.
+    let full = orb::full_frame(app);
     orb::tick(app, now, dt);
-    pill::tick(app, dt);
-    dial::tick(app, dt);
-    panels::tick(app, dt);
+    if full {
+        pill::tick(app, dt);
+        dial::tick(app, dt);
+        panels::tick(app, dt);
+    }
     app.anim_frames += 1;
     is_animating(app)
 }
 
 fn start_anim(app: &mut App) {
+    app.life.repaint = true;
     if app.anim_start.is_none() {
         app.anim_start = Some(Instant::now());
         app.anim_frames = 0;
@@ -407,17 +430,24 @@ unsafe extern "system" fn orb_proc(
             with_app(downloads::on_msg);
             return LRESULT(0);
         }
-        WM_APP_DISK if wparam.0 == disk::PICK_FOLDER => {
-            let folder = downloads::pick_folder(hwnd, None, "Scan a folder");
-            with_app(|app| disk::on_folder_picked(app, folder));
-            return LRESULT(0);
-        }
         WM_APP_DISK => {
             with_app(disk::on_msg);
             return LRESULT(0);
         }
         WM_APP_FOREGROUND => {
             with_app(notices::on_foreground);
+            return LRESULT(0);
+        }
+        WM_APP_PRAYER => {
+            if let Some(owner) = with_app(|app| app.settings.hwnd) {
+                let subuh = wparam.0 == 1;
+                let path = prayer::pick_adzan_file(owner, subuh);
+                with_app(|app| settings::on_adzan_picked(app, subuh, path));
+            }
+            return LRESULT(0);
+        }
+        prayer::MM_MCINOTIFY => {
+            with_app(|app| prayer::on_adzan_notify(app, wparam.0));
             return LRESULT(0);
         }
         WM_APP_LOCATE => {
@@ -575,18 +605,21 @@ fn run() -> windows::core::Result<()> {
         register_class(hinst, w!("OrbPanel"), Some(panels::panel_proc));
         register_class(hinst, w!("OrbMenu"), Some(downloads::menu_proc));
         register_class(hinst, w!("OrbSettings"), Some(settings::settings_proc));
+        register_class(hinst, w!("OrbDisk"), Some(disk_window::disk_proc));
         step("orb window");
-        let hwnd = make_window(hinst, w!("OrbProto"), w!("[App] orb"))?;
+        let hwnd = make_window(hinst, w!("OrbProto"), w!("Orby orb"))?;
         step("pill window");
-        let pill_hwnd = make_window(hinst, w!("OrbPill"), w!("[App] notice"))?;
+        let pill_hwnd = make_window(hinst, w!("OrbPill"), w!("Orby notice"))?;
         step("dial window");
-        let dial_hwnd = make_window(hinst, w!("OrbDial"), w!("[App] menu"))?;
-        let panel_hwnd = make_window(hinst, w!("OrbPanel"), w!("[App] panel"))?;
-        let menu_hwnd = make_window(hinst, w!("OrbMenu"), w!("[App] menu"))?;
+        let dial_hwnd = make_window(hinst, w!("OrbDial"), w!("Orby menu"))?;
+        let panel_hwnd = make_window(hinst, w!("OrbPanel"), w!("Orby panel"))?;
+        let menu_hwnd = make_window(hinst, w!("OrbMenu"), w!("Orby menu"))?;
         let settings_hwnd = settings::make_window(hinst)?;
+        let disk_hwnd = disk_window::make_window(hinst)?;
         let settings = settings::Settings::load(&store::data_dir(), settings_hwnd);
         let day = prayer::today();
-        let (times, tomorrow_subuh) = prayer::compute_times(settings.prefs.place.coords(), day);
+        let (times, tomorrow_subuh) =
+            prayer::compute_times(&settings.prefs, settings.prefs.place.coords(), day);
 
         let dpi = GetDpiForWindow(hwnd).max(96);
         let scale = dpi as f32 / 96.0;
@@ -607,6 +640,7 @@ fn run() -> windows::core::Result<()> {
         let orb_gpu = orb::create_orb_gpu(&g, hwnd, (WIN * scale * SS).round() as u32)?;
         step("fonts");
         let fonts = ui::Fonts::new(&g);
+        let font_note = g.font_note.clone();
         step("app");
         let log = OpenOptions::new()
             .create(true)
@@ -630,6 +664,7 @@ fn run() -> windows::core::Result<()> {
             y: 0.0,
             opacity: Spring::new(1.0, 300.0, 30.0),
             lean: Spring::new(0.0, 120.0, 18.0),
+            life: orb::Life::new(),
             sun_angle,
             brightness,
             shader_time: 1.7,
@@ -656,12 +691,13 @@ fn run() -> windows::core::Result<()> {
             dial_branch: None,
             dial_child: None,
             branch_reveal: Spring::new(0.0, 190.0, 26.0),
+            dial_tags: Spring::new(1.0, 600.0, 50.0),
             keys_on: 0,
             habits: habits::Habits::load(store::data_dir().join("habits.json")),
             tasks: tasks::Tasks::load(&store::data_dir()),
             cal: calendar::Cal::load(&store::data_dir()),
             dl: downloads::Downloads::load(menu_hwnd),
-            disk: disk::Disk::load(),
+            disk: disk::Disk::load(disk_hwnd),
             history: history::History::new(),
             notices: notices::Notices::load(&store::data_dir()),
             settings,
@@ -669,11 +705,14 @@ fn run() -> windows::core::Result<()> {
             times_day: day,
             tomorrow_subuh,
             next_reminder: None,
+            adzan_playing: false,
             panel_hwnd,
             panel_surface: None,
             panel_kind: panels::Kind::Prayer,
             panel_open: false,
             panel_reveal: Spring::new(0.0, 190.0, 26.0),
+            panel_dim: Spring::new(1.0, 260.0, 32.0),
+            panel_morph: morph::Morph::default(),
             panel_hover: None,
             panel_tracking: false,
             knob_drag: false,
@@ -714,10 +753,12 @@ fn run() -> windows::core::Result<()> {
         calendar::start(&mut app);
         downloads::start(&mut app);
         disk::start(&mut app);
+        khgt::start();
 
         let (ws, private) = memory_mb();
         let dark = app.theme.dark;
         let hotkey_ok = app.settings.hotkey_ok;
+        log_line(&mut app, &font_note);
         log_line(&mut app, &format!("start dpi={dpi} scale={scale} ss={SS} dark={dark} hotkey={hotkey_ok} ws={ws:.1}MB private={private:.1}MB"));
         APP.with(|a| *a.borrow_mut() = Some(app));
 

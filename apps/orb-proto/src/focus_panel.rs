@@ -268,6 +268,9 @@ fn button(
     unsafe {
         dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, h / 2.0), &brush(dc, fill));
     }
+    if !primary {
+        crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, h / 2.0, 1.0);
+    }
     let ink = brush(dc, if primary { t.panel } else { t.text });
     center_text(g, dc, label, &f.title, (r.0 + r.2) / 2.0, r.1, h, &ink);
 }
@@ -575,12 +578,17 @@ pub fn draw(
                 2.5,
                 &st,
             );
-            center_text(
+            // The minutes left roll on the quick spring each second (motion.rs).
+            let left = mmss(*left_secs);
+            let lw = g.text_width(&left, &f.timer);
+            crate::motion::rolling_text(
                 g,
                 dc,
-                &mmss(*left_secs),
+                "focus.timer",
+                &left,
+                crate::motion::Roll::Quick,
                 &f.timer,
-                cx,
+                cx - lw / 2.0,
                 cy - 34.0,
                 52.0,
                 &text_b,
