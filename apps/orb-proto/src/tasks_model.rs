@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use app_quickadd as qa;
 use app_store::{
     Date, Due, FolderId, ListId, ListParent, NewTask, Repeat, Snapshot, SpaceId, Store, Task,
-    TaskEdit, TimeOfDay, UserId,
+    TaskEdit, TaskId, TimeOfDay, UserId,
 };
 
 /// "Now" for the panel, read once by the caller.
@@ -941,6 +941,187 @@ pub fn space_for_new_list(s: &Snapshot, sel: &Selection) -> Option<SpaceId> {
     from_sel.or_else(|| s.spaces.keys().next().cloned())
 }
 
+// ---- the Tasks window: every task, grouped by when ----
+
+/// The Tasks window's groups, top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Group {
+    /// Overdue and due today.
+    Today,
+    /// Due after today.
+    Upcoming,
+    NoDate,
+    Done,
+}
+
+impl Group {
+    pub fn name(self) -> &'static str {
+        match self {
+            Group::Today => "Today",
+            Group::Upcoming => "Upcoming",
+            Group::NoDate => "No date",
+            Group::Done => "Done",
+        }
+    }
+}
+
+/// Open tasks in the order the panel's Today and Upcoming use: by due (all-day before timed on
+/// a date), then by hand-set order.
+fn by_due_then_order(a: &Task, b: &Task) -> std::cmp::Ordering {
+    a.due
+        .cmp(&b.due)
+        .then(a.order.total_cmp(&b.order))
+        .then(a.id.cmp(&b.id))
+}
+
+/// Every task in the window's four groups, each in its order: open ones by due then order, done
+/// ones latest first. Empty groups are kept, so the caller decides what an empty one shows.
+pub fn groups(s: &Snapshot, c: &Clock) -> Vec<(Group, Vec<Task>)> {
+    let mut out: Vec<(Group, Vec<Task>)> =
+        [Group::Today, Group::Upcoming, Group::NoDate, Group::Done]
+            .into_iter()
+            .map(|g| (g, Vec::new()))
+            .collect();
+    for t in s.tasks.values() {
+        let g = match t.due {
+            _ if t.done => 3,
+            Some(d) if d.date <= c.today => 0,
+            Some(_) => 1,
+            None => 2,
+        };
+        out[g].1.push(t.clone());
+    }
+    for (g, v) in out.iter_mut() {
+        match g {
+            Group::Done => {
+                v.sort_by(|a, b| b.completed_at.cmp(&a.completed_at).then(a.id.cmp(&b.id)))
+            }
+            _ => v.sort_by(by_due_then_order),
+        }
+    }
+    out
+}
+
+/// One line of the Tasks window's list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WinItem {
+    /// A group's heading with how many tasks it holds.
+    Header(Group, usize),
+    Task(Group, Box<Task>),
+}
+
+/// The window's list: each group that has tasks under its heading. Done shows only its heading
+/// until it is unfolded.
+pub fn window_items(groups: Vec<(Group, Vec<Task>)>, done_open: bool) -> Vec<WinItem> {
+    let mut out = Vec::new();
+    for (g, tasks) in groups {
+        if tasks.is_empty() {
+            continue;
+        }
+        out.push(WinItem::Header(g, tasks.len()));
+        if g == Group::Done && !done_open {
+            continue;
+        }
+        out.extend(tasks.into_iter().map(|t| WinItem::Task(g, Box::new(t))));
+    }
+    out
+}
+
+/// Alt+Up or Alt+Down on `group[i]`: the `order` writes that move it one place. It moves only
+/// past a neighbour with the same due, since the date and time decide everything else. Two
+/// different orders are swapped; equal ones (lists number their tasks on their own) renumber
+/// that run of same-due tasks. `None` when it can't move.
+pub fn reorder(group: &[Task], i: usize, up: bool) -> Option<Vec<(TaskId, f64)>> {
+    let j = if up { i.checked_sub(1)? } else { i + 1 };
+    let (a, b) = (group.get(i)?, group.get(j)?);
+    if a.done || a.due != b.due {
+        return None;
+    }
+    if a.order != b.order {
+        return Some(vec![(a.id.clone(), b.order), (b.id.clone(), a.order)]);
+    }
+    // The run of tasks sharing this due, with the two swapped, numbered on from its first order.
+    let start = (0..=i.min(j))
+        .rev()
+        .take_while(|k| group[*k].due == a.due)
+        .last()
+        .unwrap_or(i.min(j));
+    let end = (i.max(j)..group.len())
+        .take_while(|k| group[*k].due == a.due)
+        .last()
+        .unwrap_or(i.max(j));
+    let mut run: Vec<&Task> = group[start..=end].iter().collect();
+    run.swap(i - start, j - start);
+    let base = group[start].order;
+    Some(
+        run.into_iter()
+            .enumerate()
+            .map(|(k, t)| (t.id.clone(), base + k as f64))
+            .filter(|(id, o)| group.iter().any(|t| &t.id == id && t.order != *o))
+            .collect(),
+    )
+}
+
+/// An inline edit's title to save: trimmed, and `None` when it is empty or unchanged.
+pub fn edited_title(old: &str, new: &str) -> Option<String> {
+    let t = new.trim();
+    (!t.is_empty() && t != old).then(|| t.to_owned())
+}
+
+/// The choices of the window's due menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuePick {
+    Today,
+    Tomorrow,
+    NextWeek,
+    Clear,
+}
+
+pub const DUE_PICKS: [DuePick; 4] = [
+    DuePick::Today,
+    DuePick::Tomorrow,
+    DuePick::NextWeek,
+    DuePick::Clear,
+];
+
+impl DuePick {
+    pub fn label(self) -> &'static str {
+        match self {
+            DuePick::Today => "Today",
+            DuePick::Tomorrow => "Tomorrow",
+            DuePick::NextWeek => "Next week",
+            DuePick::Clear => "No date",
+        }
+    }
+}
+
+/// The due a pick sets. A new date keeps the time of day the task had.
+pub fn picked_due(pick: DuePick, old: Option<Due>, today: Date) -> Option<Due> {
+    let days = match pick {
+        DuePick::Today => 0,
+        DuePick::Tomorrow => 1,
+        DuePick::NextWeek => 7,
+        DuePick::Clear => return None,
+    };
+    Some(Due {
+        date: add_days(today, days),
+        time: old.and_then(|d| d.time),
+    })
+}
+
+/// What Undo puts back after a delete: the same task, made again in its list. The store keeps a
+/// delete as a tombstone, so the task comes back under a new id.
+pub fn restored(t: &Task) -> NewTask {
+    NewTask {
+        title: t.title.clone(),
+        notes: t.notes.clone(),
+        due: t.due,
+        repeat: t.repeat,
+        assignee: t.assignee.clone(),
+        order: t.order,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1425,6 +1606,207 @@ mod tests {
         let s = st.snapshot().unwrap();
         assert!(s.tasks.values().all(|t| t.notes == "Sample task"));
         assert_eq!(add_samples(&mut st, &s, &inbox, &clock()).unwrap(), 0);
+    }
+
+    fn titles(v: &[Task]) -> Vec<&str> {
+        v.iter().map(|t| t.title.as_str()).collect()
+    }
+
+    #[test]
+    fn the_window_groups_every_task_by_when_with_done_latest_first() {
+        let (mut st, inbox) = fresh();
+        let c = clock();
+        let mk = |st: &mut Store, title: &str, due: Option<Due>, order: f64| {
+            st.create_task(
+                &inbox,
+                NewTask {
+                    title: title.into(),
+                    due,
+                    order,
+                    ..NewTask::default()
+                },
+                c.now_ms,
+            )
+            .unwrap()
+        };
+        let on = |date: Date, time: Option<(u8, u8)>| {
+            Some(Due {
+                date,
+                time: time.and_then(|(h, m)| TimeOfDay::new(h, m)),
+            })
+        };
+        mk(&mut st, "today 17:00", on(c.today, Some((17, 0))), 0.0);
+        mk(&mut st, "today all day", on(c.today, None), 5.0);
+        mk(&mut st, "overdue", on(d(2026, 11, 2), None), 9.0);
+        mk(&mut st, "tomorrow", on(d(2026, 11, 7), None), 0.0);
+        mk(&mut st, "no date b", None, 2.0);
+        mk(&mut st, "no date a", None, 1.0);
+        let first = mk(&mut st, "done first", None, 3.0);
+        let second = mk(&mut st, "done second", None, 4.0);
+        st.set_done(&first, true, c.now_ms).unwrap();
+        st.set_done(&second, true, c.now_ms + 60_000).unwrap();
+        let g = groups(&st.snapshot().unwrap(), &c);
+        let names: Vec<Group> = g.iter().map(|(g, _)| *g).collect();
+        assert_eq!(
+            names,
+            vec![Group::Today, Group::Upcoming, Group::NoDate, Group::Done]
+        );
+        assert_eq!(
+            titles(&g[0].1),
+            vec!["overdue", "today all day", "today 17:00"],
+            "overdue first, then all-day before timed"
+        );
+        assert_eq!(titles(&g[1].1), vec!["tomorrow"]);
+        assert_eq!(titles(&g[2].1), vec!["no date a", "no date b"]);
+        assert_eq!(titles(&g[3].1), vec!["done second", "done first"]);
+
+        // Done is folded by default: its heading and count, no rows. Empty groups are left out.
+        let folded = window_items(g.clone(), false);
+        assert_eq!(folded.last(), Some(&WinItem::Header(Group::Done, 2)));
+        assert_eq!(folded.len(), (1 + 3) + (1 + 1) + (1 + 2) + 1);
+        assert_eq!(window_items(g.clone(), true).len(), folded.len() + 2);
+        let only_inbox: Vec<(Group, Vec<Task>)> = g
+            .into_iter()
+            .map(|(gr, v)| (gr, if gr == Group::NoDate { v } else { Vec::new() }))
+            .collect();
+        assert_eq!(
+            window_items(only_inbox, true)[0],
+            WinItem::Header(Group::NoDate, 2)
+        );
+    }
+
+    fn task(id: &str, order: f64, due: Option<Due>) -> Task {
+        Task {
+            id: TaskId(id.into()),
+            list_id: ListId("l".into()),
+            title: id.into(),
+            notes: String::new(),
+            due,
+            repeat: Repeat::None,
+            assignee: None,
+            done: false,
+            created_by: me(),
+            completed_by: None,
+            created_at: 0,
+            completed_at: None,
+            order,
+        }
+    }
+
+    fn apply(group: &mut [Task], writes: &[(TaskId, f64)]) {
+        for (id, o) in writes {
+            group.iter_mut().find(|t| &t.id == id).unwrap().order = *o;
+        }
+        group.sort_by(by_due_then_order);
+    }
+
+    #[test]
+    fn alt_arrows_move_a_task_one_place_among_tasks_with_the_same_due() {
+        let mut g = vec![
+            task("a", 0.0, None),
+            task("b", 1.0, None),
+            task("c", 4.0, None),
+        ];
+        let w = reorder(&g, 2, true).unwrap();
+        assert_eq!(w.len(), 2, "two different orders are just swapped");
+        apply(&mut g, &w);
+        assert_eq!(titles(&g), vec!["a", "c", "b"]);
+        assert_eq!(reorder(&g, 0, true), None, "the top can't go up");
+        assert_eq!(reorder(&g, 2, false), None, "the bottom can't go down");
+
+        // Lists number their own tasks, so two lists' tasks often share an order.
+        let mut g = vec![
+            task("a", 0.0, None),
+            task("b", 0.0, None),
+            task("c", 0.0, None),
+        ];
+        let w = reorder(&g, 0, false).unwrap();
+        apply(&mut g, &w);
+        assert_eq!(titles(&g), vec!["b", "a", "c"]);
+        let w = reorder(&g, 2, true).unwrap();
+        apply(&mut g, &w);
+        assert_eq!(titles(&g), vec!["b", "c", "a"]);
+
+        // A different due is a wall: the date decides there.
+        let today = Some(Due {
+            date: clock().today,
+            time: None,
+        });
+        let at9 = Some(Due {
+            date: clock().today,
+            time: TimeOfDay::new(9, 0),
+        });
+        let g = vec![task("a", 0.0, today), task("b", 0.0, at9)];
+        assert_eq!(reorder(&g, 1, true), None);
+        assert_eq!(reorder(&g, 0, false), None);
+    }
+
+    #[test]
+    fn reordering_writes_the_store_and_the_panel_sees_the_same_order() {
+        let (mut st, inbox) = fresh();
+        for t in ["Beras", "Telur", "Gula"] {
+            add(&mut st, &inbox, &Selection::Inbox, t);
+        }
+        let c = clock();
+        let s = st.snapshot().unwrap();
+        let no_date = groups(&s, &c).remove(2).1;
+        for (id, o) in reorder(&no_date, 2, true).unwrap() {
+            st.edit_task(&id, TaskEdit::Order(o), c.now_ms).unwrap();
+        }
+        let s = st.snapshot().unwrap();
+        assert_eq!(titles(&groups(&s, &c)[2].1), vec!["Beras", "Gula", "Telur"]);
+        let (todo, _) = view_tasks(&s, &Selection::Inbox, &inbox, &c);
+        assert_eq!(titles(&todo), vec!["Beras", "Gula", "Telur"]);
+    }
+
+    #[test]
+    fn an_inline_edit_saves_a_trimmed_new_title_and_nothing_else() {
+        assert_eq!(
+            edited_title("Beras", "  Beras 5 kg "),
+            Some("Beras 5 kg".into())
+        );
+        assert_eq!(edited_title("Beras", "Beras "), None, "unchanged");
+        assert_eq!(edited_title("Beras", "   "), None, "a task keeps a title");
+    }
+
+    #[test]
+    fn the_due_menu_sets_a_day_keeps_the_time_and_clears() {
+        let today = clock().today;
+        let at9 = Some(Due {
+            date: d(2026, 11, 2),
+            time: TimeOfDay::new(9, 0),
+        });
+        assert_eq!(
+            picked_due(DuePick::Tomorrow, at9, today),
+            Some(Due {
+                date: d(2026, 11, 7),
+                time: TimeOfDay::new(9, 0)
+            })
+        );
+        assert_eq!(
+            picked_due(DuePick::NextWeek, None, today),
+            Some(Due {
+                date: d(2026, 11, 13),
+                time: None
+            })
+        );
+        assert_eq!(picked_due(DuePick::Today, None, today).unwrap().date, today);
+        assert_eq!(picked_due(DuePick::Clear, at9, today), None);
+    }
+
+    #[test]
+    fn undo_after_a_delete_makes_the_same_task_again() {
+        let (mut st, inbox) = fresh();
+        let t = add(&mut st, &inbox, &Selection::Inbox, "Galon Aqua besok 9am");
+        st.delete(&app_store::EntityRef::Task(t.id.clone()), 1)
+            .unwrap();
+        assert!(st.snapshot().unwrap().tasks.is_empty());
+        let id = st.create_task(&t.list_id, restored(&t), 2).unwrap();
+        let back = st.task(&id).unwrap().unwrap();
+        assert_eq!(
+            (back.title, back.due, back.order, back.list_id),
+            (t.title, t.due, t.order, t.list_id)
+        );
     }
 
     #[test]

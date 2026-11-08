@@ -582,6 +582,7 @@ pub fn apply_theme(app: &mut App) {
     }
     panels::redraw(app);
     crate::disk_window::redraw(app);
+    crate::tasks_window::redraw(app);
     render(app);
     let dark = app.theme.dark;
     log_line(

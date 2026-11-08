@@ -60,6 +60,7 @@ pub const MENU_SETTINGS_PRAYER: usize = 72;
 pub const MENU_SETTINGS_NOTICES: usize = 73;
 pub const MENU_SETTINGS_ACCOUNT: usize = 74;
 pub const MENU_SETTINGS_ABOUT: usize = 75;
+pub const MENU_TASKS_WINDOW: usize = 80;
 
 pub fn add_tray(hwnd: HWND) {
     unsafe {
@@ -105,6 +106,7 @@ pub fn tray_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, MENU_FOCUS, w!("Open the Focus panel"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_DRINK, w!("Open the Drink panel"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_TASKS, w!("Open the Tasks panel"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_TASKS_WINDOW, w!("Open all tasks"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_TODAY, w!("Open the Today panel"));
         let _ = AppendMenuW(
             menu,
@@ -281,6 +283,9 @@ pub fn on_command(hwnd: HWND, id: usize) {
         }
         MENU_TASKS => {
             with_app(|app| tasks::open(app, None));
+        }
+        MENU_TASKS_WINDOW => {
+            with_app(crate::tasks_window::show);
         }
         MENU_TASK_SAMPLES => {
             with_app(tasks::add_samples);

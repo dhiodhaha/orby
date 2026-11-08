@@ -10,7 +10,8 @@
 //! - panels.rs: the one panel window that shows Prayer, Focus or Drink
 //! - store.rs: the drink log and focus sessions on disk
 //! - tasks.rs: the Tasks panel, due pills and the overdue badge (tasks_model.rs decides,
-//!   tasks_panel.rs draws, textfield.rs edits the quick add line)
+//!   tasks_panel.rs draws, textfield.rs edits the quick add line); tasks_window.rs is the Tasks
+//!   window on the same store (tasks_window_panel.rs draws it)
 //! - calendar.rs: the calendar link, its 10 min reads, event pills and the Today panel
 //!   (today_model.rs decides, today_panel.rs draws)
 //! - downloads.rs: the clipboard offer, the download queue on yt-dlp, its ring, pills, panel and
@@ -68,6 +69,8 @@ mod store;
 mod tasks;
 mod tasks_model;
 mod tasks_panel;
+mod tasks_window;
+mod tasks_window_panel;
 mod textfield;
 mod today_model;
 mod today_panel;
@@ -606,6 +609,7 @@ fn run() -> windows::core::Result<()> {
         register_class(hinst, w!("OrbMenu"), Some(downloads::menu_proc));
         register_class(hinst, w!("OrbSettings"), Some(settings::settings_proc));
         register_class(hinst, w!("OrbDisk"), Some(disk_window::disk_proc));
+        register_class(hinst, w!("OrbTasks"), Some(tasks_window::tasks_proc));
         step("orb window");
         let hwnd = make_window(hinst, w!("OrbProto"), w!("Orby orb"))?;
         step("pill window");
@@ -616,6 +620,7 @@ fn run() -> windows::core::Result<()> {
         let menu_hwnd = make_window(hinst, w!("OrbMenu"), w!("Orby menu"))?;
         let settings_hwnd = settings::make_window(hinst)?;
         let disk_hwnd = disk_window::make_window(hinst)?;
+        let tasks_hwnd = tasks_window::make_window(hinst)?;
         let settings = settings::Settings::load(&store::data_dir(), settings_hwnd);
         let day = prayer::today();
         let (times, tomorrow_subuh) =
@@ -722,6 +727,7 @@ fn run() -> windows::core::Result<()> {
             last_frame: Instant::now(),
             log,
         };
+        app.tasks.win.hwnd = tasks_hwnd;
         let wa = orb::work_area(hwnd);
         app.x.snap(orb::dock_x(&app, Side::Right, false));
         app.y = orb::clamp_y(

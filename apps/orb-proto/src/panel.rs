@@ -212,6 +212,15 @@ pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View)
         }
     }
 
+    // Now: a solid drop on the arc with a soft halo, apart from the prayer markers, so the
+    // ring stays "next" and this stays "you are here". Neutral, never a colour.
+    let now = arc_pt(now_s(v.times, v.now_min));
+    unsafe {
+        dc.FillEllipse(&ellipse(now.X, now.Y, 9.0), &brush(dc, with_alpha(t.text, 0.08)));
+        dc.FillEllipse(&ellipse(now.X, now.Y, 5.5), &panel_b);
+        dc.FillEllipse(&ellipse(now.X, now.Y, 4.5), &text_b);
+    }
+
     // Times row.
     let col = (W - 32.0) / 5.0;
     for (i, p) in Prayer::ALL.iter().enumerate() {
@@ -263,7 +272,9 @@ pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View)
         16.0,
         &muted,
     );
-    let secs = (v.mins_left * 60.0).max(0.0) as u64;
+    // The clock reads whole seconds and prayer times are whole minutes, so the gap is a whole
+    // number of seconds: round away the float error that would show a second twice or skip it.
+    let secs = (v.mins_left * 60.0).round().max(0.0) as u64;
     let countdown = if secs >= 3600 {
         format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
     } else {

@@ -85,6 +85,8 @@ pub enum Hit {
     Chevron(usize),
     NewList,
     Share,
+    /// Opens the Tasks window.
+    AllTasks,
     Field,
     Add,
     Tab(Tab),
@@ -178,6 +180,9 @@ fn tree_base(item: &SideItem) -> f32 {
     14.0 + item.depth as f32 * 20.0
 }
 
+/// "All tasks", left of Share in the header.
+const ALL_RECT: Rect = (X1 - 84.0 - 8.0 - 100.0, 28.0, X1 - 84.0 - 8.0, 60.0);
+
 fn add_button(g: &Shared, f: &Fonts, v: &View) -> Rect {
     let w = g.text_width(v.field.action, &f.title) + 28.0;
     (X1 - 4.0 - w, FIELD_T + 4.0, X1 - 4.0, FIELD_B - 4.0)
@@ -218,6 +223,7 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     }
     out.push((Hit::NewList, (SIDE - 36.0, 124.0, SIDE - 12.0, 148.0)));
     out.push((Hit::Share, (X1 - 84.0, 28.0, X1, 60.0)));
+    out.push((Hit::AllTasks, ALL_RECT));
     out.push((Hit::Add, add_button(g, f, v)));
     out.push((Hit::Field, (X0, FIELD_T, X1, FIELD_B)));
     for (t, r) in tab_rects(g, f, v) {
@@ -959,27 +965,42 @@ pub fn draw(
         &f.heading,
         X0,
         34.0,
-        X1 - X0 - 100.0,
+        ALL_RECT.0 - X0 - 12.0,
         30.0,
         &ink,
     );
     let sr = (X1 - 84.0, 28.0, X1, 60.0);
-    unsafe {
-        let fill = if hover == Some(Hit::Share) {
-            t.button_hover
-        } else {
-            t.surface
-        };
-        dc.FillRoundedRectangle(&rrect(sr.0, sr.1, sr.2, sr.3, 16.0), &brush(dc, fill));
-        dc.DrawRoundedRectangle(
-            &rrect(sr.0 + 0.5, sr.1 + 0.5, sr.2 - 0.5, sr.3 - 0.5, 15.5),
-            &hair,
-            1.0,
-            None,
-        );
+    for (r, h) in [(sr, Hit::Share), (ALL_RECT, Hit::AllTasks)] {
+        unsafe {
+            let fill = if hover == Some(h) {
+                t.button_hover
+            } else {
+                t.surface
+            };
+            dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 16.0), &brush(dc, fill));
+            dc.DrawRoundedRectangle(
+                &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 15.5),
+                &hair,
+                1.0,
+                None,
+            );
+        }
+        crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 16.0, 1.0);
     }
     draw_icon(g, dc, Icon::Link, sr.0 + 22.0, 44.0, 14.0, &ink);
     text(dc, "Share", &f.title, sr.0 + 34.0, sr.1, 50.0, 32.0, &ink);
+    let ar = ALL_RECT;
+    draw_icon(g, dc, Icon::List, ar.0 + 22.0, 44.0, 14.0, &ink);
+    text(
+        dc,
+        "All tasks",
+        &f.title,
+        ar.0 + 34.0,
+        ar.1,
+        66.0,
+        32.0,
+        &ink,
+    );
 
     draw_field(g, dc, t, f, v, hover);
     clipped_text(
