@@ -92,6 +92,7 @@ fn children(app: &App, parent: usize) -> (Vec<DialChild>, usize) {
             kids.push(history::dial_child(app));
             kids.push(notices::dial_child(app));
             kids.push(settings::dial_child(app));
+            kids.push(crate::tasks_window::dial_child(app));
             (kids, default)
         }
         _ => (Vec::new(), 0),
@@ -260,9 +261,13 @@ fn close_branch(app: &mut App) {
     app.branch_reveal.snap(0.0);
 }
 
-/// A main item: Tasks, Today, Prayer, Focus and Drink open their panels. More is a branch; picked
-/// itself it opens its only child so far, Downloads.
+/// A main item: Tasks, Today, Prayer, Focus and Drink open their panels. More has no panel of
+/// its own, so picking it (a click or Enter) only fans out its children; it never jumps to one.
 fn pick(app: &mut App, i: usize) {
+    if i == MORE {
+        open_branch(app, MORE, app.dial_keyboard);
+        return;
+    }
     close_dial(app);
     crate::orb::kick(app, 1.0);
     let name = ["tasks", "today", "prayer", "focus", "drink", "more"]
@@ -297,6 +302,7 @@ fn pick_child(app: &mut App, parent: usize, j: usize) {
         _ if j == 2 => history::open(app, None),
         _ if j == 3 => notices::open_panel(app),
         _ if j == 4 => settings::open(app, Section::General),
+        _ if j == 5 => crate::tasks_window::show(app),
         _ => downloads::open(app),
     }
 }

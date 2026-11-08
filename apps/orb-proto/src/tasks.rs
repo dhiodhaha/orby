@@ -42,7 +42,8 @@ struct Config {
 }
 
 pub struct Tasks {
-    store: Store,
+    /// Shared with the Tasks window (tasks_window.rs), so both show the same tasks.
+    pub(crate) store: Store,
     /// Set when app.db could not be opened: the store is in memory and nothing is saved.
     store_error: Option<String>,
     pub inbox: ListId,
@@ -63,6 +64,8 @@ pub struct Tasks {
     /// Timed tasks due up to here have had their pill (or were overdue at launch).
     fired_until: Stamp,
     pub overdue: usize,
+    /// The Tasks window, on the same store as the panel.
+    pub win: crate::tasks_window::Win,
 }
 
 fn read_config(path: &Path) -> Config {
@@ -161,6 +164,7 @@ impl Tasks {
             notice: None,
             fired_until: c.stamp(),
             overdue,
+            win: Default::default(),
         }
     }
 
@@ -169,15 +173,16 @@ impl Tasks {
     }
 
     fn parse(&self, c: &Clock) -> qa::QuickAdd {
+        self.parse_text(self.field.text(), c)
+    }
+
+    /// Quick add's reading of `text` (the panel's field or the window's).
+    pub(crate) fn parse_text(&self, text: &str, c: &Clock) -> qa::QuickAdd {
         let now = qa::Now {
             date: m::to_qa(c.today),
             time: qa::Time::new((c.minute / 60) as u8, (c.minute % 60) as u8).expect("time"),
         };
-        qa::parse(
-            self.field.text(),
-            now,
-            &m::known(&self.snap, &self.people()),
-        )
+        qa::parse(text, now, &m::known(&self.snap, &self.people()))
     }
 
     fn display_name(&self, u: &UserId) -> String {
@@ -192,8 +197,8 @@ impl Tasks {
 // ---- after every change ----
 
 /// Re-reads the store, then fixes up everything that depends on it: the badge, the due timer,
-/// the open panel.
-fn commit(app: &mut App) {
+/// the open panel and the Tasks window.
+pub(crate) fn commit(app: &mut App) {
     match app.tasks.store.snapshot() {
         Ok(s) => app.tasks.snap = s,
         Err(e) => log_line(app, &format!("tasks: snapshot failed: {e}")),
@@ -209,6 +214,7 @@ fn commit(app: &mut App) {
     update_badge(app, &clock());
     schedule(app);
     panels::refresh(app);
+    crate::tasks_window::refresh(app);
 }
 
 fn update_badge(app: &mut App, c: &Clock) {
@@ -299,6 +305,7 @@ pub fn on_timer(app: &mut App) {
         }
     }
     panels::refresh(app);
+    crate::tasks_window::refresh(app);
     schedule(app);
 }
 
@@ -734,6 +741,7 @@ pub fn click(app: &mut App, h: tp::Hit) {
             )
         }
         tp::Hit::Add => return submit(app),
+        tp::Hit::AllTasks => return crate::tasks_window::show(app),
         tp::Hit::Field | tp::Hit::Row(_) => {}
         tp::Hit::Tab(t) => {
             app.tasks.tab = t;
