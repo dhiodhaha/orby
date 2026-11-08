@@ -1164,7 +1164,7 @@ pub struct DialBranch<'a> {
 }
 
 pub const DIAL_W: f32 = 440.0;
-pub const DIAL_H: f32 = 360.0;
+pub const DIAL_H: f32 = 430.0;
 pub const DIAL_R: f32 = 92.0; // chip centres
 pub const DIAL_BAND: f32 = 46.0;
 pub const DIAL_CHIP: f32 = 22.0;
@@ -1174,6 +1174,21 @@ pub const CHILD_CHIP: f32 = 19.0;
 /// Past this distance from the hub, with a branch open, the pointer aims the children.
 pub const BRANCH_AIM: f32 = 122.0;
 const CHILD_STEP: f32 = 32.0;
+/// Past four children a fan would run the whole half dial and crowd the main band at both
+/// ends, so a long branch sits further out on a tighter angle: about the same room between
+/// chips along the arc, and clear air between the two rings.
+const WIDE_AFTER: usize = 4;
+const WIDE_R: f32 = 164.0;
+const WIDE_STEP: f32 = 28.0;
+
+/// The radius and angle step of a branch with `n` children.
+pub fn branch_geom(n: usize) -> (f32, f32) {
+    if n > WIDE_AFTER {
+        (WIDE_R, WIDE_STEP)
+    } else {
+        (BRANCH_R, CHILD_STEP)
+    }
+}
 
 /// The orb centre inside the dial window.
 pub fn dial_center(mirrored: bool) -> (f32, f32) {
@@ -1194,13 +1209,13 @@ pub fn item_angle(i: usize, mirrored: bool) -> f32 {
     }
 }
 
-/// Child angles, top to bottom, 32 degrees apart and centred on the parent, then shifted so no
+/// Child angles, top to bottom, `branch_geom` apart and centred on the parent, then shifted so no
 /// child runs past the band's ends (8 to 172 degrees from the edge).
 pub fn child_angles(parent: usize, n: usize, mirrored: bool) -> Vec<f32> {
     let base = item_angle(parent, false);
     let half = (n as f32 - 1.0) / 2.0;
     let mut v: Vec<f32> = (0..n)
-        .map(|j| base - (j as f32 - half) * CHILD_STEP)
+        .map(|j| base - (j as f32 - half) * branch_geom(n).1)
         .collect();
     let (top, bottom) = (
         v.first().copied().unwrap_or(base),
@@ -1270,7 +1285,7 @@ pub fn aim_child(dx: f32, dy: f32, mirrored: bool, parent: usize, n: usize) -> O
     nearest(
         pointer_deg(dx, dy),
         child_angles(parent, n, mirrored).into_iter(),
-        CHILD_STEP / 2.0,
+        branch_geom(n).1 / 2.0,
     )
 }
 
@@ -1520,9 +1535,11 @@ pub fn draw_dial(
         return;
     }
     let angles = child_angles(b.parent, b.children.len(), mirrored);
-    let br = BRANCH_R * (0.9 + 0.1 * b.reveal.clamp(0.0, 1.1));
-    let lo = angles.iter().copied().fold(f32::MAX, f32::min) - 12.0;
-    let hi = angles.iter().copied().fold(f32::MIN, f32::max) + 12.0;
+    let br = branch_geom(b.children.len()).0 * (0.9 + 0.1 * b.reveal.clamp(0.0, 1.1));
+    // The band runs about 30 px past its end chips on any radius.
+    let pad = 12.0 * BRANCH_R / branch_geom(b.children.len()).0;
+    let lo = angles.iter().copied().fold(f32::MAX, f32::min) - pad;
+    let hi = angles.iter().copied().fold(f32::MIN, f32::max) + pad;
     unsafe {
         let geo = path(g, polar(cx, cy, br, lo), false, |k| {
             arc_to(k, polar(cx, cy, br, hi), br, false, true)
