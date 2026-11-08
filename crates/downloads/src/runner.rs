@@ -14,13 +14,16 @@ use std::thread;
 use std::time::Duration;
 
 use crate::args::{build_args, Request};
-use crate::parse::{Tracker, Update};
+use crate::js::JsRuntime;
+use crate::parse::{Outcome, Tracker, Update};
 
 /// Where the bundled tools live.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sidecar {
     pub yt_dlp: PathBuf,
     pub ffmpeg: PathBuf,
+    /// Handed to yt-dlp for YouTube ([`crate::find_js_runtime`]); skipped if it has gone since.
+    pub js: Option<JsRuntime>,
 }
 
 /// A running download. Dropping it does not stop the process; call [`Download::stop`].
@@ -71,7 +74,8 @@ where
     F: FnMut(Update) + Send + 'static,
 {
     let mut cmd = Command::new(&sidecar.yt_dlp);
-    cmd.args(build_args(req, &sidecar.ffmpeg))
+    let js = sidecar.js.as_ref().filter(|j| j.path.is_file());
+    cmd.args(build_args(req, &sidecar.ffmpeg, js))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -109,8 +113,15 @@ where
             Some(s) => Ok(s),
             None => wait(&waiter),
         };
-        let exit_ok = status.map(|s| s.success()).unwrap_or(false);
+        let exit_ok = status.as_ref().is_ok_and(|s| s.success());
         let outcome = tracker.finish(exit_ok, |p| fs::metadata(p).ok().map(|m| m.len()));
+        if let Outcome::Failed(_) = outcome {
+            let text = tracker.error_text().unwrap_or_else(|| match &status {
+                Ok(s) => format!("yt-dlp ended with {s} and no error text"),
+                Err(e) => format!("yt-dlp ended, exit status unknown ({e})"),
+            });
+            on_update(Update::ErrorText(text));
+        }
         on_update(Update::Finished(outcome));
     });
     Ok(Download { child })

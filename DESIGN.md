@@ -120,12 +120,15 @@ Doop frames "v6.2 · 05 Prayer: panel, reminders, place (white)" and "v6.2 · 06
   - Custom texts inform. They never ask whether you prayed.
 - **Place and method:**
   - Windows location (follows travel).
-  - Kemenag RI (Subuh 20°, Isya 18°, +2 min ihtiyat), or the kab/kota schedule.
+  - Method (2026-11-07): Kemenag RI (Subuh 20°, Isya 18°, +2 min ihtiyat) or Muhammadiyah (Majelis Tarjih, Subuh 18°, Isya 18°, so Subuh is about 8 min later), as radio rows. Later: the kab/kota schedule.
+  - Adjust by minutes: Subuh to Isya, each −10 to +10 with − and +, for someone who follows a local mosque. Imsak moves with Subuh.
   - An optional "Show Dzuhur as Jumat" on Friday.
-  - Adzan has its own volume and mute. It is silent in meetings and full screen, and the pill still shows.
+  - At the time (2026-11-07): Diam, Bunyi (default, Windows' short notification sound) or Adzan. Adzan plays an mp3 or wav you choose on this PC, with an optional separate file for Subuh; nothing is bundled or downloaded. Never a sound in full screen or while presenting: the pill still shows, silently. Later: adzan volume, and silence in a meeting.
 - **Pills:**
-  - −30 and −10 min: normal, a bell chip, no action, gone after 6 s.
-  - At the time: urgent, a filled ink dot chip, "Memasuki waktu Isya" and one action, Mute adzan. It shows even while the orb is hidden, and the drop flows once.
+  - −30 min: normal, a bell chip, no action, gone after 6 s.
+  - −10 min (2026-11-07): normal, a bell chip, no action, and it **stays until you close it** (X) or "Memasuki waktu" replaces it. A panel or the dial covering it brings it back after; a new normal notice takes the front for its turn, then it comes back.
+  - Both pass every quiet time except presenting (focus, full screen, a pause, the orb hidden for a full-screen app). Held while presenting, one is shown only within 2 min of its moment, else dropped; a newer one for the same prayer replaces it. Hidden by you, they are skipped.
+  - At the time: urgent, a filled ink dot chip, "Memasuki waktu Isya". It shows even while the orb is hidden, and the drop flows once. While the adzan plays its one action is Hentikan, and it stays until the adzan ends, Hentikan, or its X (which stops the adzan too).
   - A focus session that runs into prayer time pauses itself ("Focus paused for Isya · 12:40 left", Resume).
 - **Qibla:** a static compass. North is ink and the other points are muted. The Qibla line ends in a small square for the Kaaba.
   - The bearing is shown big: "295° WNW".
@@ -137,7 +140,12 @@ Chosen: option A, kept plain. B (metal bezel) and C (bead in glass) are dropped.
 
 **The user's rule: no other orb library is drawn on the drop.** A v6.2 draft broke the drop into Thinking Orbs beads during tasks. It was rejected as too much and has been removed.
 
-- **At rest:** the whole 48 px orb is one polished liquid-metal drop (`shape` circle, `fit` contain, shift R/B .15, softness .12, tint `#ffffff40` white / `#ffffff66` dark). The metal is a still frame. Nothing loops.
+- **At rest:** the whole 48 px orb is one polished liquid-metal drop (`shape` circle, `fit` contain, shift R/B .15, softness .12, tint `#ffffff40` white / `#ffffff66` dark). **Idle:** the metal is a still frame, nothing loops and no frames are drawn.
+- **Active (v6.3):** while you engage with Orby the same drop comes alive, with no new visuals: the metal flows in a slow loop (shader time 0.45/s at full activity, edge distortion +.035), the drop breathes ±0.8% at 0.3 Hz and the highlight sways ±7° at 0.1 Hz. Engagement levels: pointer on the drop, pressing or dragging 1.0; dial open .85 (1.0 while an item is aimed); pointer within 20 px .7; a panel open .4; a pill showing .3.
+  - Activity climbs in 250 ms, holds 300 ms after engagement drops (so moving between dial items never dips), then eases out over 800 ms to exactly 0 and the drop is still again. Both ramps are smoothstepped.
+  - Clicks and picks land on top of the loop: release pulse (about 2% overshoot) plus an edge ripple (distortion +.11 × strength, 0.3 s decay); a dial pick swells the drop about 3% with a full ripple and a burst of flow (`orb::kick`).
+  - Only the drop redraws for the loop; the pill, dial and panel redraw only when they themselves move.
+  - Windows "Animation effects" off: no loop, no ripple, no squish; the static drop.
 - **While a task runs:** a thin progress ring around the drop, 6 px out (radius 30 at 1×).
   - Track: hairline 1.5 px, `rgba(255,255,255,.12)` dark / `rgba(0,0,0,.1)` white.
   - Arc: 2 px with round caps, `#FAFAFA` dark / `#171717` white, filling clockwise from 12 o'clock.
@@ -298,6 +306,8 @@ Shared rules carried into all eight:
 - The stack is a column, never a fan: no rotation.
 
 ## Type
+- **v6.3 (built): Inter Variable 4.1 is bundled.** `apps/orb-proto/assets/fonts/InterVariable.ttf` (the official rsms/inter v4.1 release asset, SIL OFL 1.1, licence beside it as `OFL.txt`) is compiled into the exe with `include_bytes!` and loaded from memory through DirectWrite (`IDWriteFactory5::CreateInMemoryFontFileLoader`, a font set, `CreateFontCollectionFromFontSet`). Nothing is installed on the system. Each text format sets Inter's `wght` axis to its weight and `opsz` to its size (clamped to 14 to 32), like the browser does. If Inter fails to load, text falls back to Segoe UI Variable and the log says why (`font:` line at start).
+- **Tabular numbers everywhere (v6.3):** every text layout gets `tnum` and `cv11` (`gfx.rs`), so digits are one width in every panel and window. Numbers that line up row to row (sizes, times, counts, percents) sit in a **right-aligned column**: `ui::text_num` with `ui::NUM_COL_PCT` (44 px, 12/16 muted) and `ui::NUM_COL_SIZE` (64 px, 13/16 500), 10 px apart (`ui::NUM_COL_GAP`). Never left-align a column of numbers.
 - **v6.1: Inter** (variable, optical sizes), with `font-feature-settings: "tnum", "cv11"` so times and amounts stay aligned. **No monospace anywhere.**
   - Reason: every reference the user picked uses a quiet grotesk at 13 px and 500 weight (Libraries.dev is all Inter).
   - Atkinson's low-vision shapes and its mono digits were the biggest reason v6 felt cheap (audit finding 1). Inter is OFL and bundled with the app, so it renders the same in Doop and in DirectWrite.
@@ -309,7 +319,7 @@ Shared rules carried into all eight:
   - card numbers 26/30
   - focus timer 34 to 44
 - **Weight:** 500 for titles, labels and buttons; 400 for body and muted values. Never 600 or 700 below 28 px (audit finding 2).
-- **Tracking:** −0.005em at 14 px, −0.02em at 26 px, −0.03em at 34 px and up.
+- **Tracking:** −0.005em at 14 px, −0.02em at 26 px, −0.03em at 34 px and up. (Not applied in the native build yet: DirectWrite has no per-format tracking, it needs per-layout character spacing.)
 - **Labels:** sentence case, 12 px, muted. Two-tone labels use the **same size** for noun and value; only colour and weight differ.
 
 ## Motion
@@ -320,8 +330,11 @@ Shared rules carried into all eight:
 | `pop` | `cubic-bezier(.34,1.56,.64,1)` (bigger overshoot) | 300 ms | tiny things only: the orb sliding out of the edge, the badge appearing |
 | `settle` | `cubic-bezier(.2,.85,.25,1.05)` (slight overshoot) | 250 ms (hover), 400 ms (stack, panel layout) | stack spread, list reorder, row collapse |
 | `press` | scale 1 → .98 | 120 ms down, 180 ms back on `settle` | buttons, rows and chips. Pressed things sink rather than lift (after Shujaat). |
-| `ripple` | y 6 px → 0, opacity 0 → 1, with `settle` | 200 ms each, 30 ms stagger, at most 8 rows (240 ms total) | panel rows entering, starting from the row nearest the orb |
+| `ripple` | y 6 px → 0, opacity 0 → 1, with `settle` | 200 ms each, 30 ms stagger, at most 8 rows (240 ms total) | panel rows entering, starting from the row nearest the orb. Built: `motion::ripple_row` + `motion::with_row` (Today, Drink log) |
+| `roll` | critically damped spring, ω 7.5 (no overshoot) | settled 0.9 s | rolling numbers: totals and sizes. Built: `motion::rolling_text` with `Roll::Slow` (Drink total) |
+| `roll quick` | critically damped spring, ω 22 | settled 0.3 s | rolling numbers that change every second (`Roll::Quick`: focus timer, prayer countdown, Downloads count and percent) |
 | `fade` | ease-out | 150 ms | content in and out, every exit |
+| `switch` | spring k 700, c 53 (critical, no overshoot) | 90 % at ~150 ms, done ~250 ms | one panel becoming another while open (Today "Add task" → Tasks, Esc back): the shape grows from the old size to the new, anchored to the orb side; old content fades out by 35 %, new content fades in over 10–70 % rising 6 px. Animation effects off: instant. (`morph.rs`) |
 
 **Surface morph (v3.1, after Shujaat):** orb, pill and panel are one object changing shape. Size and corner radius animate together (radius from 22 → 22 → 20), and the content is never stretched.
 
@@ -332,7 +345,7 @@ Shared rules carried into all eight:
 | 250 ms | Content starts fading in (`fade`, 120 ms), so text never reflows. | |
 | 360–370 ms | Settled and ready. The auto-dismiss clock starts. | Done at 280 ms, after the content fade-out. |
 
-- No endless loops. The prayer pill shakes once (±3 px) when it appears, and repeats only if it is still unread after 5.5 s, at most twice.
+- No endless loops at idle. The one loop is the drop's active state (see "Orb body"), and it only runs while you are engaging with Orby. The prayer pill shakes once (±3 px) when it appears, and repeats only if it is still unread after 5.5 s, at most twice.
 - Under `prefers-reduced-motion` (Windows: "Animation effects" off), every movement becomes a 150 ms crossfade.
 - In Rust these curves are evaluated by `crates/orb` on its own frame clock. Slint panels use the same curves through its `animate` blocks.
 
@@ -396,6 +409,19 @@ From Libraries.dev (https://github.com/Jakubantalik/Libraries.dev, MIT): **Think
 - **Gap:** shapes closer than about 12 px bridge, so the settled orb-to-pill gap is **12 px** (was 10).
 - **Limits:** bounce 0.5 or less. Reduced motion means no liquid, just a 150 ms crossfade.
 
+## Edges and depth (v6.3, built)
+Frame "v6.3 · 01 Foundation". Depth comes from the edge, not a bigger shadow. Code: `apps/orb-proto/src/depth.rs`.
+
+| Token | White | Dark |
+|---|---|---|
+| hairline | 1 px `rgba(0,0,0,.07)` | 1 px `rgba(255,255,255,.07)` |
+| **lip** (cards, controls, panels, pills) | bottom, inset `0 -1px 0 rgba(0,0,0,.04)` | top, inset `0 1px 0 rgba(255,255,255,.06)` |
+| **float shadow** (panels, pills) | `0 4px 42px rgba(0,0,0,.07), 0 2px 6px rgba(0,0,0,.05)` | tucked: `0 16px 40px -18px rgba(0,0,0,.55)` |
+
+- **Lip:** on the side that faces away from the light. White: at the bottom, where a lit surface falls into shade. Dark: on the top edge, catching the light. It follows the corners (a one-pixel crescent, `depth::lip`). Primary (ink) buttons have none.
+- **Tucked shadow:** the −18 px spread pulls the shadow under the surface, so it reads as lift without a grey halo. Direct2D has no spread, so the shape is shrunk by 18 px before the Shadow effect (σ = blur / 2).
+- **Where it is drawn:** every floating window clips itself to its rounded shape, so the shadow lives in its own click-through window right under the surface (`depth::follow`, `depth::hide`). It is drawn once per size and theme and only moved after that, so a resting surface costs nothing.
+
 ## Surface depth and liquid metal (v6)
 Doop pages: "v5.1 · surface depth + liquid gold" (the first pass, warm and gold) and "v6 · neutral + liquid metal" (**current**). This replaces the v3 micro-shadow and the core glow.
 
@@ -455,8 +481,13 @@ Interface sounds are synthesized, not samples, after the Shujaat palette: soft m
 - Muted by default; text colour on hover.
 
 ## Copy
-- Prayer and drink notices are in Indonesian. The rest is in English until there's a language setting.
-- No em dashes. No emoji in UI chrome: folder emoji are user content.
+Frame "v6.3 · 01 Foundation", copy patterns.
+- Prayer and drink notices are in Indonesian. The rest is in English until there's a language setting. Indonesian prayer strings are never rewritten by an English copy pass.
+- **Sentence case** everywhere. Panel and window names (History, Downloads, Settings) keep their capital.
+- **No exclamation marks, no emoji, no em dashes** in UI chrome. Folder emoji are user content.
+- **Errors** start with "Couldn't" and say why, then the next step: "Couldn't read this link" + "The site didn't answer in 10 s. Check the address, then retry." Ember is for the error icon only. Offline is a state, not an error ("Offline", muted).
+- **Empty states** are a title (14/18 500), one muted line, and at most one quiet button for the next step: "Nothing to clean on D:" / "Temp files and caches are already small." / Open Results.
+- **Work in progress** is a verb with an ellipsis, plus a count where there is one: "Scanning Users… 4 of 9", "Retrying…", "Loading your day…". Never a bare spinner. A button that starts the work keeps its width and shows the progress verb, quiet, while it runs.
 
 ## Placeholders (R-23, R-38)
 - **App name and logo:** not decided. "Clippy" belongs to Microsoft. Mockups use `[App]`.

@@ -7,15 +7,20 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::gfx::Surface;
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F};
+use windows::Win32::Graphics::Direct2D::{
+    ID2D1DeviceContext, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_LAYER_PARAMETERS1,
+};
+
+use crate::gfx::{brush, rrect, Surface};
 use crate::hook::unpack;
+use crate::morph::{self, Rect};
 use crate::orb::{self, arm_tuck_timer, orb_center, set_tucked, work_area, Side, INSET, WIN};
 use crate::pill::dismiss_pill;
 use crate::{
-    calendar, disk, disk_panel, downloads, downloads_panel, drink_panel, focus_panel, habits,
-    history, history_panel, hook, log_line, notices, notices_panel, panel, prayer, px, start_anim,
-    sync_keys, tasks, tasks_panel, today_panel, with_app, App, MSG_MOUSELEAVE, TIMER_PANEL,
-    TIMER_TUCK,
+    calendar, downloads, downloads_panel, drink_panel, focus_panel, habits, history, history_panel,
+    hook, log_line, notices, notices_panel, panel, prayer, px, start_anim, sync_keys, tasks,
+    tasks_panel, today_panel, with_app, App, MSG_MOUSELEAVE, TIMER_PANEL, TIMER_TUCK,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -26,7 +31,6 @@ pub enum Kind {
     Tasks,
     Today,
     Downloads,
-    Disk,
     History,
     Notices,
 }
@@ -39,14 +43,13 @@ pub enum Hit {
     Tasks(tasks_panel::Hit),
     Today(today_panel::Hit),
     Downloads(downloads_panel::Hit),
-    Disk(disk_panel::Hit),
     History(history_panel::Hit),
     Notices(notices_panel::Hit),
 }
 
-/// The panel's logical size; Focus and Drink change height with their state.
-fn size(app: &App) -> (f32, f32) {
-    match app.panel_kind {
+/// A panel's logical size; Focus and Drink change height with their state.
+fn size_of(app: &App, kind: Kind) -> (f32, f32) {
+    match kind {
         Kind::Prayer => (panel::W, panel::H),
         Kind::Focus => (
             focus_panel::W,
@@ -59,13 +62,14 @@ fn size(app: &App) -> (f32, f32) {
         Kind::Tasks => (tasks_panel::W, tasks_panel::H),
         Kind::Today => (today_panel::W, calendar::height(app)),
         Kind::Downloads => (downloads_panel::W, downloads::height(app)),
-        Kind::Disk => disk::size(app),
         Kind::History => history::size(app),
         Kind::Notices => notices::size(app),
     }
 }
 
 fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
+    let (ox, oy) = content_origin(app);
+    let (x, y) = (x - ox, y - oy);
     match app.panel_kind {
         Kind::Prayer => panel::hit(&app.g, &app.fonts, x, y).map(Hit::Prayer),
         Kind::Focus => {
@@ -77,7 +81,6 @@ fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
         Kind::Tasks => tasks::hit(app, x, y).map(Hit::Tasks),
         Kind::Today => calendar::hit(app, x, y).map(Hit::Today),
         Kind::Downloads => downloads::hit(app, x, y).map(Hit::Downloads),
-        Kind::Disk => disk::hit(app, x, y).map(Hit::Disk),
         Kind::History => history::hit(app, x, y).map(Hit::History),
         Kind::Notices => notices::hit(app, x, y).map(Hit::Notices),
     }
@@ -102,15 +105,17 @@ pub fn on_arrow(app: &mut App, up: bool) {
     }
 }
 
-fn place(app: &App) {
-    let (w, h) = size(app);
-    let (w, h) = (px(app, w), px(app, h));
+/// How far the panel fades while the dial is open over it.
+const DIMMED: f32 = 0.35;
+
+/// Where a panel of `kind` rests beside the drop, in screen pixels (before the opening slide).
+fn rest_rect(app: &App, kind: Kind) -> Rect {
+    let (w, h) = size_of(app, kind);
+    let (w, h) = (px(app, w).ceil(), px(app, h).ceil());
     let gap = px(app, 12.0);
-    // Slides 12 px in from the orb side as it opens.
-    let slide = (1.0 - app.panel_reveal.pos.clamp(0.0, 1.0)) * px(app, 12.0);
     let x = match app.side {
-        Side::Right => app.x.pos + px(app, INSET) - gap - w + slide,
-        Side::Left => app.x.pos + px(app, WIN - INSET) + gap - slide,
+        Side::Right => app.x.pos + px(app, INSET) - gap - w,
+        Side::Left => app.x.pos + px(app, WIN - INSET) + gap,
     };
     let wa = work_area(app.hwnd);
     let (_, oy) = orb_center(app);
@@ -118,28 +123,136 @@ fn place(app: &App) {
         wa.top as f32 + px(app, 8.0),
         wa.bottom as f32 - h - px(app, 8.0),
     );
+    let (l, t) = (x.round(), y.round());
+    Rect {
+        l,
+        t,
+        r: l + w,
+        b: t + h,
+    }
+}
+
+/// This frame's geometry. At rest the window, the shape and the panel are one rect. Mid-switch the
+/// window covers both panels' rects, the visible shape moves from the old rect to the new one, and
+/// each panel's content hugs the shape's orb-side top corner.
+struct Frame {
+    /// The window, in screen pixels, before the opening slide.
+    win: Rect,
+    /// The visible panel shape, in screen pixels.
+    shape: Rect,
+    /// Where the open panel's content starts, in pixels from the window's corner.
+    at: (f32, f32),
+    /// The panel being left, where its content starts, and both contents' opacity.
+    old: Option<(Kind, (f32, f32))>,
+    fade: (f32, f32),
+}
+
+fn frame(app: &App) -> Frame {
+    let to = rest_rect(app, app.panel_kind);
+    let Some((old, from)) = app.panel_morph.from else {
+        return Frame {
+            win: to,
+            shape: to,
+            at: (0.0, 0.0),
+            old: None,
+            fade: (0.0, 1.0),
+        };
+    };
+    let e = app.panel_morph.e();
+    let u = Rect::union(from, to);
+    let win = Rect {
+        l: u.l.floor(),
+        t: u.t.floor(),
+        r: u.r.ceil(),
+        b: u.b.ceil(),
+    };
+    let shape = Rect::lerp(from, to, e);
+    let fade = morph::fades(e);
+    let right = matches!(app.side, Side::Right);
+    // Whole pixels, so text stays crisp while it moves.
+    let at = |w: f32, rise: f32| {
+        let (x, y) = morph::anchor(shape, w, right);
+        ((x - win.l).round(), (y + rise - win.t).round())
+    };
+    let old_w = px(app, size_of(app, old).0).ceil();
+    Frame {
+        win,
+        shape,
+        at: at(to.w(), px(app, morph::RISE) * (1.0 - fade.1)),
+        old: Some((old, at(old_w, 0.0))),
+        fade,
+    }
+}
+
+/// Where the open panel's content starts in the window, in logical pixels (zero at rest).
+fn content_origin(app: &App) -> (f32, f32) {
+    if !app.panel_morph.active() {
+        return (0.0, 0.0);
+    }
+    let (x, y) = frame(app).at;
+    (x / app.scale, y / app.scale)
+}
+
+fn place(app: &mut App) {
+    let f = frame(app);
+    // Slides 12 px in from the orb side as it opens.
+    let slide = (1.0 - app.panel_reveal.pos.clamp(0.0, 1.0)) * px(app, 12.0);
+    let dx = match app.side {
+        Side::Right => slide,
+        Side::Left => -slide,
+    };
     let raising = orb::raise_once(app.panel_hwnd).0 == 0;
     unsafe {
         let _ = SetWindowPos(
             app.panel_hwnd,
             Some(HWND_TOPMOST),
-            x.round() as i32,
-            y.round() as i32,
-            w.ceil() as i32,
-            h.ceil() as i32,
+            (f.win.l + dx).round() as i32,
+            f.win.t.round() as i32,
+            f.win.w().round() as i32,
+            f.win.h().round() as i32,
             SWP_NOACTIVATE | SWP_NOOWNERZORDER | orb::raise_once(app.panel_hwnd),
         );
+    }
+    // The region is the visible shape, so clicks and the click-outside test follow it mid-switch.
+    let rgn = (
+        (f.shape.l - f.win.l).round() as i32,
+        (f.shape.t - f.win.t).round() as i32,
+        (f.shape.r - f.win.l).round() as i32,
+        (f.shape.b - f.win.t).round() as i32,
+    );
+    if app.panel_morph.rgn != Some(rgn) {
+        set_region(app, rgn);
+        app.panel_morph.rgn = Some(rgn);
+    }
+    // The shadow window sits right under the visible shape (depth.rs), fading with the panel.
+    let shown = app.panel_reveal.pos.clamp(0.0, 1.0) * app.panel_dim.pos.clamp(0.0, 1.0);
+    if app.panel_open || app.panel_reveal.pos > 0.02 {
+        crate::depth::follow(
+            &app.g,
+            app.panel_hwnd,
+            (f.shape.l + dx, f.shape.t, f.shape.r + dx, f.shape.b),
+            20.0,
+            app.scale,
+            app.theme.dark,
+            shown,
+        );
+    } else {
+        crate::depth::hide(app.panel_hwnd);
     }
     // A notice on screen must stay readable: the pill keeps its place above a panel that opens under it.
     if raising && app.pill.is_some() {
         crate::pill::raise(app);
     }
+    // The click-outside test reads a copy of our window rects. A panel that grows without an
+    // animation frame (a notice cleared, a task added) must update that copy at once, or the
+    // next click on its new part counts as outside and closes it.
+    crate::hook::update_hook(app);
 }
 
-fn set_region(app: &App, w: i32, h: i32) {
+fn set_region(app: &App, (l, t, r, b): (i32, i32, i32, i32)) {
     unsafe {
         let d = px(app, 40.0).round() as i32;
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
+        let rgn = CreateRoundRectRgn(l, t, r + 1, b + 1, d, d);
         let _ = SetWindowRgn(app.panel_hwnd, Some(rgn), true);
     }
 }
@@ -148,26 +261,142 @@ fn render(app: &mut App) {
     if !app.panel_open && app.panel_reveal.pos <= 0.02 {
         return;
     }
-    if app.panel_kind == Kind::Disk {
-        disk::prepare(app);
-    }
-    let (lw, lh) = size(app);
-    let (w, h) = (px(app, lw).ceil() as u32, px(app, lh).ceil() as u32);
-    match app.panel_surface.as_mut() {
-        None => app.panel_surface = Surface::new(&app.g, app.panel_hwnd, w, h, app.scale).ok(),
+    let f = frame(app);
+    let (w, h) = (f.win.w().round() as u32, f.win.h().round() as u32);
+    let resized = match app.panel_surface.as_mut() {
+        None => {
+            app.panel_surface = Surface::new(&app.g, app.panel_hwnd, w, h, app.scale).ok();
+            false
+        }
         Some(s) if s.w != w || s.h != h => {
             let _ = s.resize(&app.g, w, h);
-            place(app);
-            set_region(app, w as i32, h as i32);
+            true
         }
-        _ => {}
+        _ => false,
+    };
+    if resized {
+        place(app);
     }
     let Some(s) = app.panel_surface.as_ref() else {
         return;
     };
     let dc = s.begin(&app.g);
     let hover = app.panel_hover;
-    match app.panel_kind {
+    match f.old {
+        None => {
+            draw_kind(app, dc, app.panel_kind, hover);
+            // The T3 lip along the panel's edge (depth.rs).
+            let (w, h) = (f.win.w() / app.scale, f.win.h() / app.scale);
+            crate::depth::lip(&app.g, dc, &app.theme, 0.0, 0.0, w, h, 20.0, 1.0);
+        }
+        Some((old, old_at)) => {
+            let sc = app.scale;
+            let shape = D2D_RECT_F {
+                left: (f.shape.l - f.win.l) / sc,
+                top: (f.shape.t - f.win.t) / sc,
+                right: (f.shape.r - f.win.l) / sc,
+                bottom: (f.shape.b - f.win.t) / sc,
+            };
+            let t = &app.theme;
+            unsafe {
+                dc.FillRoundedRectangle(
+                    &rrect(shape.left, shape.top, shape.right, shape.bottom, 20.0),
+                    &brush(dc, t.panel),
+                );
+            }
+            in_shape(dc, &shape, old_at, sc, f.fade.0, || {
+                draw_kind(app, dc, old, None)
+            });
+            in_shape(dc, &shape, f.at, sc, f.fade.1, || {
+                draw_kind(app, dc, app.panel_kind, hover)
+            });
+            stroke_shape(dc, &shape, t.hair);
+            crate::depth::lip(
+                &app.g,
+                dc,
+                t,
+                shape.left,
+                shape.top,
+                shape.right,
+                shape.bottom,
+                20.0,
+                1.0,
+            );
+        }
+    }
+    s.end(&app.g);
+    // A rolling number or a row ripple started in this draw: keep frames coming until it settles.
+    if crate::motion::active() && app.anim_start.is_none() {
+        start_anim(app);
+    }
+}
+
+/// Draws one panel's content into the moving shape: clipped to it, faded, offset to `at` (pixels).
+fn in_shape(
+    dc: &ID2D1DeviceContext,
+    shape: &D2D_RECT_F,
+    at: (f32, f32),
+    scale: f32,
+    opacity: f32,
+    draw: impl FnOnce(),
+) {
+    if opacity <= 0.003 {
+        return;
+    }
+    let layer = D2D1_LAYER_PARAMETERS1 {
+        contentBounds: D2D_RECT_F {
+            left: -1e6,
+            top: -1e6,
+            right: 1e6,
+            bottom: 1e6,
+        },
+        maskTransform: windows_numerics::Matrix3x2::identity(),
+        opacity,
+        ..Default::default()
+    };
+    unsafe {
+        dc.PushAxisAlignedClip(shape, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        dc.PushLayer(&layer, None);
+        dc.SetTransform(&translate(at.0 / scale, at.1 / scale));
+    }
+    draw();
+    unsafe {
+        dc.SetTransform(&translate(0.0, 0.0));
+        dc.PopLayer();
+        dc.PopAxisAlignedClip();
+    }
+}
+
+fn stroke_shape(dc: &ID2D1DeviceContext, s: &D2D_RECT_F, hair: D2D1_COLOR_F) {
+    unsafe {
+        dc.DrawRoundedRectangle(
+            &rrect(
+                s.left + 0.5,
+                s.top + 0.5,
+                s.right - 0.5,
+                s.bottom - 0.5,
+                19.5,
+            ),
+            &brush(dc, hair),
+            1.0,
+            None,
+        );
+    }
+}
+
+fn translate(x: f32, y: f32) -> windows_numerics::Matrix3x2 {
+    windows_numerics::Matrix3x2 {
+        M11: 1.0,
+        M12: 0.0,
+        M21: 0.0,
+        M22: 1.0,
+        M31: x,
+        M32: y,
+    }
+}
+
+fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>) {
+    match kind {
         Kind::Prayer => prayer::draw_panel(
             app,
             dc,
@@ -210,11 +439,6 @@ fn render(app: &mut App) {
                 }
             }),
         ),
-        Kind::Disk => disk::draw_panel(
-            app,
-            dc,
-            hover.and_then(|h| if let Hit::Disk(p) = h { Some(p) } else { None }),
-        ),
         Kind::History => history::draw_panel(
             app,
             dc,
@@ -238,7 +462,6 @@ fn render(app: &mut App) {
             }),
         ),
     }
-    s.end(&app.g);
 }
 
 /// The countdowns tick once a second while their panel is open, and Today once a minute (its
@@ -306,12 +529,10 @@ pub fn open_panel(app: &mut App, kind: Kind) {
     }
     set_tucked(app, false);
     let switching = app.panel_open;
+    // The shape on screen now: a switch grows from here (mid-switch too, so it never jumps).
+    let leaving = (app.panel_kind, frame(app).shape);
     if switching && app.panel_kind == Kind::Tasks {
         tasks::on_panel_hidden(app);
-    }
-    if switching && app.panel_kind == Kind::Disk {
-        disk::on_panel_closed(app);
-        release_keyboard(app);
     }
     if switching && app.panel_kind == Kind::History {
         history::on_closed(app);
@@ -324,14 +545,22 @@ pub fn open_panel(app: &mut App, kind: Kind) {
     app.panel_kind = kind;
     app.panel_open = true;
     app.panel_hover = None;
+    // Its rows ripple in on the first draw.
+    crate::motion::ripple_reset_all();
     if !switching {
         app.panel_reveal.k = 190.0; // "settle"
         app.panel_reveal.c = 26.0;
         app.panel_reveal.target = 1.0;
     }
+    // A switch while open morphs the window from one panel to the other (Animation effects off:
+    // it changes at once).
+    app.panel_morph.back = None;
+    if switching && !downloads::reduced_motion() {
+        app.panel_morph.start(leaving.0, leaving.1);
+    } else {
+        app.panel_morph.finish();
+    }
     place(app);
-    let (w, h) = size(app);
-    set_region(app, px(app, w).ceil() as i32, px(app, h).ceil() as i32);
     unsafe {
         let _ = KillTimer(Some(app.hwnd), TIMER_TUCK);
         let _ = ShowWindow(app.panel_hwnd, SW_SHOWNOACTIVATE);
@@ -343,13 +572,6 @@ pub fn open_panel(app: &mut App, kind: Kind) {
     start_anim(app);
     if kind == Kind::Tasks {
         tasks::on_panel_shown(app);
-    }
-    if kind == Kind::Disk {
-        let ok = take_keyboard(app);
-        log_line(
-            app,
-            &format!("disk: panel takes the keyboard (foreground={ok})"),
-        );
     }
     if kind == Kind::History {
         let ok = take_keyboard(app);
@@ -365,10 +587,23 @@ pub fn open_panel(app: &mut App, kind: Kind) {
 pub fn on_esc(app: &mut App) {
     if app.panel_open && app.panel_kind == Kind::Tasks {
         tasks::on_esc(app);
-    } else if app.panel_open && app.panel_kind == Kind::Disk {
-        disk::on_esc(app);
     } else {
-        close_panel(app);
+        back_or_close(app);
+    }
+}
+
+/// Opens `kind` from inside the open panel (Today's "Add task"); Esc there comes back.
+pub fn drill_in(app: &mut App, kind: Kind) {
+    let back = app.panel_open.then_some(app.panel_kind);
+    open_panel(app, kind);
+    app.panel_morph.back = back.filter(|b| *b != kind);
+}
+
+/// Esc with nothing left to clear: back to the panel this one was opened from, else close.
+pub fn back_or_close(app: &mut App) {
+    match app.panel_morph.back.take() {
+        Some(k) if app.panel_open => open_panel(app, k),
+        _ => close_panel(app),
     }
 }
 
@@ -377,14 +612,11 @@ pub fn close_panel(app: &mut App) {
         return;
     }
     app.panel_open = false;
+    app.panel_morph.back = None;
     app.knob_drag = false;
     downloads::close_menu(app);
     if app.panel_kind == Kind::Tasks {
         tasks::on_panel_hidden(app);
-    }
-    if app.panel_kind == Kind::Disk {
-        disk::on_panel_closed(app);
-        release_keyboard(app);
     }
     if app.panel_kind == Kind::History {
         history::on_closed(app);
@@ -412,7 +644,6 @@ fn click(app: &mut App, h: Hit) {
         Hit::Tasks(t) => tasks::click(app, t),
         Hit::Today(t) => calendar::click(app, t),
         Hit::Downloads(d) => downloads::click(app, d),
-        Hit::Disk(d) => disk::click(app, d),
         Hit::History(h) => history::click(app, h),
         Hit::Notices(h) => notices::click(app, h),
     }
@@ -422,34 +653,60 @@ fn click(app: &mut App, h: Hit) {
 pub fn tick(app: &mut App, dt: f32) {
     let was_visible = app.panel_open || app.panel_reveal.pos > 0.02;
     app.panel_reveal.step(dt);
+    if app.panel_morph.active() {
+        app.panel_morph.p.step(dt);
+        if app.panel_morph.p.settled(0.002) {
+            app.panel_morph.finish();
+        }
+    }
+    // With the dial open over it, the panel steps back so the eye goes to the dial.
+    app.panel_dim.target = if app.dial_open && app.panel_open {
+        DIMMED
+    } else {
+        1.0
+    };
+    app.panel_dim.step(dt);
+    let dim = app.panel_dim.pos;
+    if let Some(s) = app.panel_surface.as_mut() {
+        s.set_opacity(&app.g, dim);
+    }
     if was_visible {
-        place(app);
         if !app.panel_open && app.panel_reveal.pos <= 0.02 {
+            place(app);
             app.panel_reveal.snap(0.0);
+            crate::depth::hide(app.panel_hwnd);
             unsafe {
                 let _ = ShowWindow(app.panel_hwnd, SW_HIDE);
             }
         } else {
+            // Draw first: when a switch ends, the surface shrinks and the window moves together.
             render(app);
+            place(app);
         }
     }
 }
 
 pub fn is_animating(app: &App) -> bool {
-    !app.panel_reveal.settled(0.002)
+    let dim_target = if app.dial_open && app.panel_open {
+        DIMMED
+    } else {
+        1.0
+    };
+    app.panel_morph.active()
+        || (app.panel_open && crate::motion::active())
+        || !app.panel_reveal.settled(0.002)
+        || !app.panel_dim.settled(0.002)
+        || (app.panel_dim.pos - dim_target).abs() > 0.002
 }
 
 fn knob_at(app: &mut App, x: f32, y: f32, persist: bool) {
-    let v = focus_panel::knob_value(x / app.scale, y / app.scale);
+    let (ox, oy) = content_origin(app);
+    let v = focus_panel::knob_value(x / app.scale - ox, y / app.scale - oy);
     habits::set_knob(app, v, persist);
 }
 
 fn tasks_open(app: &App) -> bool {
     app.panel_open && app.panel_kind == Kind::Tasks
-}
-
-fn disk_open(app: &App) -> bool {
-    app.panel_open && app.panel_kind == Kind::Disk
 }
 
 fn history_open(app: &App) -> bool {
@@ -460,7 +717,7 @@ fn notices_open(app: &App) -> bool {
     app.panel_open && app.panel_kind == Kind::Notices
 }
 
-/// A panel that types (Tasks, Disk) takes the keyboard: the window drops WS_EX_NOACTIVATE and
+/// A panel that types takes the keyboard: the window drops WS_EX_NOACTIVATE and
 /// comes to the foreground. Returns whether Windows let it.
 pub fn take_keyboard(app: &mut App) -> bool {
     unsafe {
@@ -508,10 +765,9 @@ pub unsafe extern "system" fn panel_proc(
 ) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => {
-            let activate = with_app(|app| {
-                tasks_open(app) || disk_open(app) || history_open(app) || notices_open(app)
-            })
-            .unwrap_or(false);
+            let activate =
+                with_app(|app| tasks_open(app) || history_open(app) || notices_open(app))
+                    .unwrap_or(false);
             return LRESULT(if activate { MA_ACTIVATE } else { MA_NOACTIVATE } as isize);
         }
         WM_ACTIVATE => {
@@ -525,7 +781,6 @@ pub unsafe extern "system" fn panel_proc(
         WM_KEYDOWN => {
             let handled = with_app(|app| {
                 (tasks_open(app) && tasks::on_keydown(app, wparam.0 as u16))
-                    || (disk_open(app) && disk::on_keydown(app, wparam.0 as u16))
                     || (history_open(app) && history::on_keydown(app, wparam.0 as u16))
                     || (notices_open(app) && notices::on_keydown(app, wparam.0 as u16))
             })
@@ -552,7 +807,7 @@ pub unsafe extern "system" fn panel_proc(
                         knob_at(app, x, y, false);
                     }
                     Some(Hit::Tasks(tasks_panel::Hit::Field)) => {
-                        tasks::press_field(app, x / app.scale)
+                        tasks::press_field(app, x / app.scale - content_origin(app).0)
                     }
                     _ => {}
                 }
@@ -626,14 +881,6 @@ pub unsafe extern "system" fn panel_proc(
                     calendar::on_wheel(app, delta);
                 } else if app.panel_open && app.panel_kind == Kind::Downloads {
                     downloads::on_wheel(app, delta);
-                } else if disk_open(app) {
-                    let (sx, sy) = unpack(lparam);
-                    let mut p = POINT {
-                        x: sx as i32,
-                        y: sy as i32,
-                    };
-                    let _ = ScreenToClient(hwnd, &mut p);
-                    disk::on_wheel(app, p.x as f32 / app.scale, p.y as f32 / app.scale, delta);
                 } else if wants_arrows(app) {
                     habits::knob_key(app, delta > 0);
                 } else if tasks_open(app) {
@@ -644,7 +891,7 @@ pub unsafe extern "system" fn panel_proc(
                         y: sy as i32,
                     };
                     let _ = ScreenToClient(hwnd, &mut p);
-                    tasks::on_wheel(app, p.x as f32 / app.scale, delta);
+                    tasks::on_wheel(app, p.x as f32 / app.scale - content_origin(app).0, delta);
                 }
             });
             return LRESULT(0);

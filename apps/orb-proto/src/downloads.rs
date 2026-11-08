@@ -61,7 +61,12 @@ enum Msg {
     Fetched(Result<PathBuf, String>),
     /// Change folder moved the job's half-done files; these are their new paths.
     Moved(JobId, Vec<PathBuf>),
+    /// The pause after a job's first unnamed failure is over: start it again.
+    Restart(JobId),
 }
+
+/// How long a job waits before its one silent retry.
+const RETRY_PAUSE: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 enum MenuFor {
@@ -153,6 +158,16 @@ fn find_ffmpeg(bin: &Path) -> PathBuf {
         .unwrap_or(ours)
 }
 
+/// yt-dlp with its ffmpeg and, for YouTube, a JavaScript runtime (deno next to yt-dlp, else
+/// deno, node or bun on PATH).
+fn sidecar(yt_dlp: PathBuf, bin: &Path) -> Sidecar {
+    Sidecar {
+        yt_dlp,
+        ffmpeg: find_ffmpeg(bin),
+        js: dl::find_js_runtime(bin, std::env::var_os("PATH").as_deref()),
+    }
+}
+
 fn downloads_known() -> Option<PathBuf> {
     unsafe {
         let p = SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None).ok()?;
@@ -210,10 +225,7 @@ impl Downloads {
     pub fn load(menu_hwnd: HWND) -> Downloads {
         let bin = bin_dir();
         let engine = match find_yt_dlp(&bin) {
-            Some(yt_dlp) => Engine::Ready(Sidecar {
-                yt_dlp,
-                ffmpeg: find_ffmpeg(&bin),
-            }),
+            Some(yt_dlp) => Engine::Ready(sidecar(yt_dlp, &bin)),
             None => Engine::Missing,
         };
         let (tx, rx) = channel();
@@ -280,13 +292,15 @@ pub fn start(app: &mut App) {
     let listening = unsafe { AddClipboardFormatListener(app.hwnd) }.is_ok();
     let engine = match &app.dl.engine {
         Engine::Ready(s) => format!(
-            "yt-dlp {} (ffmpeg {})",
+            "yt-dlp {} (ffmpeg {}, js runtime {})",
             s.yt_dlp.display(),
             if s.ffmpeg.is_file() {
                 "found"
             } else {
                 "missing"
-            }
+            },
+            s.js.as_ref()
+                .map_or("none".to_string(), |j| j.path.display().to_string())
         ),
         _ => format!("yt-dlp missing in {}", app.dl.bin.display()),
     };
@@ -416,32 +430,64 @@ fn pump(app: &mut App) {
     if let Engine::Ready(sidecar) = &app.dl.engine {
         let sidecar = sidecar.clone();
         for (id, req) in app.dl.queue.start_ready() {
-            let _ = std::fs::create_dir_all(&req.folder);
-            let r = reporter(app);
-            let started = dl::start(&sidecar, &req, move |u| r.send(Msg::Job(id, u)));
-            match started {
-                Ok(d) => {
-                    app.dl.running.insert(id, d);
-                    log_line(
-                        app,
-                        &format!(
-                            "downloads: started {} ({})",
-                            dm::short_link(&req.link),
-                            req.format.label()
-                        ),
-                    );
-                }
-                Err(e) => {
-                    log_line(app, &format!("downloads: could not start yt-dlp ({e})"));
-                    // Back to waiting, so it starts once the engine is there.
-                    let _ = app.dl.queue.pause(id);
-                    let _ = app.dl.queue.resume(id);
-                    app.dl.engine = Engine::Missing;
-                }
-            }
+            launch(app, &sidecar, id, &req, "started");
         }
     }
     after(app);
+}
+
+/// Spawns yt-dlp for a job the queue has made active.
+fn launch(app: &mut App, sidecar: &Sidecar, id: JobId, req: &dl::Request, verb: &str) {
+    let _ = std::fs::create_dir_all(&req.folder);
+    let r = reporter(app);
+    match dl::start(sidecar, req, move |u| r.send(Msg::Job(id, u))) {
+        Ok(d) => {
+            app.dl.running.insert(id, d);
+            log_line(
+                app,
+                &format!(
+                    "downloads: {verb} {} ({})",
+                    dm::short_link(&req.link),
+                    req.format.label()
+                ),
+            );
+        }
+        Err(e) => {
+            log_line(app, &format!("downloads: could not start yt-dlp ({e})"));
+            // Back to waiting, so it starts once the engine is there.
+            let _ = app.dl.queue.pause(id);
+            let _ = app.dl.queue.resume(id);
+            app.dl.engine = Engine::Missing;
+        }
+    }
+}
+
+/// The silent retry: only if the job still waits for it (not paused, cancelled or already
+/// started again by a resume in between).
+fn restart(app: &mut App, id: JobId) {
+    if app.dl.running.contains_key(&id) {
+        return;
+    }
+    let Some(req) = app
+        .dl
+        .queue
+        .get(id)
+        .filter(|j| j.state.is_active())
+        .map(|j| j.request.clone())
+    else {
+        return;
+    };
+    match &app.dl.engine {
+        Engine::Ready(sidecar) => {
+            let sidecar = sidecar.clone();
+            launch(app, &sidecar, id, &req, "trying again");
+        }
+        // Back to waiting, so it starts once the engine is there.
+        _ => {
+            let _ = app.dl.queue.pause(id);
+            let _ = app.dl.queue.resume(id);
+        }
+    }
 }
 
 fn ring_changed(a: Ring, b: Ring) -> bool {
@@ -497,8 +543,32 @@ pub fn on_msg(app: &mut App) {
                     }
                 }
                 let was_active = app.dl.queue.get(id).is_some_and(|j| j.state.is_active());
-                app.dl.queue.apply(id, u, now);
-                if finished && was_active {
+                if app.dl.queue.apply(id, u, now) {
+                    let why = app
+                        .dl
+                        .queue
+                        .get(id)
+                        .map(|j| {
+                            format!(
+                                "{}: {}",
+                                dm::short_link(&j.request.link),
+                                j.error_text.as_deref().unwrap_or("no error text")
+                            )
+                        })
+                        .unwrap_or_default();
+                    log_line(
+                        app,
+                        &format!(
+                            "downloads: {why}; trying again in {} s",
+                            RETRY_PAUSE.as_secs()
+                        ),
+                    );
+                    let r = reporter(app);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(RETRY_PAUSE);
+                        r.send(Msg::Restart(id));
+                    });
+                } else if finished && was_active {
                     if let Some(job) = app.dl.queue.get(id).cloned() {
                         on_finished(app, &job);
                     }
@@ -514,13 +584,13 @@ pub fn on_msg(app: &mut App) {
                     app,
                     &format!("downloads: yt-dlp is ready at {}", yt_dlp.display()),
                 );
-                let ffmpeg = find_ffmpeg(&app.dl.bin);
-                app.dl.engine = Engine::Ready(Sidecar { yt_dlp, ffmpeg });
+                app.dl.engine = Engine::Ready(sidecar(yt_dlp, &app.dl.bin));
             }
             Msg::Fetched(Err(why)) => {
                 log_line(app, &format!("downloads: fetching yt-dlp failed: {why}"));
                 app.dl.engine = Engine::Failed(why);
             }
+            Msg::Restart(id) => restart(app, id),
             Msg::Moved(id, moved) => {
                 app.dl.moving.remove(&id);
                 if app.dl.queue.get(id).is_some() {
@@ -590,8 +660,9 @@ fn on_finished(app: &mut App, job: &Job) {
             log_line(
                 app,
                 &format!(
-                    "downloads: {} failed ({kind:?})",
-                    dm::short_link(&job.request.link)
+                    "downloads: {} failed ({kind:?}): {}",
+                    dm::short_link(&job.request.link),
+                    job.error_text.as_deref().unwrap_or("no error text")
                 ),
             );
             let (title, mut value, action) = dm::error_words(*kind, &job.request.folder);
@@ -1102,7 +1173,7 @@ pub fn on_wheel(app: &mut App, delta: i16) {
 
 fn fetch(url: &str, bin: &Path, progress: impl Fn(u64, Option<u64>)) -> Result<PathBuf, String> {
     std::fs::create_dir_all(bin)
-        .map_err(|e| format!("Could not make the folder {} ({})", bin.display(), e.kind()))?;
+        .map_err(|e| format!("Couldn't make the folder {} ({})", bin.display(), e.kind()))?;
     let tls = native_tls::TlsConnector::new()
         .map_err(|_| "Secure connections are not available".to_string())?;
     let agent = ureq::AgentBuilder::new()
@@ -1113,12 +1184,12 @@ fn fetch(url: &str, bin: &Path, progress: impl Fn(u64, Option<u64>)) -> Result<P
         .build();
     let resp = agent.get(url).call().map_err(|e| match e {
         ureq::Error::Status(code, _) => format!("The download answered {code}"),
-        _ => "Could not reach GitHub".to_string(),
+        _ => "Couldn't reach GitHub".to_string(),
     })?;
     let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
     let part = bin.join("yt-dlp.exe.part");
     let mut out = std::fs::File::create(&part)
-        .map_err(|e| format!("Could not write in {} ({})", bin.display(), e.kind()))?;
+        .map_err(|e| format!("Couldn't write in {} ({})", bin.display(), e.kind()))?;
     let mut reader = resp.into_reader();
     let mut buf = vec![0u8; 64 * 1024];
     let (mut done, mut told) = (0u64, 0u64);
@@ -1132,7 +1203,7 @@ fn fetch(url: &str, bin: &Path, progress: impl Fn(u64, Option<u64>)) -> Result<P
             break Err("The file was not a Windows program".to_string());
         }
         if out.write_all(&buf[..n]).is_err() {
-            break Err("Could not write the file".to_string());
+            break Err("Couldn't write the file".to_string());
         }
         done += n as u64;
         if done - told >= 256 * 1024 {
@@ -1154,7 +1225,7 @@ fn fetch(url: &str, bin: &Path, progress: impl Fn(u64, Option<u64>)) -> Result<P
     }
     let dest = bin.join("yt-dlp.exe");
     std::fs::rename(&part, &dest)
-        .map_err(|e| format!("Could not put yt-dlp in place ({})", e.kind()))?;
+        .map_err(|e| format!("Couldn't put yt-dlp in place ({})", e.kind()))?;
     Ok(dest)
 }
 

@@ -253,6 +253,7 @@ fn button(
             &brush(dc, if hover { t.button_hover } else { t.button }),
         );
     }
+    crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, (r.3 - r.1) / 2.0, 1.0);
     center_text(
         g,
         dc,
@@ -454,7 +455,7 @@ pub fn draw(
                 }
             }
         } else {
-            right_text(g, dc, &row.time, &f.small, r.2 - 8.0, r.1, ROW_H, &muted);
+            crate::ui::text_num(g, dc, &row.time, &f.small, r.2 - 8.0, r.1, ROW_H, &muted);
         }
     }
     if let Some((n, y)) = l.older {

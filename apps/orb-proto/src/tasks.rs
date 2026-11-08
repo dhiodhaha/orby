@@ -223,7 +223,7 @@ fn update_badge(app: &mut App, c: &Clock) {
 fn report(app: &mut App, what: &str, r: app_store::Result<()>) {
     if let Err(e) = r {
         log_line(app, &format!("tasks: {what} failed: {e}"));
-        app.tasks.notice = Some(format!("Could not {what}: {e}"));
+        app.tasks.notice = Some(format!("Couldn't {what}: {e}"));
     }
 }
 
@@ -413,6 +413,13 @@ pub fn open(app: &mut App, sel: Option<Selection>) {
     panels::open_panel(app, Kind::Tasks);
 }
 
+/// Today's "Add task": Tasks opens on its Today list with the field ready, and Esc comes back.
+pub fn add_from_today(app: &mut App) {
+    select(app, Selection::Today);
+    commit(app);
+    panels::drill_in(app, Kind::Tasks);
+}
+
 /// The panel takes the keyboard while it is open (the other panels never do).
 pub fn on_panel_shown(app: &mut App) {
     let ok = panels::take_keyboard(app);
@@ -445,7 +452,7 @@ pub fn on_esc(app: &mut App) {
         app.tasks.notice = None;
         panels::refresh(app);
     } else {
-        panels::close_panel(app);
+        panels::back_or_close(app);
     }
 }
 
@@ -646,7 +653,7 @@ pub fn view(app: &App) -> View {
         None => String::new(),
     };
     let sync = match &t.store_error {
-        Some(_) => "Could not open app.db; not saved".to_string(),
+        Some(_) => "Couldn't open app.db, changes aren't saved".to_string(),
         None => "On this PC only · sync is off".to_string(),
     };
     let understood = t.notice.clone().unwrap_or(understood);

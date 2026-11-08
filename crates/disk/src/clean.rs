@@ -17,12 +17,23 @@ pub enum SuggestionKind {
 }
 
 /// The honesty tag on a suggestion. Words in the UI, never colours.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Tag {
-    /// The user's own files: look first.
+    /// The user's own files, or something slow or costly to get back: look first. Never
+    /// pre-selected.
     CheckFirst,
     /// Windows or the app rebuilds it.
     SafeToRemove,
+}
+
+impl Tag {
+    /// "Check first", "Safe to remove".
+    pub fn label(self) -> &'static str {
+        match self {
+            Tag::CheckFirst => "Check first",
+            Tag::SafeToRemove => "Safe to remove",
+        }
+    }
 }
 
 impl SuggestionKind {

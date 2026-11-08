@@ -19,6 +19,13 @@ use crate::ui::{Pill, PillAction};
 pub const PACING_MS: u64 = 1500;
 /// Clear all can be undone this long.
 pub const UNDO_CLEAR: Duration = Duration::from_secs(6);
+/// A pill that stays until you close it ("10 menit lagi Isya", the adzan playing). This is the
+/// longest a Windows timer waits (USER_TIMER_MAXIMUM, about 24 days), so the pill's own clock
+/// never ends it; the prayer time does.
+pub const STICKY_MS: u32 = 0x7FFF_FFFF;
+/// A prayer reminder held this long past its moment says the wrong thing ("30 menit lagi" with
+/// 18 minutes left), so it is dropped instead of shown late.
+pub const PRAYER_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Now {
@@ -105,10 +112,19 @@ pub struct Notice {
     pub merge: Option<Merge>,
     /// Gone once this passes ("10 menit lagi Maghrib" at Maghrib, "Standup in 10 min" at its start).
     pub stale_at: Option<Moment>,
+    /// Dropped if it has not shown by then (cleared once it shows): a held "30 menit lagi" is
+    /// never shown late.
+    pub show_by: Option<Moment>,
     /// A reminder ahead of this prayer: "Memasuki waktu" drops it wherever it waits.
     pub prayer: Option<String>,
     /// After a pill of this kind shows, the next one waits this long ("Disk space: once a day").
     pub cooldown: Option<(&'static str, Duration)>,
+    /// A prayer reminder: only presenting holds it. Focus, full screen, a pause and the orb
+    /// hidden for a full-screen app let it through (silently in full screen).
+    pub through: bool,
+    /// Stays until you close it. Covered by a panel or the dial, it comes back; a normal notice
+    /// arriving takes the front for its turn, then this one comes back.
+    pub sticky: bool,
 }
 
 impl Notice {
@@ -126,8 +142,11 @@ impl Notice {
             pill,
             merge: None,
             stale_at: None,
+            show_by: None,
             prayer: None,
             cooldown: None,
+            through: false,
+            sticky: false,
         }
     }
 
@@ -149,14 +168,26 @@ impl Notice {
         }
     }
 
-    /// "10 menit lagi Maghrib" replaces a waiting "30 menit lagi Maghrib".
-    pub fn before_prayer(self, prayer: &str, at: Moment) -> Notice {
+    /// "10 menit lagi Maghrib" replaces a waiting "30 menit lagi Maghrib". `prayer_at` is the
+    /// prayer's time and `now` when the reminder fired: it is gone at the prayer time, and if it
+    /// has not shown within `PRAYER_GRACE` of firing it is dropped, so it never shows late.
+    pub fn before_prayer(self, prayer: &str, prayer_at: Moment, now: Moment) -> Notice {
         Notice {
             prayer: Some(prayer.to_string()),
-            stale_at: Some(at),
+            stale_at: Some(prayer_at),
+            show_by: Some(now + PRAYER_GRACE),
+            through: true,
             ..self
         }
         .replacing("before-prayer")
+    }
+
+    /// Stays until you close it.
+    pub fn sticky(self) -> Notice {
+        Notice {
+            sticky: true,
+            ..self
+        }
     }
 
     /// The newest of this kind replaces the one waiting.
@@ -227,7 +258,12 @@ impl Entry {
     }
 
     fn fresh(&self, now: Moment) -> bool {
-        self.notice.stale_at.is_none_or(|s| now < s)
+        self.notice.stale_at.is_none_or(|s| now < s) && self.notice.show_by.is_none_or(|s| now < s)
+    }
+
+    /// It is on screen: from now on only `stale_at` ends it.
+    fn shown(&mut self) {
+        self.notice.show_by = None;
     }
 }
 
@@ -242,16 +278,27 @@ pub struct Quiet {
     pub focus: bool,
     /// Pause notices (30 min, 1 hour, until tomorrow).
     pub paused: bool,
+    /// Presenting (Windows presentation mode): the one quiet time that holds prayer reminders.
+    pub presenting: bool,
 }
 
 impl Quiet {
     pub fn holds(&self) -> bool {
-        self.hidden || self.full_screen || self.focus || self.paused
+        self.hidden || self.full_screen || self.focus || self.paused || self.presenting
+    }
+
+    /// Whether this quiet time holds `n`. Prayer reminders wait only while you present.
+    pub fn holds_notice(&self, n: &Notice) -> bool {
+        if n.through {
+            self.presenting
+        } else {
+            self.holds()
+        }
     }
 
     /// After these, what waited comes back as one summary. Being hidden ends with the badge only.
     fn summarizes(&self) -> bool {
-        self.full_screen || self.focus || self.paused
+        self.full_screen || self.focus || self.paused || self.presenting
     }
 }
 
@@ -398,6 +445,18 @@ impl Queue {
         matches!(&self.front, Some(Front::Entry(e)) if e.notice.priority == Priority::Urgent)
     }
 
+    /// The pill in front shows even while the orb is hidden (urgent, or a prayer reminder).
+    pub fn front_breaks_through(&self) -> bool {
+        matches!(&self.front, Some(Front::Entry(e))
+            if e.notice.priority == Priority::Urgent || e.notice.through)
+    }
+
+    /// A sticky normal pill in front gives the slot to a new notice and comes back after it.
+    fn front_yields(&self) -> bool {
+        matches!(&self.front, Some(Front::Entry(e))
+            if e.notice.sticky && e.notice.priority != Priority::Urgent)
+    }
+
     /// A notice arrives. `q` is the quiet time right now; `slot_busy` says a pill (perhaps one
     /// closing) is on screen.
     pub fn offer(
@@ -415,12 +474,13 @@ impl Queue {
             if let Some(e) = self.front_entry().filter(|e| e.notice.merges_with(&n)) {
                 e.count += 1;
                 e.notice = n;
+                e.shown();
                 return Offered::Update(e.pill());
             }
             // Into one waiting its turn, or one held by the quiet time that still holds. One left
             // in the list by an earlier quiet time stays as it was: the new one must still show.
             let joins = |e: &Entry| {
-                (e.state == State::Queued || (e.state == State::Held && q.holds()))
+                (e.state == State::Queued || (e.state == State::Held && q.holds_notice(&n)))
                     && e.notice.merges_with(&n)
             };
             if let Some(e) = self.entries.iter_mut().find(|e| joins(e)) {
@@ -464,8 +524,14 @@ impl Queue {
                 }
             }
             Priority::Normal => {
-                if q.holds() {
+                if q.holds_notice(&n) {
                     return self.hold(n, now);
+                }
+                if slot_busy && self.front_yields() && !n.sticky {
+                    // The sticky pill waits behind this one for one turn, then comes back (it is
+                    // older, so it is next in line).
+                    self.requeue_front();
+                    return self.show(n, now, unix_now);
                 }
                 let paced = self.last_shown_ms.is_some_and(|l| now.ms < l + PACING_MS);
                 if slot_busy
@@ -493,13 +559,14 @@ impl Queue {
     fn show(&mut self, n: Notice, now: Now, unix_now: i64) -> Offered {
         self.mark_shown(&n, now, unix_now);
         self.next_id += 1;
-        let e = Entry {
+        let mut e = Entry {
             id: self.next_id,
             notice: n,
             at: now.at,
             count: 1,
             state: State::Seen,
         };
+        e.shown();
         let pill = e.pill();
         self.front = Some(Front::Entry(Box::new(e)));
         Offered::Show(pill)
@@ -513,7 +580,21 @@ impl Queue {
     }
 
     /// The pill on screen starts to leave. `acted`: its action was taken, so it is done with.
+    /// A sticky pill that you did not close (a panel or the dial covered it) goes back in line.
     pub fn close_front(&mut self, acted: bool) {
+        self.close_front_as(acted, false);
+    }
+
+    /// The pill on screen leaves because you closed it (its X): a sticky one is done with too.
+    pub fn close_front_by_you(&mut self) {
+        self.close_front_as(false, true);
+    }
+
+    fn close_front_as(&mut self, acted: bool, by_you: bool) {
+        if matches!(&self.front, Some(Front::Entry(e)) if e.notice.sticky && !acted && !by_you) {
+            self.requeue_front();
+            return;
+        }
         if let Some(Front::Entry(mut e)) = self.front.take() {
             if e.notice.listed() && !acted {
                 e.state = State::Seen;
@@ -541,7 +622,10 @@ impl Queue {
         if q.holds() {
             // A quiet time began while these waited their turn: they wait for it to end instead.
             for e in &mut self.entries {
-                if e.state == State::Queued && e.notice.priority != Priority::Urgent {
+                if e.state == State::Queued
+                    && e.notice.priority != Priority::Urgent
+                    && q.holds_notice(&e.notice)
+                {
                     e.state = State::Held;
                 }
             }
@@ -566,6 +650,7 @@ impl Queue {
                 let p = e.notice.priority;
                 self.mark_shown(&e.notice, now, unix_now);
                 e.state = State::Seen;
+                e.shown();
                 let pill = e.pill();
                 self.front = Some(Front::Entry(Box::new(e)));
                 return Next::Show(pill, p);
@@ -606,12 +691,16 @@ impl Queue {
         if q.summarizes() && !was.summarizes() {
             self.quiet_since = Some(now);
         }
-        if !q.holds() {
-            for e in &mut self.entries {
-                if e.state == State::Held && !e.notice.listed() {
-                    e.state = State::Queued;
-                }
+        // Unlisted notices still current go back in line once nothing holds them (a prayer
+        // reminder as soon as presenting ends, even while focus runs).
+        let mut released = false;
+        for e in &mut self.entries {
+            if e.state == State::Held && !e.notice.listed() && !q.holds_notice(&e.notice) {
+                e.state = State::Queued;
+                released = true;
             }
+        }
+        if released || !q.holds() {
             self.tidy(now);
         }
         if was.summarizes() && !q.summarizes() {
@@ -683,6 +772,7 @@ impl Queue {
         self.requeue_front();
         self.last_shown_ms = Some(now.ms);
         e.state = State::Seen;
+        e.shown();
         let pill = e.pill();
         self.front = Some(Front::Entry(Box::new(e)));
         Some(pill)
@@ -761,6 +851,22 @@ impl Queue {
     pub fn drop_prayer(&mut self, prayer: &str) {
         self.entries
             .retain(|e| e.notice.prayer.as_deref() != Some(prayer));
+        // The one on screen is done with too, so an urgent pill covering it cannot put it back.
+        if matches!(&self.front, Some(Front::Entry(e)) if e.notice.prayer.as_deref() == Some(prayer))
+        {
+            self.front = None;
+        }
+    }
+
+    /// You hid the orb: prayer reminders are skipped while it is hidden by you, so the ones
+    /// waiting (and the one on screen) are done with. Returns whether the front was one.
+    pub fn drop_through(&mut self) -> bool {
+        self.entries.retain(|e| !(e.waiting() && e.notice.through));
+        let front = matches!(&self.front, Some(Front::Entry(e)) if e.notice.through);
+        if front {
+            self.front = None;
+        }
+        front
     }
 
     /// Takes out what matches (the clipboard offer once its link joined the queue).
@@ -775,7 +881,8 @@ impl Queue {
             .entries
             .iter()
             .filter(|e| e.waiting())
-            .filter_map(|e| e.notice.stale_at)
+            .flat_map(|e| [e.notice.stale_at, e.notice.show_by])
+            .flatten()
             .filter(|s| *s > now)
             .min();
         let midnight = (!self.entries.is_empty()).then(|| now.date().next().at_minute(0));
@@ -862,6 +969,7 @@ mod tests {
         full_screen: false,
         focus: false,
         paused: false,
+        presenting: false,
     };
 
     fn titles(q: &Queue) -> Vec<String> {
@@ -981,12 +1089,6 @@ mod tests {
             ),
             Offered::Held
         );
-        let before =
-            normal(Source::Prayer, "10 menit lagi Ashar").before_prayer("Ashar", day().at(15, 10));
-        assert_eq!(
-            q.offer(before, at(14, 6, 0), 0, focus, false),
-            Offered::Held
-        );
         let offer = normal(Source::Downloads, "Save this video?").keep(Keep::Drop);
         assert_eq!(
             q.offer(offer, at(14, 7, 0), 0, focus, false),
@@ -1003,7 +1105,7 @@ mod tests {
             Offered::Show(_)
         ));
         q.close_front(false);
-        assert_eq!(q.held_now(), 1, "the prayer reminder is never counted");
+        assert_eq!(q.held_now(), 1);
         assert_eq!(q.waiting(), 1);
         assert_eq!(
             q.set_quiet(CALM, day().at(14, 25)),
@@ -1012,58 +1114,228 @@ mod tests {
                 focus: true
             })
         );
-        // The drink waits in the list for you; the reminder, still current, comes as a pill.
-        assert_eq!(
-            q.next(at(14, 25, 60_000), 0, CALM),
-            Next::Show(pill("10 menit lagi Ashar"), Priority::Normal)
-        );
+        // The drink waits in the list for you.
+        assert_eq!(q.next(at(14, 25, 60_000), 0, CALM), Next::Idle);
         let (waiting, _) = q.list();
         assert_eq!(waiting.len(), 1);
-        assert!(
-            q.list()
-                .0
-                .iter()
-                .chain(q.list().1.iter())
-                .all(|e| e.notice.source != Source::Prayer),
-            "prayer never stays in the list"
+    }
+
+    /// "10 menit lagi Isya" fired at 18:41 for Isya at 18:51 (the user's log, 7 Nov 2026).
+    fn ten_before(fired: Moment) -> Notice {
+        normal(Source::Prayer, "10 menit lagi Isya")
+            .before_prayer("Isya", day().at(18, 51), fired)
+            .sticky()
+    }
+
+    fn thirty_before(fired: Moment) -> Notice {
+        normal(Source::Prayer, "30 menit lagi Isya").before_prayer("Isya", day().at(18, 51), fired)
+    }
+
+    #[test]
+    fn prayer_reminders_pass_focus_full_screen_pause_and_an_fs_hidden_orb() {
+        // The bug: full screen held "30 menit lagi Isya" for 20 minutes, then it showed late.
+        for quiet in [
+            Quiet {
+                full_screen: true,
+                hidden: true,
+                ..CALM
+            },
+            Quiet {
+                focus: true,
+                ..CALM
+            },
+            Quiet {
+                paused: true,
+                ..CALM
+            },
+        ] {
+            let mut q = Queue::new();
+            q.set_quiet(quiet, day().at(18, 0));
+            assert_eq!(
+                q.offer(
+                    thirty_before(day().at(18, 21)),
+                    at(18, 21, 0),
+                    0,
+                    quiet,
+                    false
+                ),
+                Offered::Show(pill("30 menit lagi Isya")),
+                "{quiet:?}"
+            );
+            assert!(q.front_breaks_through(), "it shows over a hidden orb");
+        }
+    }
+
+    #[test]
+    fn presenting_holds_a_prayer_reminder_and_drops_it_once_its_moment_passed() {
+        let mut q = Queue::new();
+        let present = Quiet {
+            presenting: true,
+            full_screen: true,
+            ..CALM
+        };
+        q.set_quiet(present, day().at(18, 0));
+        assert_eq!(
+            q.offer(
+                thirty_before(day().at(18, 21)),
+                at(18, 21, 0),
+                0,
+                present,
+                false
+            ),
+            Offered::Held
+        );
+        // Presenting ends 20 minutes later: "30 menit lagi" would be wrong now, so it is gone.
+        q.set_quiet(CALM, day().at(18, 41));
+        assert_eq!(q.next(at(18, 41, 1_000_000), 0, CALM), Next::Idle);
+
+        // Presenting ends within the grace: it still shows, right away.
+        let mut q = Queue::new();
+        q.set_quiet(present, day().at(18, 0));
+        q.offer(
+            thirty_before(day().at(18, 21)),
+            at(18, 21, 0),
+            0,
+            present,
+            false,
+        );
+        q.set_quiet(CALM, day().at(18, 22));
+        assert_eq!(
+            q.next(at(18, 22, 60_000), 0, CALM),
+            Next::Show(pill("30 menit lagi Isya"), Priority::Normal)
         );
     }
 
     #[test]
-    fn a_held_prayer_reminder_goes_stale_and_memasuki_waktu_drops_it() {
+    fn a_newer_reminder_for_the_same_prayer_supersedes_the_held_one() {
         let mut q = Queue::new();
-        let fs = Quiet {
-            full_screen: true,
+        let present = Quiet {
+            presenting: true,
             ..CALM
         };
-        q.set_quiet(fs, day().at(14, 0));
+        q.set_quiet(present, day().at(18, 0));
         q.offer(
-            normal(Source::Prayer, "10 menit lagi Ashar").before_prayer("Ashar", day().at(15, 10)),
-            at(15, 0, 0),
+            thirty_before(day().at(18, 21)),
+            at(18, 21, 0),
             0,
-            fs,
+            present,
             false,
         );
         q.offer(
-            normal(Source::Prayer, "10 menit lagi Maghrib")
-                .before_prayer("Maghrib", day().at(17, 40)),
-            at(17, 30, 0),
+            ten_before(day().at(18, 41)),
+            at(18, 41, 0),
             0,
-            fs,
+            present,
             false,
         );
-        q.drop_prayer("Maghrib");
+        q.set_quiet(CALM, day().at(18, 42));
+        let mut shown = Vec::new();
+        let mut ms = 100_000;
+        while let Next::Show(p, _) = q.next(at(18, 42, ms), 0, CALM) {
+            shown.push(p.title);
+            q.close_front_by_you();
+            ms += 10_000;
+        }
         assert_eq!(
-            q.set_quiet(CALM, day().at(15, 20)),
-            Some(Release {
-                waited: 0,
-                focus: false
-            })
+            shown,
+            vec!["10 menit lagi Isya"],
+            "never the 30 after the 10"
         );
+
+        // Calm: the 30 is on screen when the 10 comes, and the 10 takes its place.
+        let mut q = Queue::new();
+        q.offer(
+            thirty_before(day().at(18, 21)),
+            at(18, 21, 0),
+            0,
+            CALM,
+            false,
+        );
+        q.close_front(false);
+        match q.offer(
+            ten_before(day().at(18, 41)),
+            at(18, 41, 9_000),
+            0,
+            CALM,
+            false,
+        ) {
+            Offered::Show(p) => assert_eq!(p.title, "10 menit lagi Isya"),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn ten_minutes_before_stays_until_you_close_it() {
+        let mut q = Queue::new();
+        assert!(matches!(
+            q.offer(ten_before(day().at(18, 41)), at(18, 41, 0), 0, CALM, false),
+            Offered::Show(_)
+        ));
+        // A panel or the dial covers it: it comes back.
+        q.close_front(false);
         assert_eq!(
-            q.next(at(15, 20, 0), 0, CALM),
-            Next::Idle,
-            "Ashar's reminder is past its time"
+            q.next(at(18, 42, 5_000), 0, CALM),
+            Next::Show(pill("10 menit lagi Isya"), Priority::Normal)
+        );
+        // Another notice takes the front for its turn, then the reminder comes back.
+        assert_eq!(
+            q.offer(
+                normal(Source::Drink, "Minum dulu"),
+                at(18, 43, 9_000),
+                0,
+                CALM,
+                true
+            ),
+            Offered::Show(pill("Minum dulu"))
+        );
+        q.close_front(false);
+        assert_eq!(
+            q.next(at(18, 43, 20_000), 0, CALM),
+            Next::Show(pill("10 menit lagi Isya"), Priority::Normal)
+        );
+        // Your X ends it.
+        q.close_front_by_you();
+        assert_eq!(q.next(at(18, 44, 30_000), 0, CALM), Next::Idle);
+    }
+
+    #[test]
+    fn hiding_the_orb_yourself_ends_a_waiting_or_shown_prayer_reminder() {
+        let mut q = Queue::new();
+        q.offer(ten_before(day().at(18, 41)), at(18, 41, 0), 0, CALM, false);
+        assert!(q.drop_through(), "the one on screen");
+        q.close_front(false);
+        assert_eq!(q.next(at(18, 42, 9_000), 0, CALM), Next::Idle);
+    }
+
+    #[test]
+    fn memasuki_waktu_replaces_the_ten_minute_pill_for_good() {
+        let mut q = Queue::new();
+        q.offer(ten_before(day().at(18, 41)), at(18, 41, 0), 0, CALM, false);
+        q.drop_prayer("Isya");
+        assert!(matches!(
+            q.offer(
+                Notice::new(
+                    Source::Prayer,
+                    Priority::Urgent,
+                    pill("Memasuki waktu Isya")
+                ),
+                at(18, 51, 9_000),
+                0,
+                CALM,
+                true
+            ),
+            Offered::Show(_)
+        ));
+        q.close_front_by_you();
+        assert_eq!(q.next(at(18, 52, 20_000), 0, CALM), Next::Idle);
+        // And it goes stale at Isya even if nothing dropped it.
+        let mut q = Queue::new();
+        q.offer(ten_before(day().at(18, 41)), at(18, 41, 0), 0, CALM, false);
+        q.close_front(false);
+        assert_eq!(q.next(at(18, 51, 20_000), 0, CALM), Next::Idle);
+        assert!(
+            q.list().0.is_empty() && q.list().1.is_empty(),
+            "prayer never stays in the list"
         );
     }
 

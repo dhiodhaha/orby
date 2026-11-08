@@ -154,10 +154,26 @@ pub enum Update {
     Progress(Progress),
     /// A file this run creates; cancel deletes it (and its `.part`).
     Destination(PathBuf),
+    /// yt-dlp's own words for a failure, for the log. Sent once, right before a failed `Finished`.
+    ErrorText(String),
     Finished(Outcome),
 }
 
-/// Folds the lines of one run into job-level updates and the final outcome.
+/// Longest error text kept for the log.
+pub const ERROR_TEXT_MAX: usize = 400;
+
+/// How many recent warnings stand in when a run fails without an ERROR line.
+const WARNINGS_KEPT: usize = 2;
+
+fn capped(line: &str) -> String {
+    let line = line.trim();
+    match line.char_indices().nth(ERROR_TEXT_MAX) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    }
+}
+
+/// Folds the lines of one run into job-level updates, the final outcome and, on failure, why.
 #[derive(Debug, Default)]
 pub struct Tracker {
     title: Option<String>,
@@ -169,6 +185,10 @@ pub struct Tracker {
     progress: Progress,
     final_path: Option<PathBuf>,
     error: Option<ErrorKind>,
+    /// The first ERROR line, as yt-dlp wrote it.
+    error_line: Option<String>,
+    /// The last few WARNING lines.
+    warnings: Vec<String>,
 }
 
 impl Tracker {
@@ -208,10 +228,23 @@ impl Tracker {
             // The first error is the cause; later ones are usually its consequences.
             Line::Error(kind) => {
                 self.error.get_or_insert(kind);
+                self.error_line.get_or_insert_with(|| capped(line));
             }
-            Line::Other => {}
+            Line::Other => {
+                if line.starts_with("WARNING:") {
+                    if self.warnings.len() == WARNINGS_KEPT {
+                        self.warnings.remove(0);
+                    }
+                    self.warnings.push(capped(line));
+                }
+            }
         }
         out
+    }
+
+    /// Why the run failed in yt-dlp's words: the first ERROR line, else the last warnings.
+    pub fn error_text(&self) -> Option<String> {
+        self.error_line.clone().or_else(|| (!self.warnings.is_empty()).then(|| self.warnings.join(" | ")))
     }
 
     pub fn progress(&self) -> Progress {
@@ -328,6 +361,32 @@ mod tests {
         assert_eq!(t.finish(false, |_| None), Outcome::Failed(ErrorKind::DiskFull));
         assert_eq!(Tracker::new().finish(false, |_| None), Outcome::Failed(ErrorKind::Other));
         assert_eq!(Tracker::new().finish(true, |_| None), Outcome::Failed(ErrorKind::Other), "success without a file is not done");
+    }
+
+    #[test]
+    fn error_text_is_the_first_error_line_else_the_last_warnings() {
+        let mut t = Tracker::new();
+        assert_eq!(t.error_text(), None);
+        t.feed("WARNING: [youtube] No supported JavaScript runtime could be found.");
+        t.feed("WARNING: [youtube] abc: Some formats may be missing");
+        t.feed("WARNING: [youtube] abc: nsig extraction failed");
+        assert_eq!(
+            t.error_text().as_deref(),
+            Some("WARNING: [youtube] abc: Some formats may be missing | WARNING: [youtube] abc: nsig extraction failed"),
+            "only the last two warnings"
+        );
+        t.feed("ERROR: [youtube] abc: Requested format is not available.  \r");
+        t.feed("ERROR: later consequence");
+        assert_eq!(t.error_text().as_deref(), Some("ERROR: [youtube] abc: Requested format is not available."));
+    }
+
+    #[test]
+    fn error_text_is_capped() {
+        let mut t = Tracker::new();
+        t.feed(&format!("ERROR: {}", "é".repeat(1000)));
+        let text = t.error_text().unwrap();
+        assert_eq!(text.chars().count(), ERROR_TEXT_MAX + 1);
+        assert!(text.ends_with('…'));
     }
 
     #[test]

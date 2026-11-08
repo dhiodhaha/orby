@@ -68,6 +68,10 @@ pub struct Job {
     pub state: JobState,
     /// Files this job's runs created, for cancel to delete.
     pub files: Vec<PathBuf>,
+    /// yt-dlp's words for the last failure, for the log.
+    pub error_text: Option<String>,
+    /// This run already failed once and went on by itself ([`Queue::apply`]).
+    auto_retried: bool,
     batch: u64,
 }
 
@@ -169,7 +173,7 @@ impl Queue {
         }
         let id = JobId(self.next_id);
         self.next_id += 1;
-        self.jobs.push(Job { id, request: Request { link, format, folder }, title: None, state: JobState::Waiting, files: Vec::new(), batch: self.batch });
+        self.jobs.push(Job { id, request: Request { link, format, folder }, title: None, state: JobState::Waiting, files: Vec::new(), error_text: None, auto_retried: false, batch: self.batch });
         id
     }
 
@@ -188,6 +192,7 @@ impl Queue {
                 break;
             }
             job.state = JobState::Reading;
+            job.auto_retried = false;
             started.push((job.id, job.request.clone()));
             free -= 1;
         }
@@ -196,8 +201,13 @@ impl Queue {
 
     /// Feeds one runner update. Updates for jobs that are no longer active (paused, cancelled,
     /// or already finished) are ignored, since a stopped process can still flush a few lines.
-    pub fn apply(&mut self, id: JobId, update: Update, now: SystemTime) {
-        let Some(job) = self.jobs.iter_mut().find(|j| j.id == id && j.state.is_active()) else { return };
+    ///
+    /// Returns true when the run failed for no reason we can name ([`ErrorKind::Other`], often a
+    /// passing YouTube hiccup) for the first time since it started: the job stays active, holding
+    /// its slot and progress, and the caller starts its process again after a short pause. Only a
+    /// second failure in a row shows as Failed.
+    pub fn apply(&mut self, id: JobId, update: Update, now: SystemTime) -> bool {
+        let Some(job) = self.jobs.iter_mut().find(|j| j.id == id && j.state.is_active()) else { return false };
         match update {
             Update::Title(t) => job.title = Some(t),
             Update::Progress(p) => job.state = JobState::Running(p),
@@ -206,12 +216,23 @@ impl Queue {
                     job.files.push(p);
                 }
             }
+            Update::ErrorText(t) => job.error_text = Some(t),
             Update::Finished(Outcome::Done { path, size }) => job.state = JobState::Done { path, size, at: now },
+            Update::Finished(Outcome::Failed(ErrorKind::Other)) if !job.auto_retried => {
+                job.auto_retried = true;
+                if let JobState::Running(p) = &mut job.state {
+                    // Nothing is moving until the process is back.
+                    p.speed = None;
+                    p.eta = None;
+                }
+                return true;
+            }
             Update::Finished(Outcome::Failed(kind)) => {
                 let (downloaded, total) = progress_of(&job.state);
                 job.state = JobState::Failed { kind, downloaded, total };
             }
         }
+        false
     }
 
     /// Running or reading to Paused. The caller stops the process; the part file stays.
@@ -465,6 +486,54 @@ mod tests {
         assert_eq!(started[0].1.folder, PathBuf::from(r"E:\More"));
         assert_eq!(q.retry(a), Err(QueueError::NotAllowed));
         assert_eq!(q.set_folder(a, Path::new(r"F:\")), Err(QueueError::NotAllowed));
+    }
+
+    fn failed(kind: ErrorKind) -> Update {
+        Update::Finished(Outcome::Failed(kind))
+    }
+
+    #[test]
+    fn an_unnamed_failure_goes_on_once_by_itself_and_shows_only_the_second_time() {
+        let mut q = Queue::new();
+        let (a, b) = (add(&mut q, 1), add(&mut q, 2));
+        q.start_ready();
+        q.apply(a, running(100 * MB, 400 * MB), t0());
+        q.apply(a, Update::ErrorText("ERROR: [youtube] a: HTTP Error 403: Forbidden".into()), t0());
+        assert!(q.apply(a, failed(ErrorKind::Other), t0()), "first failure: start it again");
+        let JobState::Running(p) = q.get(a).unwrap().state else { panic!("{:?}", q.get(a).unwrap().state) };
+        assert_eq!((p.downloaded, p.speed, p.eta), (100 * MB, None, None), "keeps its progress, nothing moving");
+        assert_eq!(q.get(a).unwrap().error_text.as_deref(), Some("ERROR: [youtube] a: HTTP Error 403: Forbidden"));
+        let c = add(&mut q, 3);
+        assert!(q.start_ready().is_empty(), "a keeps its slot while it waits to go again");
+
+        q.apply(a, Update::ErrorText("ERROR: again".into()), t0());
+        assert!(!q.apply(a, failed(ErrorKind::Other), t0()), "second failure in a row shows");
+        assert_eq!(q.get(a).unwrap().state, JobState::Failed { kind: ErrorKind::Other, downloaded: 100 * MB, total: Some(400 * MB) });
+        assert_eq!(q.get(a).unwrap().error_text.as_deref(), Some("ERROR: again"));
+        assert_eq!(q.start_ready()[0].0, c);
+
+        // Retry by hand earns another silent try.
+        q.apply(b, done(1), t0());
+        q.retry(a).unwrap();
+        q.start_ready();
+        assert!(q.apply(a, failed(ErrorKind::Other), t0()));
+        assert!(q.get(a).unwrap().state.is_active());
+    }
+
+    #[test]
+    fn named_failures_show_at_once() {
+        for kind in [ErrorKind::Private, ErrorKind::Removed, ErrorKind::Unsupported, ErrorKind::DiskFull, ErrorKind::FfmpegMissing, ErrorKind::Offline] {
+            let mut q = Queue::new();
+            let a = add(&mut q, 1);
+            q.start_ready();
+            assert!(!q.apply(a, failed(kind), t0()), "{kind:?}");
+            assert!(matches!(q.get(a).unwrap().state, JobState::Failed { kind: k, .. } if k == kind));
+        }
+        let mut q = Queue::new();
+        let a = add(&mut q, 1);
+        q.start_ready();
+        q.pause(a).unwrap();
+        assert!(!q.apply(a, failed(ErrorKind::Other), t0()), "a paused job's killed process is not retried");
     }
 
     #[test]

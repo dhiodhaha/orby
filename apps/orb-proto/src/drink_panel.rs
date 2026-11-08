@@ -187,7 +187,19 @@ pub fn draw(
     glass(g, dc, t, v.total as f32 / v.goal.max(1) as f32);
     let total = v.total.to_string();
     let tw = g.text_width(&total, &f.big);
-    text(dc, &total, &f.big, 118.0, 70.0, tw + 2.0, 36.0, &text_b);
+    // The total rolls to its new value after a drink is logged (or undone).
+    crate::motion::rolling_text(
+        g,
+        dc,
+        "drink.total",
+        &total,
+        crate::motion::Roll::Slow,
+        &f.big,
+        118.0,
+        70.0,
+        36.0,
+        &text_b,
+    );
     text(
         dc,
         &format!("/ {} ml", v.goal),
@@ -235,6 +247,9 @@ pub fn draw(
                 unsafe {
                     dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 16.0), &brush(dc, fill));
                 }
+                if !primary {
+                    crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 16.0, 1.0);
+                }
                 center_text(
                     g,
                     dc,
@@ -253,6 +268,7 @@ pub fn draw(
                         &brush(dc, if hov { t.button_hover } else { t.button }),
                     );
                 }
+                crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 14.0, 1.0);
                 center_text(
                     g,
                     dc,
@@ -283,26 +299,29 @@ pub fn draw(
         );
     }
     for (i, row) in v.rows.iter().take(MAX_ROWS).enumerate() {
-        let y = ROWS_Y + ROW_H * i as f32;
+        let y0 = ROWS_Y + ROW_H * i as f32;
         if i > 0 {
             unsafe {
-                dc.DrawLine(pt(16.0, y), pt(W - 16.0, y), &hair, 1.0, None);
+                dc.DrawLine(pt(16.0, y0), pt(W - 16.0, y0), &hair, 1.0, None);
             }
         }
-        text(dc, &row.time, &f.small, 20.0, y, 48.0, ROW_H, &muted);
-        let amount = format!("{} ml", row.ml);
-        let aw = g.text_width(&amount, &f.title);
-        text(dc, &amount, &f.title, 70.0, y, aw + 2.0, ROW_H, &text_b);
-        text(
-            dc,
-            &row.source,
-            &f.body,
-            70.0 + aw + 5.0,
-            y,
-            140.0,
-            ROW_H,
-            &muted,
-        );
+        // Rows ripple in when the panel opens (motion.rs).
+        crate::motion::with_row(dc, crate::motion::ripple_row("drink.rows", i), || {
+            text(dc, &row.time, &f.small, 20.0, y0, 48.0, ROW_H, &muted);
+            let amount = format!("{} ml", row.ml);
+            let aw = g.text_width(&amount, &f.title);
+            text(dc, &amount, &f.title, 70.0, y0, aw + 2.0, ROW_H, &text_b);
+            text(
+                dc,
+                &row.source,
+                &f.body,
+                70.0 + aw + 5.0,
+                y0,
+                140.0,
+                ROW_H,
+                &muted,
+            );
+        });
     }
 
     // The last 7 days: met days grey, short days track, today ink; the goal is a dashed line.

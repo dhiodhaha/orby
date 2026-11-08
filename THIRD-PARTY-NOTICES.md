@@ -3,6 +3,11 @@
 Orby is licensed under Apache-2.0 (see `LICENSE`). It uses or learns from the work below.
 Where a licence requires its text to travel with the code, it is reproduced here.
 
+## Inter (typeface, bundled)
+Source: Inter 4.1 (https://github.com/rsms/inter, release `v4.1`, asset `Inter-4.1.zip`), SIL Open Font License 1.1, copyright (c) 2016 The Inter Project Authors.
+- **Used for:** all text in the app. `apps/orb-proto/assets/fonts/InterVariable.ttf` is the unmodified `InterVariable.ttf` from that release (SHA-256 `4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf`; the release zip is `9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e`). It is embedded in the executable and loaded from memory; it is not installed or sold on its own.
+- **Licence:** the full OFL 1.1 text travels with the font as `apps/orb-proto/assets/fonts/OFL.txt`, as the licence requires. Inter has no Reserved Font Name.
+
 ## Paper Shaders (`liquidMetal`)
 Source: `@paper-design/shaders` 0.0.80 (https://github.com/paper-design/shaders), Apache License 2.0, copyright 2026 Paper ("Powered by Paper Shaders: https://shaders.paper.design").
 - **Used for:** the liquid-metal drop. The fragment shader is ported to HLSL in `apps/orb-proto/src/metal.hlsl`, keeping only the circle shape path and adding a rim ring pass.
@@ -20,12 +25,17 @@ Source: https://github.com/JanaSundar/ovio, at commit `81a1bcb6737356038163728b3
 - **Used for (behaviour and numbers, reimplemented natively):** the dial-menu geometry and aiming, the knob's detents and end-stop resistance, the rolling-number spring timing, and the contribution-graph grid and year layout.
 - Visual styling is Orby's own (see `DESIGN.md`).
 
-MIT licence text for Libraries.dev and Ovio (the copyright lines are as above):
+## Purge
+Source: https://github.com/jithin-sabu/purge-app, at commit `743da14be07fe22cb4c63f1d6433a174584f8b70` (2026-11-07), MIT, copyright (c) 2026 Jithin Sabu.
+- **Used for:** rule structure and safety lessons adapted from Purge. The cleaning rules in `crates/disk/src/rules.rs` follow its shape (one table as the single source of truth: id, group, name, paths, tier and one plain explanation per rule) and its lessons: a rule only proposes a path and a separate never-touch policy can only narrow it; Check first is never selected in bulk; a tool's home folder (`.gradle`, `.cache`) is never offered whole; browser Service Worker, IndexedDB and Local Storage folders are never offered; and every path is checked again just before it moves.
+- **Not used:** no Swift code, explanations text or assets were copied. The Windows rules, paths and wording are Orby's own.
+
+MIT licence text for Libraries.dev, Ovio and Purge (the copyright lines are as above):
 
 ```
 MIT License
 
-Copyright (c) 2026 Jakub Antalik / Jana Sundar (see the sections above)
+Copyright (c) 2026 Jakub Antalik / Jana Sundar / Jithin Sabu (see the sections above)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

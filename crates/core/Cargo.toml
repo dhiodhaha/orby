@@ -2,8 +2,9 @@
 name = "app-core"
 version = "0.1.0"
 edition = "2021"
-description = "OS-free logic: prayer times, Qibla. Shared by Windows, macOS and mobile later."
+description = "OS-free logic: prayer times, Qibla, Ramadan dates. Shared by Windows, macOS and mobile later."
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
+serde_json = "1"

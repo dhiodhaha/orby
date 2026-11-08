@@ -11,7 +11,8 @@ use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use crate::gfx::*;
 use crate::notices_model::Source;
 use crate::settings_model::{
-    self as m, Capture, Locate, Section, Shortcut, Startup, Step, ThemeMode, CITIES,
+    self as m, AtTimeSound, Capture, Locate, PrayerMethod, Section, Shortcut, Startup, Step,
+    ThemeMode, CITIES,
 };
 use crate::tasks_panel::clipped_text;
 use crate::textfield::TextField;
@@ -54,6 +55,13 @@ pub enum Hit {
     CityBack,
     CityRow(usize),
     Reminder(usize),
+    Method(PrayerMethod),
+    /// Prayer (0 Subuh to 4 Isya) and the step, −1 or +1 minute.
+    Adjust(usize, i32),
+    AtTime(AtTimeSound),
+    /// Choose the adzan file (true: Subuh's own).
+    PickAdzan(bool),
+    ClearAdzanSubuh,
     Source(Source),
     OpenData,
     // the first run
@@ -133,6 +141,13 @@ impl<'a> Painter<'a> {
     fn fill(&self, r: Rect, rad: f32, c: D2D1_COLOR_F) {
         if let Some(dc) = self.dc {
             unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, rad), &brush(dc, c)) };
+        }
+    }
+
+    /// The T3 lip on a card or control (depth.rs).
+    fn lip(&self, r: Rect, rad: f32, a: f32) {
+        if let Some(dc) = self.dc {
+            crate::depth::lip(self.g, dc, self.t, r.0, r.1, r.2, r.3, rad, a);
         }
     }
 
@@ -248,6 +263,9 @@ impl<'a> Painter<'a> {
         };
         let rad = (r.3 - r.1) / 2.0;
         self.fill(r, rad, fill);
+        if !primary {
+            self.lip(r, rad, a);
+        }
         let fmt = &self.f.small_medium;
         let w = self.width(label, fmt);
         self.text(
@@ -373,6 +391,7 @@ impl<'a> Painter<'a> {
         let h: f32 = rows.iter().sum();
         self.fill((X0, top, X1, top + h), 10.0, t.raised);
         self.stroke((X0, top, X1, top + h), 10.0, t.hair, 1.0);
+        self.lip((X0, top, X1, top + h), 10.0, 1.0);
         let mut y = top;
         for r in &rows[..rows.len().saturating_sub(1)] {
             y += r;
@@ -405,6 +424,7 @@ impl<'a> Painter<'a> {
         let h = 56.0;
         self.fill((X0, top, X1, top + h), 10.0, t.raised);
         self.stroke((X0, top, X1, top + h), 10.0, t.hair, 1.0);
+        self.lip((X0, top, X1, top + h), 10.0, 1.0);
         self.fill(
             (X0 + 14.0, top + 16.0, X0 + 38.0, top + 40.0),
             6.0,
@@ -483,7 +503,7 @@ fn paint(p: &mut Painter, v: &View) -> f32 {
 
 fn section_icon(s: Section) -> Icon {
     match s {
-        Section::General => Icon::Sliders,
+        Section::General => Icon::Gear,
         Section::Prayer => Icon::Prayer,
         Section::Notices => Icon::Bell,
         Section::Account => Icon::Person,
@@ -657,7 +677,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
         y = p.problem(
             y,
             "Couldn't add to startup",
-            "Windows blocked it. Allow [App] there.",
+            "Windows blocked it. Allow Orby there.",
             Some(("Startup apps", Hit::StartupApps)),
         ) + 8.0;
     }
@@ -778,14 +798,14 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
     if let Some(s) = v.taken {
         y = p.problem(
             y,
-            &format!("{} is taken", s.label()),
+            &format!("Couldn't use {}", s.label()),
             "Another app already uses it.",
             Some(("Pick another", Hit::PickAnother)),
         ) + 8.0;
     } else if !v.hotkey_ok && v.capture.is_none() {
         y = p.problem(
             y,
-            &format!("{} is taken", v.prefs.shortcut.label()),
+            &format!("Couldn't use {}", v.prefs.shortcut.label()),
             "Another app already uses it.",
             Some(("Pick another", Hit::ChangeShortcut)),
         ) + 8.0;
@@ -979,14 +999,8 @@ fn prayer(p: &mut Painter, v: &View, top: f32) -> f32 {
     y = c + 16.0;
 
     y = p.group(y, "Method");
-    let c = p.card(y, &[56.0]);
-    p.row_words(
-        y,
-        56.0,
-        "Kemenag RI",
-        "Subuh 20°, Isya 18°, Ashar shadow 1, +2 min ihtiyat",
-        0.0,
-    );
+    let c = p.card(y, &[56.0, 56.0]);
+    method_rows(p, v, y);
     y = c + 16.0;
 
     y = p.group(y, &v.day);
@@ -994,12 +1008,17 @@ fn prayer(p: &mut Painter, v: &View, top: f32) -> f32 {
     times_row(p, v, X0, X1, y + 11.0);
     y = c + 16.0;
 
+    y = p.group(y, "Adjust by minutes, to follow your mosque");
+    let c = p.card(y, &[64.0]);
+    adjust_row(p, v, y);
+    y = c + 16.0;
+
     y = p.group(y, "Reminders");
     let rows = [56.0, 56.0, 56.0];
     let c = p.card(y, &rows);
     let subs = [
-        "\"30 menit lagi Maghrib\", waits for a focus break",
-        "\"10 menit lagi Maghrib\", waits for a focus break",
+        "\"30 menit lagi Maghrib\", shows for a few seconds",
+        "\"10 menit lagi Maghrib\", stays until you close it",
         "\"Memasuki waktu Maghrib\", always shows",
     ];
     for (i, sub) in subs.iter().enumerate() {
@@ -1013,13 +1032,220 @@ fn prayer(p: &mut Painter, v: &View, top: f32) -> f32 {
             Hit::Reminder(i),
         );
     }
-    y = c + 16.0;
+    y = c + 12.0;
+    p.text(
+        "Only presenting holds these. Focus and full screen let them through.",
+        &p.f.small,
+        X0,
+        y,
+        X1 - X0,
+        18.0,
+        t.muted,
+    );
+    y += 34.0;
+
+    y = p.group(y, "At the time");
+    y = at_time_rows(p, v, y) + 16.0;
 
     y = p.group(y, "Qibla");
     let c = p.card(y, &[44.0]);
     p.row_words(y, 44.0, "From here", "", 200.0);
     p.right(&v.qibla, &p.f.body, X1 - 16.0, y, 44.0, t.text);
     c + 16.0
+}
+
+/// Kemenag RI or Muhammadiyah: two radio rows in the Method card.
+fn method_rows(p: &mut Painter, v: &View, top: f32) {
+    let t = *p.t;
+    for (i, mm) in PrayerMethod::ALL.iter().enumerate() {
+        let y = top + 56.0 * i as f32;
+        let r = (X0, y, X1, y + 56.0);
+        let h = Hit::Method(*mm);
+        if p.hovered(h) {
+            p.fill(r, 8.0, t.button);
+        }
+        p.radio(X0 + 18.0, y + 28.0, v.prefs.prayer_method == *mm);
+        let w = X1 - X0 - 50.0;
+        p.text(mm.name(), &p.f.title, X0 + 36.0, y + 11.0, w, 17.0, t.text);
+        p.text(
+            mm.words(),
+            &p.f.small,
+            X0 + 36.0,
+            y + 29.0,
+            w,
+            16.0,
+            t.muted,
+        );
+        p.ring(h, r, 8.0);
+        p.hit(h, r);
+    }
+}
+
+/// A small round − or + button.
+fn step_button(p: &mut Painter, cx: f32, cy: f32, label: &str, enabled: bool, h: Hit) {
+    let t = *p.t;
+    let r = (cx - 12.0, cy - 12.0, cx + 12.0, cy + 12.0);
+    let fill = if enabled && p.hovered(h) {
+        t.button_hover
+    } else {
+        t.button
+    };
+    p.fill(r, 12.0, fill);
+    let fmt = &p.f.body;
+    let w = p.width(label, fmt);
+    let ink = if enabled {
+        t.text
+    } else {
+        with_alpha(t.text, 0.35)
+    };
+    p.text(label, fmt, cx - w / 2.0, r.1, w + 2.0, 24.0, ink);
+    if enabled {
+        p.ring(h, r, 12.0);
+        p.hit(h, r);
+    }
+}
+
+/// Subuh to Isya, each with its minutes and − / + (−10 to +10).
+fn adjust_row(p: &mut Painter, v: &View, top: f32) {
+    let t = *p.t;
+    let colw = (X1 - X0) / 5.0;
+    for (i, (name, _)) in v.times.iter().enumerate() {
+        let cx = X0 + colw * (i as f32 + 0.5);
+        let nw = p.width(name, &p.f.small);
+        p.text(
+            name,
+            &p.f.small,
+            cx - nw / 2.0,
+            top + 8.0,
+            nw + 2.0,
+            18.0,
+            t.muted,
+        );
+        let val = v.prefs.prayer_adjust[i];
+        let s = m::adjust_words(val);
+        let sw = p.width(&s, &p.f.title);
+        let cy = top + 42.0;
+        p.text(
+            &s,
+            &p.f.title,
+            cx - sw / 2.0,
+            cy - 10.0,
+            sw + 2.0,
+            20.0,
+            t.text,
+        );
+        step_button(
+            p,
+            cx - 30.0,
+            cy,
+            "\u{2212}",
+            val > -m::ADJUST_MAX,
+            Hit::Adjust(i, -1),
+        );
+        step_button(
+            p,
+            cx + 30.0,
+            cy,
+            "+",
+            val < m::ADJUST_MAX,
+            Hit::Adjust(i, 1),
+        );
+    }
+}
+
+/// Diam, Bunyi or Adzan, and the adzan files.
+fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
+    let adzan = v.prefs.at_time_sound == AtTimeSound::Adzan;
+    let rows: &[f32] = if adzan { &[56.0, 56.0, 56.0] } else { &[56.0] };
+    let c = p.card(top, rows);
+    p.row_words(
+        top,
+        56.0,
+        "Sound",
+        "Silent in full screen and while presenting",
+        250.0,
+    );
+    sound_segmented(p, X1 - 12.0, top + 28.0, v.prefs.at_time_sound);
+    if adzan {
+        let y = top + 56.0;
+        let main = v
+            .prefs
+            .adzan_file
+            .as_deref()
+            .map(m::file_name)
+            .unwrap_or_else(|| "Choose an mp3 or wav on this PC".into());
+        p.row_words(y, 56.0, "Adzan", &main, 120.0);
+        p.button_at(
+            X1 - 12.0,
+            y + 28.0,
+            "Choose file",
+            false,
+            true,
+            Some(Hit::PickAdzan(false)),
+        );
+        let y = y + 56.0;
+        let subuh = v.prefs.adzan_subuh_file.as_deref();
+        let words = subuh
+            .map(m::file_name)
+            .unwrap_or_else(|| "Optional. Uses the adzan above if empty".into());
+        p.row_words(y, 56.0, "Adzan for Subuh", &words, 200.0);
+        let l = p.button_at(
+            X1 - 12.0,
+            y + 28.0,
+            "Choose file",
+            false,
+            true,
+            Some(Hit::PickAdzan(true)),
+        );
+        if subuh.is_some() {
+            p.button_at(
+                l - 8.0,
+                y + 28.0,
+                "Clear",
+                false,
+                true,
+                Some(Hit::ClearAdzanSubuh),
+            );
+        }
+    }
+    c
+}
+
+fn sound_segmented(p: &mut Painter, right: f32, cy: f32, on: AtTimeSound) {
+    let t = *p.t;
+    let fmt = p.f.small_medium.clone();
+    let fmt = &fmt;
+    let ws: Vec<f32> = AtTimeSound::ALL
+        .iter()
+        .map(|s| p.width(s.name(), fmt) + 24.0)
+        .collect();
+    let total: f32 = ws.iter().sum::<f32>() + 8.0;
+    let r = (right - total, cy - 16.0, right, cy + 16.0);
+    p.fill(r, 10.0, t.button);
+    let mut x = r.0 + 4.0;
+    for (s, w) in AtTimeSound::ALL.iter().zip(ws) {
+        let ir = (x, r.1 + 4.0, x + w, r.3 - 4.0);
+        let h = Hit::AtTime(*s);
+        if *s == on {
+            p.fill(ir, 7.0, t.surface);
+            p.stroke(ir, 7.0, t.hair, 1.0);
+        } else if p.hovered(h) {
+            p.fill(ir, 7.0, t.button_hover);
+        }
+        let tw = p.width(s.name(), fmt);
+        p.text(
+            s.name(),
+            fmt,
+            x + (w - tw) / 2.0,
+            ir.1,
+            tw + 2.0,
+            ir.3 - ir.1,
+            if *s == on { t.text } else { t.muted },
+        );
+        p.ring(h, ir, 7.0);
+        p.hit(h, ir);
+        x += w;
+    }
 }
 
 fn notices(p: &mut Painter, v: &View, top: f32) -> f32 {
@@ -1097,7 +1323,7 @@ fn account(p: &mut Painter, top: f32) -> f32 {
 
 fn about(p: &mut Painter, v: &View, top: f32) -> f32 {
     let t = *p.t;
-    p.text("[App]", &p.f.big, X0, top, 300.0, 36.0, t.text);
+    p.text("Orby", &p.f.big, X0, top, 300.0, 36.0, t.text);
     p.text(
         &format!(
             "Version {} · orb prototype for Windows",
@@ -1126,7 +1352,10 @@ fn about(p: &mut Painter, v: &View, top: f32) -> f32 {
         y + 112.0,
         56.0,
         "Prayer times",
-        "Worked out on this PC with the Kemenag RI method",
+        &format!(
+            "Worked out on this PC with the {} method",
+            v.prefs.prayer_method.name()
+        ),
         0.0,
     );
     p.row_words(
@@ -1269,7 +1498,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 sphere(p.g, dc, t, (bx.0 + bx.2) / 2.0, (bx.1 + bx.3) / 2.0, 52.0);
             }
             p.text(
-                "Welcome to [App]",
+                "Welcome to Orby",
                 &p.f.heading,
                 x0,
                 218.0,
@@ -1462,7 +1691,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 p.icon(Icon::Alert, x0 + 11.0, y + 11.0, 13.0, t.ember);
                 let w = x1 - x0 - 30.0;
                 p.text(
-                    &format!("{} is taken", s.label()),
+                    &format!("Couldn't use {}", s.label()),
                     &p.f.title,
                     x0 + 30.0,
                     y - 2.0,

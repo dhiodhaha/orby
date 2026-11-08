@@ -27,7 +27,7 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::{
         GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetDriveTypeW, GetVolumePathNameW, FILE_ATTRIBUTE_COMPRESSED,
         FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-        FILE_ATTRIBUTE_SPARSE_FILE, INVALID_FILE_SIZE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE, INVALID_FILE_SIZE,
     };
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
@@ -69,6 +69,10 @@ mod imp {
             not_local: a & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE) != 0,
             packed: a & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0,
         }
+    }
+
+    pub fn is_reparse(md: &Metadata) -> bool {
+        md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
 
     pub fn volume_root(p: &Path) -> io::Result<PathBuf> {
@@ -185,6 +189,9 @@ mod imp {
     pub fn facts(_md: &Metadata) -> EntryFacts {
         EntryFacts { hidden: false, not_local: false, packed: false }
     }
+    pub fn is_reparse(md: &Metadata) -> bool {
+        md.file_type().is_symlink()
+    }
     pub fn cluster_size(_p: &Path) -> Option<u64> {
         None
     }
@@ -210,6 +217,10 @@ mod imp {
 
 pub(crate) fn facts(md: &Metadata) -> EntryFacts {
     imp::facts(md)
+}
+/// Junction, symbolic link, mount point, or any other reparse point (OneDrive folders too).
+pub(crate) fn is_reparse(md: &Metadata) -> bool {
+    imp::is_reparse(md)
 }
 pub(crate) fn cluster_size(p: &Path) -> Option<u64> {
     imp::cluster_size(p)

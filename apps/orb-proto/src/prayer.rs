@@ -2,20 +2,31 @@
 
 use std::time::Instant;
 
+use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
+use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
+use windows::Win32::Media::Multimedia::{mciGetErrorStringW, mciSendStringW};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{
+    FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, SIGDN_FILESYSPATH,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use app_core::prayer::{self as pr, Location, Method, Prayer, Times};
 use app_core::qibla;
 
 use crate::notices::{self, Source};
+use crate::notices_model::STICKY_MS;
 use crate::orb::set_tucked;
 use crate::panels::{self, Kind};
-use crate::pill::info_pill;
-use crate::settings_model::Section;
-use crate::ui::{Icon, Pill};
+use crate::pill::{self, info_pill};
+use crate::settings_model::{file_name, AtTimeSound, Prefs, Section};
+use crate::ui::{Icon, Pill, PillAction};
 use crate::{habits, log_line, orb, panel, settings, start_anim, tasks, App, TIMER_REMIND};
 
 /// The place in Settings: a city, or the last Windows location fix.
@@ -70,18 +81,23 @@ fn tomorrow((y, m, d): (i32, u32, u32)) -> (i32, u32, u32) {
     }
 }
 
-pub fn compute_times(at: (f64, f64), day: (i32, u32, u32)) -> (Times, u32) {
+/// Today's times and tomorrow's Subuh at a place, by the method in Settings with your minute
+/// adjustments.
+pub fn compute_times(prefs: &Prefs, at: (f64, f64), day: (i32, u32, u32)) -> (Times, u32) {
     let loc = location(at);
-    let t = pr::times(loc, Method::KEMENAG, day.0, day.1, day.2);
+    let m: Method = prefs.prayer_method.method();
+    let adj = prefs.prayer_adjust;
+    let t = pr::times(loc, m, day.0, day.1, day.2).adjusted(adj);
     let n = tomorrow(day);
-    let t2 = pr::times(loc, Method::KEMENAG, n.0, n.1, n.2);
+    let t2 = pr::times(loc, m, n.0, n.1, n.2).adjusted(adj);
     (t, t2.subuh)
 }
 
-/// The place changed in Settings: today's times, the reminders, Today's markers and the sun.
+/// The place, the method or an adjustment changed in Settings: today's times, the reminders,
+/// Today's markers and the sun.
 pub fn apply_place(app: &mut App) {
     let d = today();
-    let (t, ts) = compute_times(coords(app), d);
+    let (t, ts) = compute_times(&app.settings.prefs, coords(app), d);
     app.times = t;
     app.tomorrow_subuh = ts;
     app.times_day = d;
@@ -175,7 +191,10 @@ pub fn schedule_reminders(app: &mut App) {
 pub fn fire_reminder(app: &mut App, p: Prayer, off: i32) {
     let at = pr::hhmm(app.times.of(p));
     if off < 0 {
-        // Normal: a bell, the time, no action, gone after 6 s. It waits for a focus break.
+        // Normal: a bell, the time, no action. −30 leaves after 6 s; −10 stays until you close
+        // it or "Memasuki waktu" replaces it. Only presenting holds them, and a held one that
+        // could not show within 2 min is dropped (notices_model::PRAYER_GRACE).
+        let sticky = off >= -10;
         let pill = Pill {
             icon: Icon::Bell,
             dot: false,
@@ -183,32 +202,185 @@ pub fn fire_reminder(app: &mut App, p: Prayer, off: i32) {
             value: at,
             action: None,
             closable: true,
-            ttl_ms: 6000,
+            ttl_ms: if sticky { STICKY_MS } else { 6000 },
         };
         if !notices::hidden_by_you(app) {
             let due = prayer_moment(app, p);
-            notices::post(app, notices::prayer_before(p.name(), due, pill));
+            notices::post(app, notices::prayer_before(p.name(), due, pill, sticky));
         }
     } else {
         // Urgent: shows even when the orb is hidden (the queue shows it, then hides it again),
-        // and the drop flows once.
+        // and the drop flows once. With the adzan playing it stays, with Hentikan, until the
+        // adzan ends or you stop it.
+        notices::drop_prayer(app, p.name());
+        let playing = sound_at_time(app, p);
         let pill = Pill {
             icon: Icon::Bell,
             dot: true,
             title: format!("Memasuki waktu {}", p.name()),
             value: String::new(),
-            action: None,
+            action: playing.then(|| ("Hentikan".to_string(), PillAction::StopAdzan)),
             closable: true,
-            ttl_ms: 10_000,
+            ttl_ms: if playing { STICKY_MS } else { 10_000 },
         };
-        notices::drop_prayer(app, p.name());
-        notices::post(app, notices::urgent(Source::Prayer, pill));
+        let n = notices::urgent(Source::Prayer, pill);
+        notices::post(app, if playing { n.sticky() } else { n });
         set_tucked(app, false);
         app.flow = Some(Instant::now());
         start_anim(app);
         habits::on_prayer_time(app, p.name());
     }
     log_line(app, &format!("reminder {} {:+}", p.name(), off));
+}
+
+// ---- the sound at the time: Diam, Bunyi, or the adzan file you chose ----
+
+/// winmm's message when a `play ... notify` ends (MM_MCINOTIFY), sent to the orb window.
+pub const MM_MCINOTIFY: u32 = 0x03B9;
+const MCI_NOTIFY_SUCCESSFUL: usize = 1;
+const MCI_NOTIFY_FAILURE: usize = 8;
+const ADZAN: &str = "orb_adzan";
+
+/// Plays what Settings asks for at "Memasuki waktu". Returns true while an adzan plays (its pill
+/// gets Hentikan). Never a sound in full screen or while presenting: the pill shows silently.
+fn sound_at_time(app: &mut App, p: Prayer) -> bool {
+    stop_adzan(app);
+    let choice = app.settings.prefs.at_time_sound;
+    if choice == AtTimeSound::Silent {
+        return false;
+    }
+    if notices::silent(app) {
+        log_line(app, "prayer: no sound (full screen or presenting)");
+        return false;
+    }
+    if choice == AtTimeSound::Chime {
+        chime();
+        return false;
+    }
+    let Some(path) = app
+        .settings
+        .prefs
+        .adzan_for(p == Prayer::Subuh)
+        .map(str::to_string)
+    else {
+        log_line(app, "prayer: no adzan file chosen, Bunyi instead");
+        chime();
+        return false;
+    };
+    match play_adzan(app, &path) {
+        Ok(()) => {
+            log_line(app, &format!("prayer: adzan plays ({})", file_name(&path)));
+            true
+        }
+        Err(e) => {
+            log_line(app, &format!("prayer: adzan failed ({e}), Bunyi instead"));
+            chime();
+            false
+        }
+    }
+}
+
+/// Bunyi: Windows' own short notification sound (follows the sound scheme, never bundled).
+fn chime() {
+    unsafe {
+        let _ = PlaySoundW(
+            w!("Notification.Default"),
+            None,
+            SND_ALIAS | SND_ASYNC | SND_NODEFAULT,
+        );
+    }
+}
+
+fn mci(cmd: &str, notify: Option<HWND>) -> Result<(), String> {
+    let err = unsafe { mciSendStringW(&HSTRING::from(cmd), None, notify) };
+    if err == 0 {
+        return Ok(());
+    }
+    let mut buf = [0u16; 256];
+    unsafe {
+        let _ = mciGetErrorStringW(err, &mut buf);
+    }
+    let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    Err(format!(
+        "MCI {err}: {}",
+        String::from_utf16_lossy(&buf[..n])
+    ))
+}
+
+/// mp3 or wav through winmm's MCI (no decoder of our own); the end arrives as MM_MCINOTIFY.
+fn play_adzan(app: &mut App, path: &str) -> Result<(), String> {
+    if !std::path::Path::new(path).is_file() {
+        return Err("the file is not there any more".into());
+    }
+    mci(&format!("open \"{path}\" alias {ADZAN}"), None)?;
+    if let Err(e) = mci(&format!("play {ADZAN} notify"), Some(app.hwnd)) {
+        let _ = mci(&format!("close {ADZAN}"), None);
+        return Err(e);
+    }
+    app.adzan_playing = true;
+    Ok(())
+}
+
+/// Hentikan, your X on its pill, or a new prayer time.
+pub fn stop_adzan(app: &mut App) {
+    if app.adzan_playing {
+        let _ = mci(&format!("close {ADZAN}"), None);
+        app.adzan_playing = false;
+        log_line(app, "prayer: adzan stopped");
+    }
+}
+
+fn is_adzan_pill(p: &Pill) -> bool {
+    matches!(p.action, Some((_, PillAction::StopAdzan)))
+}
+
+/// MM_MCINOTIFY: the adzan reached its end (or failed mid-way). A stop we asked for (aborted,
+/// superseded) needs nothing. Its pill leaves with it.
+pub fn on_adzan_notify(app: &mut App, flags: usize) {
+    if !app.adzan_playing || !matches!(flags, MCI_NOTIFY_SUCCESSFUL | MCI_NOTIFY_FAILURE) {
+        return;
+    }
+    let _ = mci(&format!("close {ADZAN}"), None);
+    app.adzan_playing = false;
+    log_line(app, "prayer: adzan ended");
+    notices::drop_offers(app, is_adzan_pill);
+    if app.pill.as_ref().is_some_and(is_adzan_pill) && !app.pill_closing {
+        notices::closed_by_you(app);
+        pill::dismiss_pill(app);
+    }
+}
+
+/// You closed a pill with its X: closing the adzan's pill stops the adzan too.
+pub fn on_pill_closed_by_you(app: &mut App) {
+    if app.pill.as_ref().is_some_and(is_adzan_pill) {
+        stop_adzan(app);
+    }
+}
+
+/// Settings, "Choose file": an mp3 or wav from this PC. Run with the app not borrowed (its modal
+/// loop dispatches our messages).
+pub fn pick_adzan_file(owner: HWND, subuh: bool) -> Option<String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dlg: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let types = [COMDLG_FILTERSPEC {
+            pszName: w!("Audio (mp3, wav)"),
+            pszSpec: w!("*.mp3;*.wav"),
+        }];
+        dlg.SetFileTypes(&types).ok()?;
+        let opts = dlg.GetOptions().ok()?;
+        dlg.SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST)
+            .ok()?;
+        let title = if subuh { "Adzan for Subuh" } else { "Adzan" };
+        dlg.SetTitle(&HSTRING::from(title)).ok()?;
+        dlg.Show(Some(owner)).ok()?;
+        let item = dlg.GetResult().ok()?;
+        let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s
+    }
 }
 
 /// When `p` next comes: today's time, or tomorrow's once today's has passed (Subuh after Isya).
@@ -246,7 +418,7 @@ pub fn on_remind_timer(app: &mut App, hwnd: HWND) {
 pub fn refresh_day(app: &mut App) {
     let d = today();
     if d != app.times_day {
-        let (t, ts) = compute_times(coords(app), d);
+        let (t, ts) = compute_times(&app.settings.prefs, coords(app), d);
         app.times = t;
         app.tomorrow_subuh = ts;
         app.times_day = d;
@@ -272,6 +444,7 @@ pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<panel::Hit>)
         next: np,
         mins_left: mins,
         place: &place,
+        method: app.settings.prefs.prayer_method.short(),
         qibla: format!("{:.0}° {}", b, qibla::compass(b)),
         reminders: app.settings.prefs.prayer_reminders,
         hover,

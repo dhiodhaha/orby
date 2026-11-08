@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::format::{AudioCodec, Format};
+use crate::js::JsRuntime;
 use crate::link::MediaLink;
 
 /// Every progress line we asked for starts with this, so it never collides with yt-dlp's own text.
@@ -24,7 +25,21 @@ pub struct Request {
     pub folder: PathBuf,
 }
 
-pub fn build_args(req: &Request, ffmpeg: &Path) -> Vec<OsString> {
+/// Network robustness on top of yt-dlp's own retries (10 per request, 10 per fragment, 3 for the
+/// extractor): back off between tries instead of retrying at once, and give YouTube's flaky
+/// player and API pages a few more chances.
+pub const RETRY_ARGS: [&str; 8] = [
+    "--extractor-retries",
+    "5",
+    "--retry-sleep",
+    "exp=1:8",
+    "--retry-sleep",
+    "fragment:exp=1:8",
+    "--retry-sleep",
+    "extractor:exp=1:8",
+];
+
+pub fn build_args(req: &Request, ffmpeg: &Path, js: Option<&JsRuntime>) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |s: &str| a.push(s.into());
     match req.format {
@@ -56,8 +71,17 @@ pub fn build_args(req: &Request, ffmpeg: &Path) -> Vec<OsString> {
             push("0");
         }
     }
-    for s in ["--newline", "--no-playlist", "--no-colors", "--progress-template", PROGRESS_TEMPLATE] {
+    // The PyInstaller yt-dlp.exe ignores PYTHONUTF8 and writes piped output in the ANSI code page,
+    // which turns titles and paths outside it into "?" or mojibake; `--encoding` makes it UTF-8.
+    for s in ["--newline", "--no-playlist", "--no-colors", "--encoding", "utf-8", "--progress-template", PROGRESS_TEMPLATE] {
         push(s);
+    }
+    for s in RETRY_ARGS {
+        push(s);
+    }
+    if let Some(js) = js {
+        a.push("--js-runtimes".into());
+        a.push(js.arg());
     }
     a.push("--ffmpeg-location".into());
     a.push(ffmpeg.into());
@@ -75,9 +99,27 @@ pub fn build_args(req: &Request, ffmpeg: &Path) -> Vec<OsString> {
 mod tests {
     use super::*;
 
-    fn args(url: &str, format: Format) -> Vec<String> {
+    fn args_with(url: &str, format: Format, js: Option<&JsRuntime>) -> Vec<String> {
         let req = Request { link: MediaLink::parse(url).unwrap(), format, folder: PathBuf::from(r"C:\Users\me\Downloads\App") };
-        build_args(&req, Path::new(r"C:\sidecar\ffmpeg.exe")).into_iter().map(|s| s.into_string().unwrap()).collect()
+        build_args(&req, Path::new(r"C:\sidecar\ffmpeg.exe"), js).into_iter().map(|s| s.into_string().unwrap()).collect()
+    }
+
+    fn args(url: &str, format: Format) -> Vec<String> {
+        args_with(url, format, None)
+    }
+
+    #[test]
+    fn retries_back_off_and_the_js_runtime_is_passed_when_found() {
+        let a = args("https://youtu.be/dQw4w9WgXcQ", Format::default());
+        assert_eq!(after(&a, "--extractor-retries"), "5");
+        let sleeps: Vec<&str> = a.windows(2).filter(|w| w[0] == "--retry-sleep").map(|w| w[1].as_str()).collect();
+        assert_eq!(sleeps, ["exp=1:8", "fragment:exp=1:8", "extractor:exp=1:8"]);
+        assert!(!a.contains(&"--js-runtimes".to_string()), "none found, none passed");
+
+        let node = JsRuntime { kind: crate::js::JsKind::Node, path: PathBuf::from(r"C:\Program Files\nodejs\node.exe") };
+        let a = args_with("https://youtu.be/dQw4w9WgXcQ", Format::default(), Some(&node));
+        assert_eq!(after(&a, "--js-runtimes"), r"node:C:\Program Files\nodejs\node.exe");
+        assert_eq!(&a[a.len() - 2..], ["--", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"]);
     }
 
     fn after<'a>(a: &'a [String], flag: &str) -> &'a str {
@@ -111,6 +153,7 @@ mod tests {
             assert!(a.contains(&flag.to_string()), "{flag}");
         }
         assert_eq!(after(&a, "--progress-template"), PROGRESS_TEMPLATE);
+        assert_eq!(after(&a, "--encoding"), "utf-8");
         assert_eq!(after(&a, "--ffmpeg-location"), r"C:\sidecar\ffmpeg.exe");
         assert_eq!(after(&a, "-P"), r"C:\Users\me\Downloads\App");
         assert_eq!(after(&a, "-o"), OUTPUT_TEMPLATE);

@@ -18,11 +18,14 @@ cbuffer Params : register(b0)
     float  contour;
     float  tintA;
     float  ringStart;    // 0..1 of a turn: where the arc begins (the travelling arc while reading a link)
-    float  pad1;
+    float  squash;       // horizontal stretch (0 = round); the height shrinks to keep the volume
     float  ringMode;     // 0 none, 1 progress (hairline track + arc), 2 focus (dotted track + arc)
     float  ringProgress; // 0..1, clockwise from 12 o'clock
     float  ringRadius;   // px
     float  px1;          // one logical pixel in px
+    float2 wander;       // noise-field offset; wanders on a random path while active
+    float  warp;         // strength of a second, drifting stripe warp (0 at idle)
+    float  pad2;
     float4 ringInk;      // premultiplied
     float4 ringTrack;    // premultiplied
     float4 ringHalo;     // premultiplied, opposite colour so the ring reads over any wallpaper
@@ -130,7 +133,8 @@ float colorChanges(float c1, float c2, float stripe, float3 w, float blur, float
 
 float4 ps_main(VSOut i) : SV_Target
 {
-    float2 uv = (i.pos.xy - orbOrigin) / orbSize;
+    float2 stretch = float2(1.0 + squash, 1.0 / (1.0 + squash));
+    float2 uv = (i.pos.xy - (orbOrigin + 0.5 * orbSize)) / (orbSize * stretch) + 0.5;
     float t = 0.3 * (time + 2.8);
     float cycleWidth = repetition;
 
@@ -169,7 +173,7 @@ float4 ps_main(VSOut i) : SV_Target
     float thin1w = cycleWidth * thin1;
     float thin2w = cycleWidth * thin2;
 
-    float noise = snoise(uv - t);
+    float noise = snoise(uv - t + wander);
     edge += (1.0 - edge) * distortion * noise;
 
     direction += diagBLtoTR;
@@ -187,6 +191,8 @@ float4 ps_main(VSOut i) : SV_Target
     direction *= (0.5 + 0.5 * pow(uy, 2.0));
     direction *= cycleWidth;
     direction -= t;
+    // A second, slower field bends the stripes along the wander path, so the loop never repeats.
+    direction += 0.12 * warp * snoise(1.3 * uv + float2(wander.y, -wander.x) * 0.7 + 0.37 * t);
 
     float colorDispersion = saturate(1.0 - bump);
     float dR = colorDispersion;

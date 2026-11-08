@@ -165,6 +165,39 @@ fn place_pill(app: &App) {
             SWP_NOACTIVATE | SWP_NOOWNERZORDER | orb::raise_once(app.pill_hwnd),
         );
     }
+    // The tucked shadow under the front pill's visible shape as it grows out of the drop.
+    let fw = app.pill_layout.w;
+    let r = app.pill_reveal.pos.clamp(0.0, 1.2);
+    let width = 48.0 + (fw - 48.0) * r.min(1.0);
+    let fx = x_of(app, fw);
+    let (l, rr) = if app.side == Side::Right {
+        (fx + fw - width, fx + fw)
+    } else {
+        (fx, fx + width)
+    };
+    let (x0, y0) = (x.round(), y.round());
+    gfx_shadow(
+        app,
+        (
+            x0 + px(app, l),
+            y0 + px(app, ui::PILL_PAD),
+            x0 + px(app, rr),
+            y0 + px(app, ui::PILL_PAD + ui::PILL_H),
+        ),
+        r.min(1.0),
+    );
+}
+
+fn gfx_shadow(app: &App, shape: (f32, f32, f32, f32), opacity: f32) {
+    crate::depth::follow(
+        &app.g,
+        app.pill_hwnd,
+        shape,
+        ui::PILL_H / 2.0,
+        app.scale,
+        app.theme.dark,
+        opacity,
+    );
 }
 
 /// Clicks outside the shapes go through: the front pill (and the peeks under it), or the spread
@@ -411,6 +444,8 @@ pub fn show_pill(app: &mut App, p: Pill) {
     app.pill_reveal.c = 17.0;
     app.stack.behind = notices::badge_count(app);
     put_pill(app, p);
+    // The drop swells as it pushes the pill out.
+    orb::kick_notice(app);
     start_anim(app);
 }
 
@@ -652,6 +687,10 @@ fn pill_action(app: &mut App, a: PillAction) {
             crate::settings::open(app, crate::settings_model::Section::General);
         }
         PillAction::UndoShortcut => crate::settings::undo_shortcut(app),
+        PillAction::StopAdzan => {
+            crate::prayer::stop_adzan(app);
+            dismiss_pill(app);
+        }
     }
 }
 
@@ -695,6 +734,7 @@ pub fn tick(app: &mut App, dt: f32) {
         app.pill_reveal.snap(0.0);
         app.stack.spread.snap(0.0);
         app.stack.items.clear();
+        crate::depth::hide(app.pill_hwnd);
         unsafe {
             let _ = ShowWindow(app.pill_hwnd, SW_HIDE);
         }
@@ -734,7 +774,11 @@ fn on_click(app: &mut App, x: f32, y: f32) {
                 pill_action(app, a);
             }
         }
-        StackHit::Front(PillPart::Close) => dismiss_pill(app),
+        StackHit::Front(PillPart::Close) => {
+            // Your X: a pill that stays until closed is done with, not put back in line.
+            notices::closed_by_you(app);
+            dismiss_pill(app);
+        }
         StackHit::Item(k, PillPart::Action | PillPart::Menu) => {
             if let Some((id, p, _)) = app.stack.items.get(k).cloned() {
                 notices::stack_action(app, id);

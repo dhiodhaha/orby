@@ -497,11 +497,15 @@ pub fn offline_count(q: &Queue) -> usize {
 /// The error pill's words and whether it offers a next step: (title, value, action label).
 pub fn error_words(kind: ErrorKind, folder: &Path) -> (&'static str, String, Option<&'static str>) {
     match kind {
-        ErrorKind::Private => ("Can't save", "video is private".into(), None),
-        ErrorKind::Removed => ("Can't save", "video was removed".into(), None),
-        ErrorKind::DiskFull => ("Disk full", drive(folder), Some("Change folder")),
+        ErrorKind::Private => ("Couldn't save", "video is private".into(), None),
+        ErrorKind::Removed => ("Couldn't save", "video was removed".into(), None),
+        ErrorKind::DiskFull => (
+            "Couldn't save",
+            format!("{} is full", drive(folder)),
+            Some("Change folder"),
+        ),
         ErrorKind::Offline => ("Offline", "downloads paused".into(), None),
-        ErrorKind::FfmpegMissing => ("Can't save", "needs ffmpeg".into(), None),
+        ErrorKind::FfmpegMissing => ("Couldn't save", "needs ffmpeg".into(), None),
         ErrorKind::Unsupported | ErrorKind::Other => {
             ("Couldn't read this link", String::new(), Some("Retry"))
         }
@@ -730,11 +734,14 @@ mod tests {
             Update::Finished(Outcome::Failed(ErrorKind::Offline)),
             at(),
         );
-        q.apply(
-            ids[3],
-            Update::Finished(Outcome::Failed(ErrorKind::Other)),
-            at(),
-        );
+        // An unnamed failure goes on once by itself; the second one in a row shows.
+        for _ in 0..2 {
+            q.apply(
+                ids[3],
+                Update::Finished(Outcome::Failed(ErrorKind::Other)),
+                at(),
+            );
+        }
         let rows = rows(&q, &clock);
         let by = |id: JobId| rows.iter().find(|r| r.id == id).unwrap();
         assert_eq!(by(ids[0]).line, "Private. Only the owner can share it.");
@@ -757,7 +764,11 @@ mod tests {
         );
         assert_eq!(
             error_words(ErrorKind::DiskFull, Path::new(r"D:\Video")),
-            ("Disk full", "D:".to_string(), Some("Change folder"))
+            (
+                "Couldn't save",
+                "D: is full".to_string(),
+                Some("Change folder")
+            )
         );
         assert_eq!(
             error_words(ErrorKind::Private, Path::new(r"D:\")).2,

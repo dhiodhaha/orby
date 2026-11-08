@@ -16,7 +16,12 @@ pub struct Location {
 }
 
 impl Location {
-    pub const YOGYAKARTA: Location = Location { lat: -7.7956, lng: 110.3695, tz: 7.0, elevation_m: 0.0 };
+    pub const YOGYAKARTA: Location = Location {
+        lat: -7.7956,
+        lng: 110.3695,
+        tz: 7.0,
+        elevation_m: 0.0,
+    };
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -46,7 +51,26 @@ impl Method {
         terbit_ihtiyat_min: 2.0,
         imsak_before_min: 10.0,
     };
+
+    /// Majelis Tarjih dan Tajdid PP Muhammadiyah: Subuh at the sun 18° below the horizon (Munas
+    /// Tarjih XXXI, 2020, announced March 2021; Subuh comes about 8 minutes later than Kemenag's
+    /// 20°), Isya 18°, Ashar shadow factor 1. Their tables round up with a smaller ihtiyat than
+    /// Kemenag's. The offsets were fitted on the Imsakiyah 1447 H for Yogyakarta by Oman
+    /// Fathurohman SW, Majelis Tarjih dan Tajdid (18 Feb to 19 Mar 2026): 178 of 180 published
+    /// times match to the minute, the other two are Ashar ±1 (see tests). No published
+    /// Muhammadiyah table for another season was found, so other months are not checked.
+    pub const MUHAMMADIYAH: Method = Method {
+        fajr_angle: 18.0,
+        isha_angle: 18.0,
+        asr_factor: 1.0,
+        offsets_min: [0.95, 1.0, 1.0, 2.44, 1.0],
+        terbit_ihtiyat_min: 2.45,
+        imsak_before_min: 10.0,
+    };
 }
+
+/// The most a manual adjustment moves one prayer, in minutes either way.
+pub const MAX_ADJUST_MIN: i32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prayer {
@@ -58,7 +82,13 @@ pub enum Prayer {
 }
 
 impl Prayer {
-    pub const ALL: [Prayer; 5] = [Prayer::Subuh, Prayer::Dzuhur, Prayer::Ashar, Prayer::Maghrib, Prayer::Isya];
+    pub const ALL: [Prayer; 5] = [
+        Prayer::Subuh,
+        Prayer::Dzuhur,
+        Prayer::Ashar,
+        Prayer::Maghrib,
+        Prayer::Isya,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Prayer::Subuh => "Subuh",
@@ -90,6 +120,23 @@ impl Times {
             Prayer::Ashar => self.ashar,
             Prayer::Maghrib => self.maghrib,
             Prayer::Isya => self.isya,
+        }
+    }
+
+    /// The times moved by whole minutes per prayer ([subuh, dzuhur, ashar, maghrib, isya]), for
+    /// someone who follows a local mosque's schedule. Each is clamped to ±`MAX_ADJUST_MIN`.
+    /// Imsak moves with Subuh; Terbit stays (it is not a prayer time).
+    pub fn adjusted(&self, adj: [i32; 5]) -> Times {
+        let a = adj.map(|m| m.clamp(-MAX_ADJUST_MIN, MAX_ADJUST_MIN));
+        let mv = |t: u32, m: i32| (t as i32 + m).max(0) as u32;
+        Times {
+            imsak: mv(self.imsak, a[0]),
+            subuh: mv(self.subuh, a[0]),
+            terbit: self.terbit,
+            dzuhur: mv(self.dzuhur, a[1]),
+            ashar: mv(self.ashar, a[2]),
+            maghrib: mv(self.maghrib, a[3]),
+            isya: mv(self.isya, a[4]),
         }
     }
 }
@@ -132,7 +179,10 @@ fn sun(jd: f64) -> (f64, f64) {
     let q = fix(280.459 + 0.98564736 * d, 360.0);
     let l = fix(q + 1.915 * rad(g).sin() + 0.020 * rad(2.0 * g).sin(), 360.0);
     let e = 23.439 - 0.00000036 * d;
-    let ra = fix(deg((rad(e).cos() * rad(l).sin()).atan2(rad(l).cos())) / 15.0, 24.0);
+    let ra = fix(
+        deg((rad(e).cos() * rad(l).sin()).atan2(rad(l).cos())) / 15.0,
+        24.0,
+    );
     let decl = deg((rad(e).sin() * rad(l).sin()).asin());
     let mut eqt = q / 15.0 - ra;
     eqt -= 24.0 * (eqt / 24.0).round();
@@ -173,7 +223,10 @@ impl Calc {
 /// Prayer times for one day, rounded like Kemenag's schedules: offsets added, then always rounded
 /// up to the next minute (Terbit: ihtiyat taken off, rounded down).
 pub fn times(loc: Location, m: Method, y: i32, mo: u32, d: u32) -> Times {
-    let c = Calc { loc, jd: julian(y, mo, d) - loc.lng / (15.0 * 24.0) };
+    let c = Calc {
+        loc,
+        jd: julian(y, mo, d) - loc.lng / (15.0 * 24.0),
+    };
     let rise_angle = 0.833 + 0.0347 * loc.elevation_m.max(0.0).sqrt();
     let mut g = [5.0, 6.0, 12.0, 13.0, 18.0, 18.0];
     for _ in 0..2 {
@@ -210,7 +263,11 @@ pub fn next(t: &Times, now_min: f64, tomorrow_subuh: u32) -> (Prayer, u32, f64) 
             return (p, t.of(p), at - now_min);
         }
     }
-    (Prayer::Subuh, tomorrow_subuh, tomorrow_subuh as f64 + 1440.0 - now_min)
+    (
+        Prayer::Subuh,
+        tomorrow_subuh,
+        tomorrow_subuh as f64 + 1440.0 - now_min,
+    )
 }
 
 #[cfg(test)]
@@ -241,7 +298,10 @@ mod tests {
             for d in [1, 15, 28] {
                 let t = times(Location::YOGYAKARTA, Method::KEMENAG, 2026, mo, d);
                 assert!(t.imsak < t.subuh && t.subuh < t.terbit && t.terbit < t.dzuhur);
-                assert!(t.dzuhur < t.ashar && t.ashar < t.maghrib && t.maghrib < t.isya, "{mo}/{d}: {t:?}");
+                assert!(
+                    t.dzuhur < t.ashar && t.ashar < t.maghrib && t.maghrib < t.isya,
+                    "{mo}/{d}: {t:?}"
+                );
             }
         }
     }
@@ -256,7 +316,6 @@ mod tests {
         assert!((mins - (231.0 + 240.0)).abs() < 1e-6);
     }
 }
-
 
 #[cfg(test)]
 mod held_out {
@@ -294,5 +353,252 @@ mod held_out {
             }
         }
         println!("{report}exact {exact} of 25");
+    }
+}
+
+#[cfg(test)]
+mod muhammadiyah {
+    use super::*;
+
+    /// "Jadwal Imsakiyah 1447 H, Yogyakarta (DIY)", dihisab oleh Oman Fathurohman SW, Majelis
+    /// Tarjih dan Tajdid PP Muhammadiyah, published by Suara Muhammadiyah:
+    /// https://web.suaramuhammadiyah.id/wp-content/uploads/2026/01/Imsakiyah-1447-H_yogyakarta.pdf
+    /// Its place: 7° 47' 48" S, 110° 21' 50" E, WIB.
+    const PLACE: Location = Location {
+        lat: -(7.0 + 47.0 / 60.0 + 48.0 / 3600.0),
+        lng: 110.0 + 21.0 / 60.0 + 50.0 / 3600.0,
+        tz: 7.0,
+        elevation_m: 0.0,
+    };
+
+    /// Columns: imsak, subuh, terbit, dzuhur, ashar, maghrib, isya (2026).
+    const PUBLISHED: [((u32, u32), [&str; 7]); 30] = [
+        (
+            (2, 18),
+            [
+                "04:23", "04:33", "05:40", "11:54", "15:04", "18:05", "19:15",
+            ],
+        ),
+        (
+            (2, 19),
+            [
+                "04:23", "04:33", "05:40", "11:54", "15:03", "18:05", "19:15",
+            ],
+        ),
+        (
+            (2, 20),
+            [
+                "04:23", "04:33", "05:40", "11:54", "15:02", "18:05", "19:14",
+            ],
+        ),
+        (
+            (2, 21),
+            [
+                "04:23", "04:33", "05:40", "11:54", "15:01", "18:04", "19:14",
+            ],
+        ),
+        (
+            (2, 22),
+            [
+                "04:24", "04:34", "05:40", "11:54", "15:00", "18:04", "19:13",
+            ],
+        ),
+        (
+            (2, 23),
+            [
+                "04:24", "04:34", "05:40", "11:53", "15:00", "18:04", "19:13",
+            ],
+        ),
+        (
+            (2, 24),
+            [
+                "04:24", "04:34", "05:40", "11:53", "14:59", "18:03", "19:12",
+            ],
+        ),
+        (
+            (2, 25),
+            [
+                "04:24", "04:34", "05:40", "11:53", "14:58", "18:03", "19:12",
+            ],
+        ),
+        (
+            (2, 26),
+            [
+                "04:24", "04:34", "05:40", "11:53", "14:57", "18:03", "19:11",
+            ],
+        ),
+        (
+            (2, 27),
+            [
+                "04:24", "04:34", "05:40", "11:53", "14:56", "18:02", "19:11",
+            ],
+        ),
+        (
+            (2, 28),
+            [
+                "04:24", "04:34", "05:40", "11:53", "14:55", "18:02", "19:11",
+            ],
+        ),
+        (
+            (3, 1),
+            [
+                "04:25", "04:35", "05:40", "11:52", "14:55", "18:01", "19:10",
+            ],
+        ),
+        (
+            (3, 2),
+            [
+                "04:25", "04:35", "05:40", "11:52", "14:55", "18:01", "19:10",
+            ],
+        ),
+        (
+            (3, 3),
+            [
+                "04:25", "04:35", "05:40", "11:52", "14:55", "18:00", "19:09",
+            ],
+        ),
+        (
+            (3, 4),
+            [
+                "04:25", "04:35", "05:40", "11:52", "14:56", "18:00", "19:09",
+            ],
+        ),
+        (
+            (3, 5),
+            [
+                "04:25", "04:35", "05:40", "11:52", "14:56", "18:00", "19:08",
+            ],
+        ),
+        (
+            (3, 6),
+            [
+                "04:25", "04:35", "05:40", "11:51", "14:57", "17:59", "19:08",
+            ],
+        ),
+        (
+            (3, 7),
+            [
+                "04:25", "04:35", "05:40", "11:51", "14:57", "17:59", "19:07",
+            ],
+        ),
+        (
+            (3, 8),
+            [
+                "04:25", "04:35", "05:40", "11:51", "14:57", "17:58", "19:07",
+            ],
+        ),
+        (
+            (3, 9),
+            [
+                "04:25", "04:35", "05:40", "11:51", "14:58", "17:58", "19:06",
+            ],
+        ),
+        (
+            (3, 10),
+            [
+                "04:25", "04:35", "05:40", "11:50", "14:58", "17:57", "19:05",
+            ],
+        ),
+        (
+            (3, 11),
+            [
+                "04:25", "04:35", "05:40", "11:50", "14:58", "17:57", "19:05",
+            ],
+        ),
+        (
+            (3, 12),
+            [
+                "04:25", "04:35", "05:40", "11:50", "14:59", "17:56", "19:04",
+            ],
+        ),
+        (
+            (3, 13),
+            [
+                "04:25", "04:35", "05:40", "11:50", "14:59", "17:56", "19:04",
+            ],
+        ),
+        (
+            (3, 14),
+            [
+                "04:25", "04:35", "05:40", "11:49", "14:59", "17:55", "19:03",
+            ],
+        ),
+        (
+            (3, 15),
+            [
+                "04:25", "04:35", "05:40", "11:49", "14:59", "17:55", "19:03",
+            ],
+        ),
+        (
+            (3, 16),
+            [
+                "04:25", "04:35", "05:40", "11:49", "15:00", "17:54", "19:02",
+            ],
+        ),
+        (
+            (3, 17),
+            [
+                "04:25", "04:35", "05:40", "11:48", "15:00", "17:54", "19:02",
+            ],
+        ),
+        (
+            (3, 18),
+            [
+                "04:25", "04:35", "05:40", "11:48", "15:00", "17:53", "19:01",
+            ],
+        ),
+        (
+            (3, 19),
+            [
+                "04:25", "04:35", "05:40", "11:48", "15:00", "17:53", "19:01",
+            ],
+        ),
+    ];
+
+    fn mins(s: &str) -> i32 {
+        let (h, m) = s.split_once(':').unwrap();
+        h.parse::<i32>().unwrap() * 60 + m.parse::<i32>().unwrap()
+    }
+
+    #[test]
+    fn matches_the_published_muhammadiyah_imsakiyah_for_yogyakarta() {
+        let mut exact = 0;
+        let mut report = String::new();
+        for ((mo, d), want) in PUBLISHED {
+            let t = times(PLACE, Method::MUHAMMADIYAH, 2026, mo, d);
+            let got = [
+                t.imsak, t.subuh, t.terbit, t.dzuhur, t.ashar, t.maghrib, t.isya,
+            ];
+            for (g, w) in got.iter().zip(want) {
+                let diff = *g as i32 - mins(w);
+                exact += (diff == 0) as u32;
+                report += &format!("{mo:02}-{d:02} got {} want {w} ({diff:+})\n", hhmm(*g));
+                assert!(diff.abs() <= 1, "{report}");
+            }
+        }
+        assert!(exact >= 208, "{report}exact {exact} of 210");
+    }
+
+    #[test]
+    fn subuh_18_degrees_is_about_8_minutes_after_kemenag() {
+        // Muhammadiyah's own figure for the change from 20° to 18°: about 8 minutes.
+        for (mo, d) in [(3, 1), (6, 15), (11, 6)] {
+            let k = times(Location::YOGYAKARTA, Method::KEMENAG, 2026, mo, d);
+            let m = times(Location::YOGYAKARTA, Method::MUHAMMADIYAH, 2026, mo, d);
+            let diff = m.subuh as i32 - k.subuh as i32;
+            assert!((7..=9).contains(&diff), "{mo}/{d}: {diff}");
+        }
+    }
+
+    #[test]
+    fn manual_adjustments_move_each_prayer_and_are_clamped() {
+        let t = times(Location::YOGYAKARTA, Method::KEMENAG, 2026, 11, 6);
+        let a = t.adjusted([2, 0, -1, 0, 25]);
+        assert_eq!((a.subuh, a.imsak), (t.subuh + 2, t.imsak + 2));
+        assert_eq!(a.terbit, t.terbit);
+        assert_eq!(a.dzuhur, t.dzuhur);
+        assert_eq!(a.ashar, t.ashar - 1);
+        assert_eq!(a.isya, t.isya + MAX_ADJUST_MIN as u32);
+        assert_eq!(t.adjusted([0; 5]), t);
     }
 }

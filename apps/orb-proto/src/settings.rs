@@ -182,7 +182,7 @@ pub fn start(app: &mut App) {
         let p = Pill {
             icon: Icon::Keyboard,
             dot: false,
-            title: format!("{} is taken", s.label()),
+            title: format!("Couldn't use {}", s.label()),
             value: "another app uses it".into(),
             action: Some(("Change".into(), PillAction::OpenSettings)),
             closable: true,
@@ -581,6 +581,7 @@ pub fn apply_theme(app: &mut App) {
         pill::render_pill(app);
     }
     panels::redraw(app);
+    crate::disk_window::redraw(app);
     render(app);
     let dark = app.theme.dark;
     log_line(
@@ -752,7 +753,7 @@ fn finish_first_run(app: &mut App) {
     let p = Pill {
         icon: Icon::Tick,
         dot: false,
-        title: "[App] is ready".into(),
+        title: "Orby is ready".into(),
         value: label,
         action: None,
         closable: true,
@@ -833,7 +834,7 @@ fn view(app: &App) -> View<'_> {
     let s = &app.settings;
     let screen = s.screen.unwrap_or(Screen::Settings(Section::General));
     let (lat, lng) = shown_coords(app);
-    let (times, _) = prayer::compute_times((lat, lng), prayer::today());
+    let (times, _) = prayer::compute_times(&s.prefs, (lat, lng), prayer::today());
     let names = app_core::prayer::Prayer::ALL;
     let times = names.map(|p| (p.name(), app_core::prayer::hhmm(times.of(p))));
     let b = app_core::qibla::bearing(lat, lng);
@@ -927,6 +928,13 @@ pub fn render(app: &mut App) {
     };
     let dc = s.begin(&app.g);
     sp::draw(&app.g, dc, &app.theme, &app.fonts, &v);
+    // The T3 lip along the window's edge (depth.rs); radius as in `place`'s region.
+    let rad = if matches!(screen, Screen::FirstRun(_)) {
+        20.0
+    } else {
+        16.0
+    };
+    crate::depth::lip(&app.g, dc, &app.theme, 0.0, 0.0, lw, lh, rad, 1.0);
     s.end(&app.g);
 }
 
@@ -983,6 +991,48 @@ fn click(app: &mut App, h: Hit) {
             toggle_reminder(app, i);
             return;
         }
+        Hit::Method(mm) => {
+            if app.settings.prefs.prayer_method != mm {
+                app.settings.prefs.prayer_method = mm;
+                save(app);
+                log_line(app, &format!("settings: prayer method {}", mm.name()));
+                prayer::apply_place(app);
+            }
+        }
+        Hit::Adjust(i, step) => {
+            let a = &mut app.settings.prefs.prayer_adjust[i.min(4)];
+            let v = (*a + step).clamp(-m::ADJUST_MAX, m::ADJUST_MAX);
+            if v != *a {
+                *a = v;
+                save(app);
+                prayer::apply_place(app);
+            }
+        }
+        Hit::AtTime(s) => {
+            if app.settings.prefs.at_time_sound != s {
+                app.settings.prefs.at_time_sound = s;
+                save(app);
+                // A choice away from Adzan silences one playing now.
+                if s != m::AtTimeSound::Adzan {
+                    prayer::stop_adzan(app);
+                }
+            }
+        }
+        Hit::PickAdzan(subuh) => {
+            // The picker's modal loop runs from the orb window's message, with the app free.
+            unsafe {
+                let _ = PostMessageW(
+                    Some(app.hwnd),
+                    crate::WM_APP_PRAYER,
+                    WPARAM(subuh as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+        Hit::ClearAdzanSubuh => {
+            app.settings.prefs.adzan_subuh_file = None;
+            save(app);
+        }
         Hit::Source(s) => {
             let on = notices::source_state(app, s).is_some();
             notices::set_source_on(app, s, on);
@@ -1025,6 +1075,33 @@ pub fn toggle_reminder(app: &mut App, i: usize) {
     save(app);
     prayer::schedule_reminders(app);
     panels::refresh(app);
+    render(app);
+}
+
+/// The adzan file picker closed: keep the path (the file stays where you have it; nothing is
+/// copied or uploaded).
+pub fn on_adzan_picked(app: &mut App, subuh: bool, path: Option<String>) {
+    let Some(path) = path else {
+        return;
+    };
+    if !m::is_audio(&path) {
+        log_line(app, "settings: adzan file is not mp3 or wav, ignored");
+        return;
+    }
+    log_line(
+        app,
+        &format!(
+            "settings: adzan{} file {}",
+            if subuh { " (Subuh)" } else { "" },
+            m::file_name(&path)
+        ),
+    );
+    if subuh {
+        app.settings.prefs.adzan_subuh_file = Some(path);
+    } else {
+        app.settings.prefs.adzan_file = Some(path);
+    }
+    save(app);
     render(app);
 }
 
@@ -1236,7 +1313,7 @@ pub fn dial_child(app: &App) -> DialChild {
     let _ = app;
     DialChild {
         text: String::new(),
-        icon: Some(Icon::Sliders),
+        icon: Some(Icon::Gear),
         name: "Settings".into(),
         value: "General".into(),
     }
@@ -1387,7 +1464,7 @@ pub fn make_window(hinst: HINSTANCE) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
             w!("OrbSettings"),
-            w!("[App] settings"),
+            w!("Orby settings"),
             WS_POPUP,
             0,
             0,

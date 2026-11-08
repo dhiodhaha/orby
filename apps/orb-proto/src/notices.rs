@@ -33,6 +33,11 @@ pub struct Notices {
     pub q: m::Queue,
     /// Full screen or presenting on the orb's monitor, as of the last foreground change.
     pub full_screen: bool,
+    /// Windows presentation mode (part of `full_screen` too): the one quiet time that holds
+    /// prayer reminders.
+    pub presenting: bool,
+    /// The pill is leaving because you pressed its X (a sticky pill is done with, not requeued).
+    closing_by_you: bool,
     /// Tray test item: act as if an app were full screen.
     pub test_full_screen: bool,
     /// The orb hid itself for a full-screen app and comes back when it ends.
@@ -76,6 +81,8 @@ impl Notices {
         Notices {
             q,
             full_screen: false,
+            presenting: false,
+            closing_by_you: false,
             test_full_screen: false,
             fs_hidden: false,
             rehide: false,
@@ -134,7 +141,13 @@ pub fn quiet(app: &App) -> Quiet {
         full_screen: app.notices.full_screen,
         focus: app.habits.focus.is_holding(),
         paused: app.notices.paused_until.is_some_and(|t| habits::now() < t),
+        presenting: app.notices.presenting,
     }
+}
+
+/// No sound now: full screen or presenting on the orb's monitor (the pill still shows).
+pub fn silent(app: &App) -> bool {
+    app.notices.full_screen
 }
 
 /// The orb is hidden because you hid it (not for a full-screen app): drink and prayer reminders
@@ -199,8 +212,10 @@ pub fn live(app: &mut App, p: Pill) {
 }
 
 fn display(app: &mut App, p: Pill, urgent: bool) {
-    if urgent && !app.visible {
-        // Urgent shows even while the orb is hidden, then the orb hides again.
+    if app.notices.q.front_breaks_through() && !app.visible {
+        // Urgent and prayer reminders show even while the orb is hidden (a full-screen app hid
+        // it; one you hid yourself skips prayer reminders before they get here), then the orb
+        // hides again.
         orb::set_visible(app, true);
         app.notices.rehide = true;
     }
@@ -222,7 +237,17 @@ pub fn acted(app: &mut App) {
 
 /// The pill starts to leave (timed out, closed, or covered by a panel or the dial).
 pub fn on_dismiss(app: &mut App) {
-    app.notices.q.close_front(false);
+    if std::mem::take(&mut app.notices.closing_by_you) {
+        app.notices.q.close_front_by_you();
+        crate::prayer::on_pill_closed_by_you(app);
+    } else {
+        app.notices.q.close_front(false);
+    }
+}
+
+/// You pressed the pill's X: what leaves now is done with, even a pill that stays until closed.
+pub fn closed_by_you(app: &mut App) {
+    app.notices.closing_by_you = true;
 }
 
 /// The pill has gone: the next one, or hide the orb again after an urgent notice.
@@ -416,6 +441,11 @@ fn class_of(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
+/// Windows presentation mode (PowerPoint's slide show, "presentation settings").
+fn presenting_now() -> bool {
+    unsafe { matches!(SHQueryUserNotificationState(), Ok(s) if s == QUNS_PRESENTATION_MODE) }
+}
+
 /// Presentation mode, or a full-screen foreground window on the orb's own monitor. A maximized
 /// window with a title bar is not full screen.
 fn full_screen_now(app: &App) -> bool {
@@ -423,7 +453,7 @@ fn full_screen_now(app: &App) -> bool {
         return true;
     }
     unsafe {
-        if matches!(SHQueryUserNotificationState(), Ok(s) if s == QUNS_PRESENTATION_MODE) {
+        if presenting_now() {
             return true;
         }
         let fg = GetForegroundWindow();
@@ -461,6 +491,21 @@ fn full_screen_now(app: &App) -> bool {
 pub fn on_foreground(app: &mut App) {
     FG_PENDING.store(false, Ordering::Release);
     let fs = full_screen_now(app);
+    let presenting = presenting_now();
+    if presenting != app.notices.presenting {
+        app.notices.presenting = presenting;
+        log_line(
+            app,
+            if presenting {
+                "notices: presenting, prayer reminders wait too"
+            } else {
+                "notices: presenting ended"
+            },
+        );
+        if fs == app.notices.full_screen {
+            pump(app);
+        }
+    }
     if fs == app.notices.full_screen {
         return;
     }
@@ -496,6 +541,11 @@ pub fn on_foreground(app: &mut App) {
 pub fn on_user_visibility(app: &mut App) {
     app.notices.fs_hidden = false;
     app.notices.rehide = false;
+    // Hidden by you: prayer reminders are skipped (as when they fire while hidden), so a
+    // waiting or sticky one never brings the orb back.
+    if hidden_by_you(app) && app.notices.q.drop_through() && app.pill.is_some() {
+        pill::dismiss_pill(app);
+    }
     pump(app);
 }
 
@@ -596,8 +646,16 @@ pub fn stack_action(app: &mut App, id: u64) {
 
 // ---- sources: small builders the callers share ----
 
-pub fn prayer_before(prayer: &str, at: Moment, p: Pill) -> Notice {
-    Notice::new(Source::Prayer, Priority::Normal, p).before_prayer(prayer, at)
+/// "30 menit lagi Isya" and "10 menit lagi Isya": they pass every quiet time except presenting,
+/// and are dropped rather than shown late. `sticky`: it stays until you close it.
+pub fn prayer_before(prayer: &str, at: Moment, p: Pill, sticky: bool) -> Notice {
+    let n =
+        Notice::new(Source::Prayer, Priority::Normal, p).before_prayer(prayer, at, habits::now());
+    if sticky {
+        n.sticky()
+    } else {
+        n
+    }
 }
 
 pub fn urgent(source: Source, p: Pill) -> Notice {

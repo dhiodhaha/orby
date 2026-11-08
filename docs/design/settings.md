@@ -17,6 +17,7 @@ Doop frames "v6.2 · 21 First run (white)" (id kJ2Pp0_oBA) and "v6.2 · 22 Setti
    - Body: "Worked out on this PC, offline."
    - Two radio rows (40 px, radius 8, a 16 px ring, selected is a filled ink ring with the active fill): **Windows location** ("Yogyakarta, DIY · follows you"), selected by default; **Pick a city** ("Any kabupaten or kota") opens a search field.
    - Method row: "Kemenag RI" with "Subuh 20°, Isya 18°, +2 min" and a small Change (28 px). Change offers the kab/kota schedule too.
+   - Settings, Prayer (2026-11-07): Method is two radio rows, Kemenag RI and Muhammadiyah ("Majelis Tarjih: Subuh 18°, Isya 18°"). Under today's times, "Adjust by minutes, to follow your mosque": Subuh to Isya, each with its minutes and 24 px − and + (−10 to +10). Reminders say "shows for a few seconds" (−30) and "stays until you close it" (−10), with a muted note that only presenting holds them. "At the time": a Sound row with a Diam / Bunyi / Adzan segmented control (default Bunyi), and with Adzan two more rows, Adzan and Adzan for Subuh, each with Choose file (mp3 or wav; Subuh's is optional, with Clear). The first run still asks only for a place and keeps Kemenag.
    - A preview of today: "Today, Jumat 6 Nov", then five columns: Subuh 03:51, Dzuhur 11:26, Ashar 14:41, Maghrib 17:38, Isya 18:50. Names 12 muted, times 13/500. These are times only: no checkboxes, no states.
    - Continue waits until a place is known.
 3. **Shortcut** ("One shortcut")
