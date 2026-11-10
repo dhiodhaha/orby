@@ -1,5 +1,6 @@
 //! The drink log, focus sessions and focus setup on disk, as one small JSON file:
-//! `%APPDATA%\orb-proto\habits.json`. Written whole after each change (write, then rename).
+//! `habits.json` in the data folder (`data_dir`). Written whole after each change (write,
+//! then rename).
 //!
 //! Times on disk are real Unix seconds (UTC), so the file means the same thing in any time zone
 //! and can be synced later. The engines work in local wall-clock `Moment`s; [`unix`] and
@@ -8,12 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use app_habits::drink::Source;
-use app_habits::{Date, Moment};
+use app_habits::Moment;
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::SYSTEMTIME;
-use windows::Win32::System::Time::{
-    SystemTimeToTzSpecificLocalTime, TzSpecificLocalTimeToSystemTime,
-};
 
 /// 1: times are Unix seconds. 0 (files written before the field existed): local wall-clock seconds.
 const FORMAT: u32 = 1;
@@ -76,6 +73,7 @@ impl SavedDrink {
     }
 }
 
+#[cfg(test)]
 fn epoch_secs(m: Moment) -> i64 {
     let e = Moment::from_unix(0, 0);
     if m >= e {
@@ -85,63 +83,21 @@ fn epoch_secs(m: Moment) -> i64 {
     }
 }
 
-fn to_systemtime(m: Moment) -> SYSTEMTIME {
-    let (d, s) = (m.date(), epoch_secs(m).rem_euclid(60));
-    let t = m.minute_of_day();
-    SYSTEMTIME {
-        wYear: d.year() as u16,
-        wMonth: d.month() as u16,
-        wDayOfWeek: 0,
-        wDay: d.day() as u16,
-        wHour: (t / 60) as u16,
-        wMinute: (t % 60) as u16,
-        wSecond: s as u16,
-        wMilliseconds: 0,
-    }
-}
-
-fn from_systemtime(st: &SYSTEMTIME) -> Option<Moment> {
-    let d = Date::new(st.wYear as i32, st.wMonth as u32, st.wDay as u32)?;
-    Some(
-        d.at(st.wHour as u32, st.wMinute as u32)
-            + std::time::Duration::from_secs(st.wSecond as u64),
-    )
-}
-
-/// A local wall-clock moment as Unix seconds, by the zone's rule for that date.
+/// A local wall-clock moment as Unix seconds, by the zone's rule for that date (DST included).
 pub fn unix(m: Moment) -> i64 {
-    let mut utc = SYSTEMTIME::default();
-    match unsafe { TzSpecificLocalTimeToSystemTime(None, &to_systemtime(m), &mut utc) }
-        .ok()
-        .and_then(|_| from_systemtime(&utc))
-    {
-        Some(u) => epoch_secs(u),
-        None => epoch_secs(m),
-    }
+    crate::sys::unix_of_local(m)
 }
 
 /// Unix seconds as a local wall-clock moment.
 pub fn local(unix_secs: i64) -> Moment {
-    let u = Moment::from_unix(unix_secs, 0);
-    let mut lt = SYSTEMTIME::default();
-    unsafe { SystemTimeToTzSpecificLocalTime(None, &to_systemtime(u), &mut lt) }
-        .ok()
-        .and_then(|_| from_systemtime(&lt))
-        .unwrap_or(u)
+    crate::sys::local_of_unix(unix_secs)
 }
 
-/// `%APPDATA%\orb-proto`, created on first use. `ORB_PROTO_DATA` points it elsewhere, so a test
-/// drive of the exe never writes into the real log.
+/// The data folder (`sys::data_dir`): `%APPDATA%\orb-proto` on Windows, `~/Library/Application
+/// Support/orb-proto` on macOS, created on first use. `ORB_PROTO_DATA` points it elsewhere, so a
+/// test drive of the exe never writes into the real log.
 pub fn data_dir() -> PathBuf {
-    let dir = match std::env::var_os("ORB_PROTO_DATA") {
-        Some(d) => PathBuf::from(d),
-        None => std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(crate::exe_dir)
-            .join("orb-proto"),
-    };
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    crate::sys::data_dir()
 }
 
 /// A missing or unreadable file starts empty; a corrupt one is kept aside, never overwritten.
@@ -190,6 +146,7 @@ pub fn save(path: &Path, s: &Saved) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app_habits::Date;
 
     fn temp_file(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -239,8 +196,7 @@ mod tests {
 
     #[test]
     fn times_on_disk_are_real_unix_seconds() {
-        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-        let now_local = from_systemtime(&st).unwrap();
+        let now_local = crate::sys::now();
         let sys = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -13,7 +13,7 @@ use objc2_foundation::{NSArray, NSFileManager, NSString, NSURL};
 
 use super::clock;
 use crate::disk_model::Stamp;
-use crate::notices_model::{Notice, Priority, Source};
+use crate::notices::{self, Notice, Source};
 use crate::ui::Pill;
 use crate::App;
 
@@ -34,8 +34,9 @@ pub fn reduced_motion() -> bool {
 /// The drop has no ring on macOS yet: nothing to redraw for a scan.
 pub fn render_orb(_app: &mut App) {}
 
-pub fn other_ring(_app: &App) -> bool {
-    false
+/// Another ring (focus) owns the drop.
+pub fn other_ring(app: &App) -> bool {
+    crate::habits::ring(app).is_some()
 }
 
 /// The run loop's one timer already follows `disk::animating`.
@@ -95,37 +96,33 @@ fn current_resident() -> Option<u64> {
 }
 
 pub fn post(app: &mut App, n: Notice) {
-    app.post(n);
+    notices::post(app, n);
 }
 
 pub fn notify(app: &mut App, p: Pill) {
-    app.post(Notice::new(Source::Disk, Priority::Normal, p));
+    notices::notify(app, Source::Disk, p);
 }
 
 pub fn reply(app: &mut App, p: Pill) {
-    app.reply(p);
+    notices::reply(app, p);
 }
 
 /// New words for the pill on screen, in place (it does not grow from the drop again).
 pub fn live(app: &mut App, p: Pill) {
-    if app.pill.is_some() && !app.pill_closing {
-        let queued = app.pill_queued;
-        app.show_pill(p, queued);
-    } else {
-        app.reply(p);
-    }
+    notices::live(app, p);
 }
 
 pub fn dismiss_pill(app: &mut App) {
-    app.dismiss_pill(false);
+    crate::pill::dismiss_pill(app);
 }
 
+/// A quiet time holds normal notices (hidden, focus, a pause).
 pub fn quiet_holds(app: &App) -> bool {
-    app.quiet().holds()
+    notices::quiet(app).holds()
 }
 
 pub fn forget_cooldown(app: &mut App, kind: &str) {
-    app.queue.cooldowns.remove(kind);
+    notices::forget_cooldown(app, kind);
 }
 
 pub fn arm_check(app: &mut App, ms: u32) {

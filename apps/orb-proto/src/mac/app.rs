@@ -1,5 +1,11 @@
 //! The macOS app: one state on the main thread, four borderless non-activating panels (the
-//! orb, the dial, the pill, the Prayer panel) and a menu bar item.
+//! orb, the dial, the pill, the panel window) and a menu bar item.
+//!
+//! The shared units run on it as on Windows: notices.rs (the queue every pill goes through),
+//! habits.rs (focus and drink), history.rs, tasks.rs and tasks_window.rs (the window itself is
+//! mac/tasks_win.rs), calendar.rs (Today), dial_menu.rs (what the dial shows and does), over
+//! `crate::sys` (mac/sys.rs), the shims in mac/shim.rs and the panel host mac/panels.rs. Their
+//! timers (`sys::Timer`) are deadlines in `timers`, fired by `tick` and waited for by `schedule`.
 //!
 //! Like Windows it renders only while something moves. Each wake is one NSTimer: 60 Hz while a
 //! spring or a rolling number moves, otherwise a one-shot timer at the next deadline (the tuck,
@@ -8,13 +14,13 @@
 //! Accessibility permission (only key monitors do); the shortcut is a Carbon hot key.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-use app_core::prayer::{self as pr, Location, Prayer, Times};
-use app_core::qibla;
+use app_core::prayer::{self as pr, Prayer, Times};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
@@ -38,10 +44,14 @@ use super::cg::Bitmap;
 use super::clock;
 use super::metal::{self, Gpu, ORB, SS, WIN};
 use crate::canvas::Canvas;
-use crate::notices_model::{Next, Notice, Now, Offered, Priority, Queue, Quiet, Source, STICKY_MS};
+use crate::dial_menu::{self as menu, has_branch, MORE, PRAYER};
+use crate::notices::{self, Source};
+use crate::notices_model::STICKY_MS;
 use crate::panel;
 use crate::settings_model::Prefs;
+use crate::sys::Timer;
 use crate::ui::{self, Fonts, Icon, Pill, PillLayout, PillPart, Theme};
+use crate::{habits, history, panels};
 
 const INSET: f32 = (WIN - ORB) / 2.0;
 const EDGE_MARGIN: f32 = 8.0;
@@ -149,6 +159,21 @@ define_class!(
             self.send(Ev::Up, e);
         }
 
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, e: &NSEvent) {
+            self.send(Ev::RightUp, e);
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, e: &NSEvent) {
+            if self.kind() == Kind::Panel {
+                let dy = e.scrollingDeltaY();
+                let precise = e.hasPreciseScrollingDeltas();
+                let x = self.convertPoint_fromView(e.locationInWindow(), None).x as f32;
+                with_app(|a| crate::mac::panels::on_wheel(a, x, dy, precise));
+            }
+        }
+
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, e: &NSEvent) {
             self.send(Ev::Move, e);
@@ -236,12 +261,12 @@ define_class!(
     }
 );
 
-struct Win {
+pub(crate) struct Win {
     panel: Retained<OrbyPanel>,
     view: Retained<OrbyView>,
-    w: f32,
-    h: f32,
-    shown: bool,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+    pub(crate) shown: bool,
 }
 
 impl Win {
@@ -283,7 +308,7 @@ impl Win {
         }
     }
 
-    fn resize(&mut self, w: f32, h: f32) {
+    pub(crate) fn resize(&mut self, w: f32, h: f32) {
         if (w - self.w).abs() < 0.01 && (h - self.h).abs() < 0.01 {
             return;
         }
@@ -301,46 +326,124 @@ impl Win {
     }
 
     /// Places the window by its top-left corner in screen coordinates (y up).
-    fn place(&self, x: f32, top: f32) {
+    pub(crate) fn place(&self, x: f32, top: f32) {
         self.panel
             .setFrameOrigin(NSPoint::new(x as f64, (top - self.h) as f64));
     }
 
-    fn show(&mut self) {
+    /// Makes the window key (it takes the keys; a non-activating panel leaves the app in front
+    /// as it is). Returns whether it is key now.
+    pub(crate) fn make_key(&self) -> bool {
+        self.panel.makeKeyAndOrderFront(None);
+        self.panel.isKeyWindow()
+    }
+
+    /// The window has the keyboard.
+    pub(crate) fn is_key(&self) -> bool {
+        self.panel.isKeyWindow()
+    }
+
+    /// Adds a subview on top of the window's own view (an input view).
+    pub(crate) fn add_subview(&self, v: &NSView) {
+        self.view.addSubview(v);
+    }
+
+    /// Who takes the keys in the window: `v` (an input view), or the window's own view.
+    pub(crate) fn set_responder(&self, v: Option<&NSView>) -> bool {
+        match v {
+            Some(v) => self.panel.makeFirstResponder(Some(v)),
+            None => self.panel.makeFirstResponder(Some(&self.view)),
+        }
+    }
+
+    /// The window's frame on screen (y up).
+    pub(crate) fn frame(&self) -> NSRect {
+        self.panel.frame()
+    }
+
+    /// Calls `f` when the window becomes key (`true`) or stops being key (`false`).
+    pub(crate) fn observe_key(
+        &self,
+        f: fn(bool),
+    ) -> Vec<Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>> {
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        let mut out = Vec::new();
+        for (name, on) in [
+            ("NSWindowDidBecomeKeyNotification", true),
+            ("NSWindowDidResignKeyNotification", false),
+        ] {
+            let block = RcBlock::new(move |_n: NonNull<NSNotification>| f(on));
+            let obs = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(&NSString::from_str(name)),
+                    Some(&self.panel),
+                    Some(&NSOperationQueue::mainQueue()),
+                    &block,
+                )
+            };
+            out.push(obs);
+        }
+        out
+    }
+
+    pub(crate) fn show(&mut self) {
         if !self.shown {
             self.panel.orderFrontRegardless();
             self.shown = true;
         }
     }
 
-    fn hide(&mut self) {
+    pub(crate) fn hide(&mut self) {
         if self.shown {
             self.panel.orderOut(None);
             self.shown = false;
         }
     }
 
+    /// Draws into a subview's layer (`w` x `h`), in this window's colour space.
+    pub(crate) fn paint_sub(
+        &self,
+        sub: &NSView,
+        w: f32,
+        h: f32,
+        scale: f32,
+        draw: impl FnOnce(&mut dyn Canvas),
+    ) {
+        let space = self.panel.colorSpace().and_then(|s| s.CGColorSpace());
+        let b = match &space {
+            Some(sp) => Bitmap::with_space(w, h, scale, sp),
+            None => Bitmap::new(w, h, scale),
+        };
+        draw(&mut b.canvas());
+        set_contents(sub, &b, scale);
+    }
+
     /// Draws with the shared Canvas into a bitmap that becomes the view's layer contents.
-    fn paint(&self, scale: f32, draw: impl FnOnce(&mut dyn Canvas)) {
+    pub(crate) fn paint(&self, scale: f32, draw: impl FnOnce(&mut dyn Canvas)) {
         let space = self.panel.colorSpace().and_then(|s| s.CGColorSpace());
         let b = match &space {
             Some(sp) => Bitmap::with_space(self.w, self.h, scale, sp),
             None => Bitmap::new(self.w, self.h, scale),
         };
         draw(&mut b.canvas());
-        let Some(img) = b.image() else { return };
-        let Some(layer) = self.view.layer() else {
-            return;
-        };
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        // A CGImage is a CFType, toll-free bridged to an object.
-        let obj: &AnyObject =
-            unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
-        unsafe { layer.setContents(Some(obj)) };
-        layer.setContentsScale(scale as f64);
-        CATransaction::commit();
+        set_contents(&self.view, &b, scale);
     }
+}
+
+/// Makes a bitmap a view's layer contents, without an implicit animation.
+pub(crate) fn set_contents(view: &NSView, b: &Bitmap, scale: f32) {
+    let Some(img) = b.image() else { return };
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    // A CGImage is a CFType, toll-free bridged to an object.
+    let obj: &AnyObject =
+        unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
+    unsafe { layer.setContents(Some(obj)) };
+    layer.setContentsScale(scale as f64);
+    CATransaction::commit();
 }
 
 // ---- the menu bar item's target ----
@@ -357,6 +460,7 @@ define_class!(
             with_app(|a| {
                 let v = !a.visible;
                 a.set_visible(v);
+                notices::on_user_visibility(a);
             });
         }
 
@@ -364,7 +468,8 @@ define_class!(
         fn open_prayer(&self, _sender: Option<&AnyObject>) {
             with_app(|a| {
                 a.set_visible(true);
-                a.open_panel();
+                notices::on_user_visibility(a);
+                crate::prayer::open_panel(a);
             });
         }
 
@@ -376,6 +481,11 @@ define_class!(
         #[unsafe(method(toggleLogin:))]
         fn toggle_login(&self, _sender: Option<&AnyObject>) {
             with_app(|a| a.toggle_login());
+        }
+
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: Option<&AnyObject>) {
+            with_app(|a| crate::settings::open(a, crate::settings_model::Section::General));
         }
 
         /// A Disk worker has news (performSelectorOnMainThread from its thread).
@@ -391,6 +501,22 @@ define_class!(
                 // for the next turn of the run loop instead of being lost.
                 let _: () = unsafe {
                     msg_send![self, performSelector: sel!(diskWake:), withObject: None::<&AnyObject>, afterDelay: 0.02f64]
+                };
+            }
+        }
+
+        /// A calendar read finished on its worker (sys::CalWaker, performSelectorOnMainThread).
+        #[unsafe(method(calWake:))]
+        fn cal_wake(&self, _sender: Option<&AnyObject>) {
+            let mut ran = false;
+            with_app(|a| {
+                ran = true;
+                crate::calendar::on_read_done(a);
+            });
+            if !ran {
+                // The app was busy: the answer waits in its channel for the next turn.
+                let _: () = unsafe {
+                    msg_send![self, performSelector: sel!(calWake:), withObject: None::<&AnyObject>, afterDelay: 0.02f64]
                 };
             }
         }
@@ -418,11 +544,13 @@ impl MenuTarget {
 
 // ---- the state ----
 
+/// A pointer event in one of the app's windows.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Ev {
+pub(crate) enum Ev {
     Down,
     Drag,
     Up,
+    RightUp,
     Move,
     Exit,
 }
@@ -436,17 +564,20 @@ struct Drag {
 pub(crate) struct App {
     gpu: Option<Gpu>,
     orb_layer: Option<Retained<CAMetalLayer>>,
+    /// The badge over the metal, and the label it shows.
+    badge_layer: Option<Retained<objc2_quartz_core::CALayer>>,
+    badge_shown: String,
     orb: Win,
     dial: Win,
     pill_win: Win,
-    panel_win: Win,
+    pub(crate) panel_win: Win,
     _status: Option<Retained<NSStatusItem>>,
     _menu_target: Retained<MenuTarget>,
     toggle_item: Option<Retained<NSMenuItem>>,
     login_item: Option<Retained<NSMenuItem>>,
     pub(crate) fonts: Fonts,
     pub(crate) theme: Theme,
-    scale: f32,
+    pub(crate) scale: f32,
     log_path: PathBuf,
     started: Instant,
     // The drop: its window's left edge (springs) and top, in screen coordinates (y up).
@@ -455,7 +586,7 @@ pub(crate) struct App {
     top: f32,
     opacity: Spring,
     tucked: bool,
-    tuck_at: Option<Instant>,
+    pub(crate) tuck_at: Option<Instant>,
     pub(crate) visible: bool,
     drag: Option<Drag>,
     near: bool,
@@ -477,23 +608,56 @@ pub(crate) struct App {
     pill_until: Option<Instant>,
     pill_hover: PillPart,
     pub(crate) pill_closing: bool,
-    /// The pill on screen came from the queue (and goes back to it when it closes).
-    pub(crate) pill_queued: bool,
-    // The Prayer panel.
-    panel_open: bool,
-    panel_hover: Option<panel::Hit>,
+    // The panel window (mac/panels.rs hosts it): which panel, its hover, Esc's way back.
+    pub(crate) panel_open: bool,
+    pub(crate) panel_kind: panels::Kind,
+    pub(crate) panel_hover: Option<panels::Hit>,
+    pub(crate) panel_back: Option<panels::Kind>,
+    /// The Focus knob is being dragged.
+    pub(crate) knob_drag: bool,
+    /// The Prayer countdown's own layer: a second turning redraws only it, not the whole panel.
+    pub(crate) countdown_view: Retained<NSView>,
+    pub(crate) roll_view: Retained<NSView>,
+    /// Where the open panel's rolls draw (l, t, r, b), from its last full draw.
+    pub(crate) roll_rect: Option<(f32, f32, f32, f32)>,
+    pub(crate) countdown_shown: String,
+    pub(crate) countdown_rolling: bool,
+    /// The panel needs a full redraw at the next tick (and the minute it last drew).
+    pub(crate) panel_dirty: bool,
+    pub(crate) panel_min: i64,
+    /// A roll or ripple moved in the last frame (one more frame at rest after it).
+    pub(crate) panel_moving: bool,
+    // Settings (settings.rs, shared with Windows): `settings.prefs` is what settings.json keeps.
+    pub(crate) settings: crate::settings::Settings,
     // Prayer.
-    prefs: Prefs,
-    times: Times,
-    tomorrow_subuh: u32,
+    pub(crate) times: Times,
+    pub(crate) tomorrow_subuh: u32,
     day: (i32, u32, u32),
     sun_angle: f32,
     brightness: f32,
     sun_at: Instant,
     next_reminder: Option<(Instant, Prayer, i32)>,
-    pub(crate) queue: Queue,
-    queue_wait: Option<Instant>,
-    countdown_at: Option<Instant>,
+    // The shared units' state (the same fields as Windows' App).
+    pub(crate) notices: notices::Notices,
+    pub(crate) habits: habits::Habits,
+    pub(crate) history: history::History,
+    /// Tasks (the panel, the window, the due timer) on the same `app.db` store as Windows.
+    pub(crate) tasks: crate::tasks::Tasks,
+    /// The calendar link and the Today panel.
+    pub(crate) cal: crate::calendar::Cal,
+    /// The day `times` are for (Windows' `times_day`; Today's markers read it).
+    pub(crate) times_day: (i32, u32, u32),
+    /// The panel window's typing view (mac/input.rs), first responder while Tasks types.
+    pub(crate) panel_input: Retained<super::input::InputView>,
+    /// The app that was in front when the panel took the keyboard (it gets it back after).
+    pub(crate) panel_prev_app: Option<Retained<objc2_app_kit::NSRunningApplication>>,
+    /// Observers of the panel window becoming and leaving key (kept alive).
+    _panel_key_obs:
+        Vec<Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>>,
+    /// `sys::Timer` deadlines and their repeat interval (Win32 SetTimer's meaning).
+    pub(crate) timers: HashMap<Timer, (Instant, Duration)>,
+    /// While away from the computer: when to look for fresh input again (mac/sys.rs).
+    pub(crate) away_check_at: Option<Instant>,
     // Disk: its state (shared with Windows), the 10 min low-space check, letting a scan go.
     pub(crate) disk: crate::disk::Disk,
     pub(crate) disk_check_at: Option<Instant>,
@@ -621,51 +785,6 @@ fn tomorrow((y, m, d): (i32, u32, u32)) -> (i32, u32, u32) {
     }
 }
 
-fn compute_times(prefs: &Prefs, day: (i32, u32, u32)) -> (Times, u32) {
-    let (lat, lng) = prefs.place.coords();
-    let loc = Location {
-        lat,
-        lng,
-        tz: clock::local().offset as f64 / 3600.0,
-        elevation_m: 0.0,
-    };
-    let m = prefs.prayer_method.method();
-    let adj = prefs.prayer_adjust;
-    let t = pr::times(loc, m, day.0, day.1, day.2).adjusted(adj);
-    let n = tomorrow(day);
-    (t, pr::times(loc, m, n.0, n.1, n.2).adjusted(adj).subuh)
-}
-
-fn read_settings(dir: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read_to_string(dir.join("settings.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
-}
-
-const DIAL_NAMES: [&str; 6] = ["Tasks", "Today", "Prayer", "Focus", "Drink", "More"];
-const DIAL_ICONS: [Icon; 6] = [
-    Icon::Tasks,
-    Icon::Today,
-    Icon::Prayer,
-    Icon::Focus,
-    Icon::Drink,
-    Icon::More,
-];
-const PRAYER: usize = 2;
-const MORE: usize = 5;
-/// More's branch, in the Windows order.
-const MORE_KIDS: [(Icon, &str); 6] = [
-    (Icon::Download, "Downloads"),
-    (Icon::HardDrive, "Disk"),
-    (Icon::Grid, "History"),
-    (Icon::Bell, "Notices"),
-    (Icon::Gear, "Settings"),
-    (Icon::List, "All tasks"),
-];
-const MORE_DISK: usize = 1;
-
 impl App {
     pub(crate) fn log(&self, line: &str) {
         let l = clock::local();
@@ -699,6 +818,7 @@ impl App {
             r.err().unwrap_or_else(|| "ok".into())
         ));
         self.sync_login_item();
+        crate::settings::refresh_startup(self);
         if super::login::needs_approval() {
             self.reply(Pill {
                 icon: Icon::Info,
@@ -712,26 +832,22 @@ impl App {
         }
     }
 
-    fn sync_login_item(&self) {
+    /// The menu bar's Start at login checkmark shows the login item's state.
+    pub(crate) fn sync_login_item(&self) {
         if let Some(item) = &self.login_item {
             item.setState(if super::login::enabled() { 1 } else { 0 });
         }
     }
 
-    fn now(&self) -> Now {
-        Now {
-            at: clock::now(),
-            ms: self.started.elapsed().as_millis() as u64,
+    /// A theme change: the drop, the dial and the pill draw again (the panel and the windows
+    /// redraw on their own, see `settings_sys::redraw_others`).
+    pub(crate) fn redraw_for_theme(&mut self) {
+        self.render_orb();
+        if self.dial.shown {
+            self.render_dial();
         }
-    }
-
-    pub(crate) fn quiet(&self) -> Quiet {
-        Quiet {
-            hidden: !self.visible,
-            full_screen: false,
-            focus: false,
-            paused: false,
-            presenting: false,
+        if self.pill.is_some() {
+            self.render_pill();
         }
     }
 
@@ -775,20 +891,148 @@ impl App {
 
     // ---- the drop ----
 
-    fn render_orb(&mut self) {
+    /// The drop. The focus ring (`habits::ring`) and the notices badge
+    /// (`notices::badge_count`) are drawn here once the UI stage brings them to the Mac.
+    pub(crate) fn render_orb(&mut self) {
         let (Some(gpu), Some(layer)) = (&self.gpu, &self.orb_layer) else {
             return;
         };
+        let p = self.orb_params();
+        gpu.draw(layer, &p);
+        self.orb_dirty = false;
+        self.render_badge();
+    }
+
+    /// The shader's uniforms for the drop as it is now: at rest, with the ring when one runs.
+    fn orb_params(&self) -> metal::Params {
         let k = self.scale * SS;
-        let p = metal::rest_params(
+        let mut p = metal::rest_params(
             k,
             self.sun_angle,
             self.brightness,
             self.opacity.pos.clamp(0.0, 1.0),
             1.0,
         );
-        gpu.draw(layer, &p);
-        self.orb_dirty = false;
+        // The ring, as on Windows: a running focus session wins (its dotted track and the
+        // part done), else a scan you started.
+        let dark = self.theme.dark;
+        let (ink, track) = if dark {
+            ([0.98, 0.98, 0.98], [1.0, 1.0, 1.0])
+        } else {
+            ([0.09, 0.09, 0.09], [0.0, 0.0, 0.0])
+        };
+        let hair_a = if dark { 0.24 } else { 0.18 };
+        let ring = match (crate::habits::ring(self), crate::disk::ring(self)) {
+            (Some(f), _) => Some((2.0, f, if dark { 0.6 } else { 0.45 }, 0.0)),
+            (None, Some(app_downloads::Ring::Reading)) => {
+                Some((1.0, 0.25, hair_a, crate::disk::spin_start(self)))
+            }
+            (None, Some(app_downloads::Ring::Progress { fraction, .. })) => {
+                Some((1.0, fraction as f32, hair_a, 0.0))
+            }
+            _ => None,
+        };
+        if let Some((mode, progress, track_a, start)) = ring {
+            let premul = |c: [f32; 3], a: f32| [c[0] * a, c[1] * a, c[2] * a, a];
+            p.ring_mode = mode;
+            p.ring_progress = progress;
+            p.ring_start = start;
+            p.ring_ink = premul(ink, 1.0);
+            p.ring_track = premul(track, track_a);
+            p.ring_halo = if dark {
+                premul([0.06, 0.06, 0.06], 0.55)
+            } else {
+                premul([1.0, 1.0, 1.0], 0.75)
+            };
+        }
+        p
+    }
+
+    /// Overdue tasks for the badge.
+    fn overdue_tasks(&self) -> usize {
+        self.tasks.overdue
+    }
+
+    /// Overdue tasks plus the notices waiting behind the front pill, as a count on the drop's
+    /// upper shoulder away from the edge (Windows' `draw_badge`): an ink disc with panel-coloured
+    /// digits and rim; a Disk scan that needs you shows an ember "!". Drawn on its own layer
+    /// over the metal, only when the label changes.
+    fn render_badge(&mut self) {
+        let n = self.overdue_tasks() + crate::notices::badge_count(self);
+        let ember = self.disk.attention;
+        let label = if ember {
+            "!".to_string()
+        } else if n == 0 {
+            String::new()
+        } else if n > 9 {
+            "9+".to_string()
+        } else {
+            n.to_string()
+        };
+        let key = format!("{label}|{}|{:?}", self.theme.dark, self.side);
+        if key == self.badge_shown {
+            return;
+        }
+        self.badge_shown = key;
+        let Some(orb_layer) = &self.orb_layer else {
+            return;
+        };
+        let layer = self.badge_layer.get_or_insert_with(|| {
+            let l = objc2_quartz_core::CALayer::new();
+            l.setFrame(CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(WIN as f64, WIN as f64),
+            ));
+            orb_layer.addSublayer(&l);
+            l
+        });
+        let b = Bitmap::new(WIN, WIN, self.scale);
+        if !label.is_empty() {
+            let t = self.theme;
+            let wide = if label.len() > 1 { 7.0 } else { 0.0 };
+            let cx = WIN / 2.0
+                + if self.side == Side::Right {
+                    -17.0
+                } else {
+                    17.0
+                };
+            let cy = WIN / 2.0 - 17.0;
+            let mut cv = b.canvas();
+            cv.fill_rrect(
+                &crate::canvas::rrect(
+                    cx - 9.5 - wide / 2.0,
+                    cy - 9.5,
+                    cx + 9.5 + wide / 2.0,
+                    cy + 9.5,
+                    9.5,
+                ),
+                t.panel,
+            );
+            let (fill, digits) = if ember {
+                (t.ember, crate::canvas::rgba(0xFFFFFF, 1.0))
+            } else {
+                (t.text, t.panel)
+            };
+            cv.fill_rrect(
+                &crate::canvas::rrect(
+                    cx - 8.0 - wide / 2.0,
+                    cy - 8.0,
+                    cx + 8.0 + wide / 2.0,
+                    cy + 8.0,
+                    8.0,
+                ),
+                fill,
+            );
+            cv.center_text(&label, &self.fonts.badge, cx, cy - 8.0, 16.0, digits);
+        }
+        let Some(img) = b.image() else { return };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        let obj: &AnyObject =
+            unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
+        unsafe { layer.setContents(Some(obj)) };
+        layer.setContentsScale(self.scale as f64);
+        CATransaction::commit();
     }
 
     fn place_orb(&mut self) {
@@ -801,7 +1045,7 @@ impl App {
         }
     }
 
-    fn set_tucked(&mut self, tucked: bool) {
+    pub(crate) fn set_tucked(&mut self, tucked: bool) {
         if self.tucked == tucked {
             return;
         }
@@ -813,7 +1057,7 @@ impl App {
     }
 
     /// Tucks 3 s from now, unless something is open or the pointer is close.
-    fn arm_tuck(&mut self) {
+    pub(crate) fn arm_tuck(&mut self) {
         let busy = self.dial_open || self.panel_open || self.pill.is_some() || self.drag.is_some();
         self.tuck_at = if busy || self.near || self.tucked {
             None
@@ -822,7 +1066,7 @@ impl App {
         };
     }
 
-    fn set_visible(&mut self, v: bool) {
+    pub(crate) fn set_visible(&mut self, v: bool) {
         if self.visible == v {
             return;
         }
@@ -860,13 +1104,21 @@ impl App {
             } else {
                 self.arm_tuck();
             }
-            // While a scan runs, coming close names it with a counting pill.
+            // While a scan runs, coming close names it with a counting pill; while focus
+            // runs, "Focus 18 min left".
             if near {
                 crate::disk::on_orb_near(self, true);
+                notices::on_orb_near(self, true);
             } else {
                 crate::disk::on_orb_near(self, false);
+                notices::on_orb_near(self, false);
                 crate::disk::on_orb_gone(self);
+                notices::on_orb_gone(self);
             }
+        }
+        // Away from the computer: the pointer moving means you are back.
+        if self.habits.away {
+            habits::on_input(self);
         }
         if self.dial_open {
             self.aim(dx, -dy);
@@ -881,57 +1133,23 @@ impl App {
         self.dial.place(cx - dx, cy + dy);
     }
 
-    fn dial_items(&self) -> Vec<ui::DialItem> {
-        let (np, nat, _) = pr::next(&self.times, clock::now_minutes(), self.tomorrow_subuh);
-        (0..6)
-            .map(|i| ui::DialItem {
-                icon: DIAL_ICONS[i],
-                name: DIAL_NAMES[i],
-                value: if i == PRAYER {
-                    format!("{} {}", np.name(), pr::hhmm(nat))
-                } else if i == MORE {
-                    crate::disk::dial_value(self).unwrap_or_default()
-                } else {
-                    String::new()
-                },
-            })
-            .collect()
+    /// The open branch's children and its default child (dial_menu.rs, shared with Windows).
+    fn branch_children(&self) -> Vec<ui::DialChild> {
+        self.dial_branch
+            .map(|p| menu::children(self, p).0)
+            .unwrap_or_default()
     }
 
-    /// More's children, as on Windows: Downloads, Disk, History, Notices, Settings, All tasks.
-    /// Disk works on the Mac; the others say they are coming.
-    fn more_children(&self) -> Vec<ui::DialChild> {
-        MORE_KIDS
-            .iter()
-            .enumerate()
-            .map(|(j, (icon, name))| {
-                if j == MORE_DISK {
-                    crate::disk::dial_child(self)
-                } else {
-                    ui::DialChild {
-                        text: String::new(),
-                        icon: Some(*icon),
-                        name: (*name).into(),
-                        value: String::new(),
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn render_dial(&mut self) {
-        let items = self.dial_items();
-        let kids = if self.dial_branch.is_some() {
-            self.more_children()
-        } else {
-            Vec::new()
-        };
+    pub(crate) fn render_dial(&mut self) {
+        let items = menu::items(self);
+        let kids = self.branch_children();
         let branch = self.dial_branch.map(|parent| ui::DialBranch {
             parent,
             children: &kids,
             aimed: self.dial_child,
             reveal: self.branch_reveal.pos,
         });
+        let ring = habits::ring(self);
         let (t, f) = (self.theme, &self.fonts);
         let (aim, rv, mir, kb) = (
             self.dial_aim,
@@ -939,7 +1157,7 @@ impl App {
             self.mirrored(),
             self.dial_keyboard,
         );
-        // Value tags step aside while the branch is out.
+        // Value tags step aside while a branch is out.
         let tags = if self.dial_branch.is_some() { 0.0 } else { 1.0 };
         self.dial.paint(self.scale, |cv| {
             ui::draw_dial(
@@ -952,21 +1170,22 @@ impl App {
                 mir,
                 kb,
                 branch.as_ref(),
-                None,
+                ring,
                 tags,
             );
         });
     }
 
-    fn open_branch(&mut self, aim_default: bool) {
+    /// Fans out `parent`'s children (Focus, Drink or More); `aim_default` aims its default.
+    fn open_branch(&mut self, parent: usize, aim_default: bool) {
         self.branch_at = None;
-        self.dial_aim = Some(MORE);
-        if self.dial_branch != Some(MORE) {
-            self.dial_branch = Some(MORE);
+        self.dial_aim = Some(parent);
+        if self.dial_branch != Some(parent) {
+            self.dial_branch = Some(parent);
             self.branch_reveal = Spring::new(0.0, 190.0, 26.0);
             self.branch_reveal.target = 1.0;
         }
-        self.dial_child = aim_default.then_some(MORE_DISK);
+        self.dial_child = aim_default.then(|| menu::children(self, parent).1);
         self.render_dial();
     }
 
@@ -977,36 +1196,25 @@ impl App {
         self.render_dial();
     }
 
-    fn pick_child(&mut self, j: usize) {
+    /// A branch child does its action at once (dial_menu.rs): start a session, log a glass, or
+    /// open More's child.
+    fn pick_child(&mut self, parent: usize, j: usize) {
         self.close_dial();
-        let name = MORE_KIDS.get(j).map_or("?", |k| k.1);
-        self.log(&format!("dial pick more child {j} ({name})"));
-        if j == MORE_DISK {
-            crate::disk::open(self);
-        } else {
-            self.reply(Pill {
-                icon: Icon::Info,
-                dot: false,
-                title: "Coming to Mac".into(),
-                value: name.into(),
-                action: None,
-                closable: true,
-                ttl_ms: 4000,
-            });
-        }
+        let name = menu::branch_log_name(parent);
+        self.log(&format!("dial pick {name} child {j}"));
+        menu::pick_child(self, parent, j);
     }
-
-    fn open_dial(&mut self, keyboard: bool) {
+    pub(crate) fn open_dial(&mut self, keyboard: bool) {
         if self.dial_open {
             return;
         }
         if self.pill.is_some() {
-            self.dismiss_pill(false);
+            self.dismiss_pill();
         }
         self.close_panel();
         self.set_tucked(false);
         self.tuck_at = None;
-        self.theme = ui::theme(dark_mode());
+        self.theme = crate::settings::theme_now(&self.settings.prefs);
         self.dial_open = true;
         self.dial_keyboard = keyboard;
         self.dial_aim = if keyboard { Some(0) } else { None };
@@ -1039,128 +1247,164 @@ impl App {
         self.arm_tuck();
     }
 
+    /// The pointer aims by direction from the drop (`dy` up); past the main band it aims the
+    /// open branch's children. A steady aim on Focus, Drink or More opens its branch (120 ms).
     fn aim(&mut self, dx: f32, dy: f32) {
-        let a = ui::aim(dx, dy, self.mirrored(), 6);
-        if self.dial_branch.is_some() {
-            // Past the main band the pointer aims a child by direction.
-            let c = ui::aim_child(dx, dy, self.mirrored(), MORE, MORE_KIDS.len());
-            if c.is_some() {
-                if c != self.dial_child || self.dial_keyboard {
-                    self.dial_keyboard = false;
-                    self.dial_child = c;
-                    self.render_dial();
-                }
-                return;
+        let far = (dx * dx + dy * dy).sqrt() >= ui::BRANCH_AIM;
+        let (aim, child) = match self.dial_branch {
+            Some(parent) if far => {
+                let n = menu::children(self, parent).0.len();
+                (
+                    Some(parent),
+                    ui::aim_child(dx, dy, self.mirrored(), parent, n),
+                )
             }
-            if a.is_some() && a != Some(MORE) {
+            _ => (ui::aim(dx, dy, self.mirrored(), menu::N), None),
+        };
+        if aim == self.dial_aim && child == self.dial_child && !self.dial_keyboard {
+            return;
+        }
+        if aim != self.dial_aim {
+            if self.dial_branch.is_some_and(|b| Some(b) != aim) {
                 self.dial_branch = None;
                 self.dial_child = None;
-            } else {
-                if self.dial_child.is_some() {
-                    self.dial_child = None;
-                    self.render_dial();
-                }
-                return;
             }
+            self.branch_at = (aim.is_some_and(has_branch) && self.dial_branch.is_none())
+                .then(|| Instant::now() + Duration::from_millis(120));
         }
-        if a != self.dial_aim || self.dial_keyboard {
-            self.dial_keyboard = false;
-            self.dial_aim = a;
-            // A steady aim on More opens its branch, as on Windows (120 ms).
-            self.branch_at = (a == Some(MORE)).then(|| Instant::now() + Duration::from_millis(120));
-            self.render_dial();
-        }
+        self.dial_aim = aim;
+        self.dial_child = child;
+        self.dial_keyboard = false;
+        self.render_dial();
     }
 
+    /// A main item: More fans out its children; the others close the dial and open their panel
+    /// (dial_menu.rs).
     fn pick(&mut self, i: usize) {
         if i == MORE {
-            // More has no panel: picking it fans out its children.
             self.log("dial pick more");
             let kb = self.dial_keyboard;
-            self.open_branch(kb);
+            self.open_branch(MORE, kb);
             return;
         }
         self.close_dial();
-        self.log(&format!("dial pick {}", DIAL_NAMES[i].to_lowercase()));
-        if i == PRAYER {
-            self.open_panel();
-        } else {
-            self.reply(Pill {
-                icon: Icon::Info,
-                dot: false,
-                title: "Coming to Mac".into(),
-                value: DIAL_NAMES[i].into(),
-                action: None,
-                closable: true,
-                ttl_ms: 4000,
-            });
-        }
+        let name = menu::LOG_NAMES.get(i).copied().unwrap_or("?");
+        self.log(&format!("dial pick {name}"));
+        menu::pick(self, i);
     }
 
     fn on_shortcut(&mut self) {
+        // The first run's "try it" takes the press; the orb stays put.
+        if crate::settings::takes_shortcut(self) {
+            crate::settings::on_shortcut_pressed(self);
+            return;
+        }
         if !self.visible {
             self.set_visible(true);
+            notices::on_user_visibility(self);
             self.open_dial(true);
         } else if self.dial_open {
             self.close_dial();
             self.set_visible(false);
+            notices::on_user_visibility(self);
         } else {
             self.open_dial(true);
         }
     }
 
+    /// Keys, as on Windows: in the dial the arrows go round the ring (or the open branch), the
+    /// arrow toward the screen centre enters a branch and the other steps back out, Return picks
+    /// or opens a branch, 1 to 6 jump; Esc steps back. With a panel open, its unit has the keys.
     fn on_key(&mut self, code: u16, chars: &str) {
         const ESC: u16 = 53;
         const RETURN: u16 = 36;
         const ENTER: u16 = 76;
+        const LEFT: u16 = 123;
+        const RIGHT: u16 = 124;
         const UP: u16 = 126;
         const DOWN: u16 = 125;
-        if self.dial_open && self.dial_branch.is_some() {
-            let n = MORE_KIDS.len();
-            let c = self.dial_child.unwrap_or(MORE_DISK);
-            match code {
-                ESC => self.close_branch(),
-                RETURN | ENTER => self.pick_child(c),
-                UP => {
-                    self.dial_keyboard = true;
-                    self.dial_child = Some((c + n - 1) % n);
-                    self.render_dial();
+        if !self.dial_open {
+            if self.panel_open {
+                if let Some(k) = crate::sys::vk_from_mac(code) {
+                    panels::on_key(self, k);
                 }
-                DOWN => {
-                    self.dial_keyboard = true;
-                    self.dial_child = Some((c + 1) % n);
-                    self.render_dial();
-                }
-                _ => {}
             }
-        } else if self.dial_open {
-            let aim = self.dial_aim.unwrap_or(0);
-            match code {
-                ESC => self.close_dial(),
-                RETURN | ENTER => self.pick(aim),
-                UP => {
-                    self.dial_keyboard = true;
-                    self.dial_aim = Some((aim + 5) % 6);
-                    self.render_dial();
-                }
-                DOWN => {
-                    self.dial_keyboard = true;
-                    self.dial_aim = Some((aim + 1) % 6);
-                    self.render_dial();
-                }
-                _ => {
-                    if let Some(n) = chars.chars().next().and_then(|c| c.to_digit(10)) {
-                        if (1..=6).contains(&n) {
-                            self.pick(n as usize - 1);
-                        }
+            return;
+        }
+        let (inward, outward) = if self.mirrored() {
+            (RIGHT, LEFT)
+        } else {
+            (LEFT, RIGHT)
+        };
+        let aim = self.dial_aim.unwrap_or(0);
+        let digit = chars
+            .chars()
+            .next()
+            .and_then(|c| c.to_digit(10))
+            .filter(|n| (1..=6).contains(n))
+            .map(|n| n as usize - 1);
+        match (code, self.dial_branch, self.dial_child) {
+            (ESC, Some(_), _) => {
+                self.close_branch();
+                self.dial_keyboard = true;
+            }
+            (ESC, None, _) => self.close_dial(),
+            (UP | DOWN, Some(parent), Some(j)) => {
+                let n = menu::children(self, parent).0.len().max(1);
+                self.dial_keyboard = true;
+                self.dial_child = Some(if code == UP {
+                    (j + n - 1) % n
+                } else {
+                    (j + 1) % n
+                });
+                self.render_dial();
+            }
+            (UP | DOWN, _, _) => {
+                self.dial_branch = None;
+                self.dial_child = None;
+                self.branch_at = None;
+                self.dial_keyboard = true;
+                let n = menu::N;
+                self.dial_aim = Some(if code == UP {
+                    (aim + n - 1) % n
+                } else {
+                    (aim + 1) % n
+                });
+                self.render_dial();
+            }
+            (k, _, None) if k == inward && has_branch(aim) => {
+                self.dial_keyboard = true;
+                self.open_branch(aim, true);
+            }
+            (k, Some(_), Some(_)) if k == outward => {
+                self.dial_keyboard = true;
+                self.dial_child = None;
+                self.render_dial();
+            }
+            (RETURN | ENTER, Some(parent), Some(j)) => self.pick_child(parent, j),
+            // With the branch open and the parent aimed, Return opens the parent's panel.
+            (RETURN | ENTER, Some(parent), None) if parent != MORE => self.pick(parent),
+            (RETURN | ENTER, Some(_), None) => {}
+            (RETURN | ENTER, None, _) if has_branch(aim) => {
+                self.dial_keyboard = true;
+                self.open_branch(aim, true);
+            }
+            (RETURN | ENTER, None, _) => self.pick(aim),
+            _ => match (digit, self.dial_branch) {
+                (Some(j), Some(parent)) => {
+                    if j < menu::children(self, parent).0.len() {
+                        self.pick_child(parent, j);
                     }
                 }
-            }
-        } else if self.panel_open && code == ESC {
-            self.close_panel();
+                (Some(i), None) if has_branch(i) => {
+                    self.dial_keyboard = true;
+                    self.open_branch(i, true);
+                }
+                (Some(i), None) => self.pick(i),
+                _ => {}
+            },
         }
     }
-
     // ---- pills and the notice queue ----
 
     fn place_pill(&mut self) {
@@ -1174,7 +1418,7 @@ impl App {
         self.pill_win.place(x, top - INSET + ui::PILL_PAD);
     }
 
-    fn render_pill(&mut self) {
+    pub(crate) fn render_pill(&mut self) {
         let Some(p) = self.pill.clone() else { return };
         let (t, f, l) = (self.theme, &self.fonts, self.pill_layout);
         let (rv, grow_left, hover) = (
@@ -1198,8 +1442,10 @@ impl App {
         });
     }
 
-    pub(crate) fn show_pill(&mut self, p: Pill, queued: bool) {
-        self.theme = ui::theme(dark_mode());
+    /// Shows a pill from the drop, or new words in the pill on screen (the reveal carries on).
+    /// Only notices.rs (through `crate::pill`) calls this: every pill goes through the queue.
+    pub(crate) fn show_pill(&mut self, p: Pill) {
+        self.theme = crate::settings::theme_now(&self.settings.prefs);
         self.pill_layout = ui::layout_pill(&self.fonts, &p);
         self.pill_win.resize(
             self.pill_layout.w + 2.0 * ui::PILL_PAD,
@@ -1210,7 +1456,6 @@ impl App {
             (p.ttl_ms < STICKY_MS).then(|| Instant::now() + Duration::from_millis(p.ttl_ms as u64));
         self.log(&format!("pill \"{}\" {}", p.title, p.value));
         self.pill = Some(p);
-        self.pill_queued = queued;
         self.pill_closing = false;
         self.pill_hover = PillPart::None;
         if fresh {
@@ -1228,11 +1473,12 @@ impl App {
 
     /// An answer to something you just did: shows at once, never waits in the queue.
     pub(crate) fn reply(&mut self, p: Pill) {
-        self.queue.reply(self.now());
-        self.show_pill(p, false);
+        notices::reply(self, p);
     }
 
-    pub(crate) fn dismiss_pill(&mut self, by_you: bool) {
+    /// The pill starts to leave; the notice queue hears of it (`notices::on_dismiss`), and once
+    /// it has gone (`tick`) the next one may come (`notices::on_pill_gone`).
+    pub(crate) fn dismiss_pill(&mut self) {
         if self.pill.is_none() || self.pill_closing {
             return;
         }
@@ -1241,70 +1487,84 @@ impl App {
         self.pill_reveal.k = 480.0;
         self.pill_reveal.c = 40.0;
         self.pill_reveal.target = 0.0;
-        if self.pill_queued {
-            if by_you {
-                self.queue.close_front_by_you();
-            } else {
-                self.queue.close_front(false);
-            }
-            self.pill_queued = false;
-        }
+        notices::on_dismiss(self);
     }
 
-    /// A pill's action button.
+    /// A pill's action button, as Windows' pill.rs (the actions whose unit is on the Mac).
     fn pill_action(&mut self, a: ui::PillAction) {
         use ui::PillAction as A;
         match a {
-            A::FindBigFolders(d) => crate::disk::find_big_folders(self, d),
-            A::OpenDisk => crate::disk::open(self),
-            A::UndoRecycle => crate::disk::undo(self),
-            A::RetryScan => crate::disk::retry_scan(self),
-            _ => self.log("pill action not on the Mac yet"),
+            A::AddDrink(ml) => {
+                let p = habits::log_drink(self, ml);
+                notices::reply(self, p);
+            }
+            A::UndoDrink => {
+                habits::undo_drink(self);
+                self.dismiss_pill();
+            }
+            A::UndoFocus => habits::undo_focus(self),
+            A::ResumeFocus => {
+                habits::resume(self);
+                self.dismiss_pill();
+            }
+            A::StartFocus => {
+                let m = self.habits.prefs.length_min;
+                habits::start_focus(self, m);
+                self.dismiss_pill();
+            }
+            A::ShowWaited => {
+                self.dismiss_pill();
+                notices::open_panel(self);
+            }
+            A::FindBigFolders(d) => {
+                self.dismiss_pill();
+                crate::disk::find_big_folders(self, d);
+            }
+            A::OpenDisk => {
+                self.dismiss_pill();
+                crate::disk::open(self);
+            }
+            A::UndoRecycle => {
+                self.dismiss_pill();
+                crate::disk::undo(self);
+            }
+            A::RetryScan => {
+                self.dismiss_pill();
+                crate::disk::retry_scan(self);
+            }
+            A::TaskDone(id) => crate::tasks::done_from_pill(self, &id),
+            A::Join(url) => {
+                self.dismiss_pill();
+                crate::calendar::join(self, &url);
+            }
+            A::OpenTasks => {
+                self.dismiss_pill();
+                crate::tasks::open(self, Some(crate::tasks_model::Selection::Today));
+            }
+            A::OpenSettings => {
+                self.dismiss_pill();
+                crate::settings::open(self, crate::settings_model::Section::General);
+            }
+            A::UndoShortcut => crate::settings::undo_shortcut(self),
+            other => {
+                self.dismiss_pill();
+                self.log(&format!("pill action {other:?} is not on the Mac yet"));
+            }
         }
     }
-
-    pub(crate) fn post(&mut self, n: Notice) {
-        let busy = self.pill.is_some() && !self.pill_closing;
-        let title = n.pill.title.clone();
-        let out = self
-            .queue
-            .offer(n, self.now(), clock::unix_now(), self.quiet(), busy);
-        match &out {
-            Offered::Show(p) => self.show_pill(p.clone(), true),
-            Offered::Update(p) => self.show_pill(p.clone(), true),
-            _ => {}
-        }
-        self.log(&format!("notice \"{title}\" {out:?}"));
-        self.countdown_at = self.countdown_deadline();
-    }
-
-    /// The slot is free: the next waiting pill, or when to ask again.
-    fn after_pill(&mut self) {
-        self.queue_wait = None;
-        match self.queue.next(self.now(), clock::unix_now(), self.quiet()) {
-            Next::Show(p, _) => self.show_pill(p, true),
-            Next::Wait(ms) => self.queue_wait = Some(Instant::now() + Duration::from_millis(ms)),
-            Next::Idle => {}
-        }
-        self.countdown_at = self.countdown_deadline();
-    }
-
-    fn countdown_deadline(&self) -> Option<Instant> {
-        self.queue
-            .countdown_wait(clock::now())
-            .map(|d| Instant::now() + d)
-    }
-
     // ---- prayer ----
 
-    fn refresh_day(&mut self) {
+    pub(crate) fn refresh_day(&mut self) {
         let d = clock::today();
         if d != self.day {
             self.day = d;
-            (self.times, self.tomorrow_subuh) = compute_times(&self.prefs, d);
+            self.times_day = d;
+            let prefs = &self.settings.prefs;
+            (self.times, self.tomorrow_subuh) =
+                crate::prayer::compute_times(prefs, prefs.place.coords(), d);
             self.log(&format!(
                 "times {}: Subuh {} Dzuhur {} Ashar {} Maghrib {} Isya {}",
-                self.prefs.place.short(),
+                self.settings.prefs.place.short(),
                 pr::hhmm(self.times.subuh),
                 pr::hhmm(self.times.dzuhur),
                 pr::hhmm(self.times.ashar),
@@ -1317,20 +1577,28 @@ impl App {
         self.orb_dirty = true;
     }
 
-    fn schedule_reminders(&mut self) {
+    /// The place, method or adjustments changed: today's times again, and the drop's sun now.
+    pub(crate) fn recompute_times(&mut self) {
+        self.day = (0, 0, 0);
+        self.refresh_day();
+        self.render_orb();
+    }
+
+    pub(crate) fn schedule_reminders(&mut self) {
         let now = clock::now_minutes();
-        self.next_reminder = reminder_events(&self.prefs, &self.times, self.tomorrow_subuh)
-            .into_iter()
-            .find(|e| e.0 > now + 1.0 / 60.0)
-            .map(|(at, p, off)| {
-                let secs = ((at - now) * 60.0).max(0.5);
-                self.log(&format!(
-                    "next reminder: {} {off:+} min, in {:.1} min",
-                    p.name(),
-                    at - now
-                ));
-                (Instant::now() + Duration::from_secs_f64(secs), p, off)
-            });
+        self.next_reminder =
+            reminder_events(&self.settings.prefs, &self.times, self.tomorrow_subuh)
+                .into_iter()
+                .find(|e| e.0 > now + 1.0 / 60.0)
+                .map(|(at, p, off)| {
+                    let secs = ((at - now) * 60.0).max(0.5);
+                    self.log(&format!(
+                        "next reminder: {} {off:+} min, in {:.1} min",
+                        p.name(),
+                        at - now
+                    ));
+                    (Instant::now() + Duration::from_secs_f64(secs), p, off)
+                });
     }
 
     fn prayer_moment(&self, p: Prayer) -> app_habits::Moment {
@@ -1351,6 +1619,8 @@ impl App {
             .unwrap_or_else(clock::now)
     }
 
+    /// As Windows' prayer.rs: −30 and −10 are normal notices (−10 stays, counting down), the
+    /// time itself is urgent and pauses a running focus session for the prayer.
     fn fire_reminder(&mut self, p: Prayer, off: i32) {
         let at = pr::hhmm(self.times.of(p));
         if off < 0 {
@@ -1364,27 +1634,12 @@ impl App {
                 closable: true,
                 ttl_ms: if sticky { STICKY_MS } else { 6000 },
             };
-            let n = Notice::new(Source::Prayer, Priority::Normal, pill).before_prayer(
-                p.name(),
-                self.prayer_moment(p),
-                clock::now(),
-            );
-            self.post(if sticky {
-                n.sticky().counting_down()
-            } else {
-                n
-            });
-        } else {
-            self.queue.drop_prayer(p.name());
-            if self.pill_queued
-                && self
-                    .pill
-                    .as_ref()
-                    .is_some_and(|x| x.title.contains(p.name()))
-            {
-                self.pill_queued = false;
-                self.dismiss_pill(false);
+            if !notices::hidden_by_you(self) {
+                let due = self.prayer_moment(p);
+                notices::post(self, notices::prayer_before(p.name(), due, pill, sticky));
             }
+        } else {
+            notices::drop_prayer(self, p.name());
             let pill = Pill {
                 icon: Icon::Bell,
                 dot: true,
@@ -1394,115 +1649,85 @@ impl App {
                 closable: true,
                 ttl_ms: 10_000,
             };
-            self.post(Notice::new(Source::Prayer, Priority::Urgent, pill));
+            notices::post(self, notices::urgent(Source::Prayer, pill));
+            // Settings' At the time: Bunyi is the system's short sound (an adzan chosen on
+            // Windows plays as Bunyi here); never in full screen or while presenting.
+            let sound = crate::settings_model::os::shown_sound(self.settings.prefs.at_time_sound);
+            if sound != crate::settings_model::AtTimeSound::Silent && !notices::silent(self) {
+                crate::sys::play_notify_sound();
+            }
+            self.set_tucked(false);
+            habits::on_prayer_time(self, p.name());
         }
         self.log(&format!("reminder {} {off:+}", p.name()));
     }
 
-    fn panel_view_data(&self) -> (Prayer, f64, String, String) {
-        let (np, _, mins) = pr::next(&self.times, clock::now_minutes(), self.tomorrow_subuh);
-        let (lat, lng) = self.prefs.place.coords();
-        let b = qibla::bearing(lat, lng);
-        (
-            np,
-            mins,
-            self.prefs.place.short(),
-            format!("{:.0}° {}", b, qibla::compass(b)),
-        )
-    }
-
-    fn render_panel(&mut self) {
-        let (next, mins_left, place, qibla) = self.panel_view_data();
-        let view = panel::View {
-            times: &self.times,
-            now_min: clock::now_minutes(),
-            next,
-            mins_left,
-            place: &place,
-            method: self.prefs.prayer_method.short(),
-            qibla,
-            reminders: self.prefs.prayer_reminders,
-            hover: self.panel_hover,
-        };
-        let (t, f) = (self.theme, &self.fonts);
-        self.panel_win
-            .paint(self.scale, |cv| panel::draw(cv, &t, f, &view));
-    }
-
-    fn place_panel(&mut self) {
+    /// The panel window beside the drop, centred on it vertically, for its current height.
+    pub(crate) fn place_panel(&mut self) {
         let (cx, cy) = self.center();
         let (vf, _) = self.screen();
         let gap = 12.0;
+        let (w, h) = (self.panel_win.w, self.panel_win.h);
         let x = if self.side == Side::Right {
-            cx - ORB / 2.0 - gap - panel::W
+            cx - ORB / 2.0 - gap - w
         } else {
             cx + ORB / 2.0 + gap
         };
-        let lo = vf.origin.y as f32 + panel::H + 8.0;
+        let lo = vf.origin.y as f32 + h + 8.0;
         let hi = (vf.origin.y + vf.size.height) as f32 - 8.0;
-        let top = (cy + panel::H / 2.0).clamp(lo, hi.max(lo));
+        let top = (cy + h / 2.0).clamp(lo, hi.max(lo));
         self.panel_win.place(x, top);
     }
 
-    fn open_panel(&mut self) {
-        self.close_dial();
-        self.set_tucked(false);
-        self.tuck_at = None;
-        self.theme = ui::theme(dark_mode());
-        self.refresh_day();
-        self.panel_open = true;
-        self.panel_hover = None;
-        self.place_panel();
-        self.render_panel();
-        self.panel_win.show();
-        self.panel_win.panel.makeKeyAndOrderFront(None);
-        self.log("panel prayer");
-    }
-
     pub(crate) fn close_panel(&mut self) {
-        if !self.panel_open {
-            return;
-        }
-        self.panel_open = false;
-        self.panel_win.hide();
-        self.arm_tuck();
+        panels::close_panel(self);
     }
 
-    fn panel_click(&mut self, hit: panel::Hit) {
-        match hit {
-            panel::Hit::Chip(i) => {
-                self.prefs.prayer_reminders[i] = !self.prefs.prayer_reminders[i];
-                let dir = clock::data_dir();
-                let mut map = read_settings(&dir);
-                map.insert(
-                    "prayer_reminders".into(),
-                    serde_json::to_value(self.prefs.prayer_reminders).unwrap_or_default(),
-                );
-                if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::Value::Object(map)) {
-                    let path = dir.join("settings.json");
-                    let tmp = path.with_extension("json.tmp");
-                    if std::fs::write(&tmp, bytes).is_ok() {
-                        let _ = std::fs::rename(&tmp, &path);
-                    }
-                }
-                self.schedule_reminders();
-                self.render_panel();
+    /// The Tasks panel types: Orby activates (remembering the app in front, as Windows'
+    /// `panel_prev_fg`), the panel window becomes key and its input view first responder.
+    /// Returns whether the window is key.
+    pub(crate) fn take_panel_keys(&mut self) -> bool {
+        let mtm = MainThreadMarker::new().expect("main thread");
+        let me = objc2_app_kit::NSRunningApplication::currentApplication();
+        if let Some(front) = NSWorkspace::sharedWorkspace().frontmostApplication() {
+            if front.processIdentifier() != me.processIdentifier() {
+                self.panel_prev_app = Some(front);
             }
-            panel::Hit::Button(i) => {
-                let what = ["Reminder settings", "Place", "Qibla"][i.min(2)];
-                self.reply(Pill {
-                    icon: Icon::Info,
-                    dot: false,
-                    title: "Coming to Mac".into(),
-                    value: what.into(),
-                    action: None,
-                    closable: true,
-                    ttl_ms: 4000,
-                });
+        }
+        NSApplication::sharedApplication(mtm).activate();
+        let key = self.panel_win.make_key();
+        self.panel_win.set_responder(Some(&self.panel_input));
+        self.place_caret();
+        key
+    }
+
+    /// The input view lets go of the keyboard (a composition is dropped); if Orby still has it
+    /// in front, the app that was in front before gets it back.
+    pub(crate) fn release_panel_keys(&mut self) {
+        self.panel_input.discard_marked();
+        self.panel_win.set_responder(None);
+        let mtm = MainThreadMarker::new().expect("main thread");
+        let ours = NSApplication::sharedApplication(mtm).isActive()
+            && self.panel_win.is_key()
+            && !self.tasks.win.open
+            && !self.disk.win.open;
+        if let Some(prev) = self.panel_prev_app.take() {
+            if ours {
+                prev.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty());
             }
         }
     }
 
+    /// Where an input method's candidate window opens: under the quick add field (its line in
+    /// tasks_panel.rs, 288 px in and 118 px down from the panel's corner).
+    pub(crate) fn place_caret(&self) {
+        let f = self.panel_win.frame();
+        let top = f.origin.y + f.size.height;
+        super::input::set_caret_rect(NSRect::new(
+            NSPoint::new(f.origin.x + 288.0, top - 112.0),
+            NSSize::new(1.0, 18.0),
+        ));
+    }
     // ---- input ----
 
     fn on_mouse(&mut self, kind: Kind, ev: Ev, x: f32, y: f32, global: NSPoint) {
@@ -1510,9 +1735,9 @@ impl App {
             Kind::Orb => self.on_orb_mouse(ev, global),
             Kind::Dial => match ev {
                 Ev::Move | Ev::Drag => self.on_pointer(global),
-                Ev::Up => match (self.dial_child, self.dial_aim) {
-                    (Some(j), _) if self.dial_branch.is_some() => self.pick_child(j),
-                    (_, Some(i)) => self.pick(i),
+                Ev::Up => match (self.dial_branch, self.dial_child, self.dial_aim) {
+                    (Some(parent), Some(j), _) => self.pick_child(parent, j),
+                    (_, _, Some(i)) => self.pick(i),
                     _ => self.close_dial(),
                 },
                 _ => {}
@@ -1531,20 +1756,27 @@ impl App {
                         self.pill_hover = PillPart::None;
                         self.render_pill();
                     }
+                    // A closing pill still shows for a moment; its action was already taken.
+                    Ev::Up if self.pill_closing => {}
                     Ev::Up => match part {
-                        PillPart::Close => self.dismiss_pill(true),
+                        PillPart::Close => {
+                            // Your X: a pill that stays until closed is done with.
+                            notices::closed_by_you(self);
+                            self.dismiss_pill();
+                        }
                         PillPart::Action => {
-                            let action = self.pill.as_ref().and_then(|p| p.action.clone());
-                            self.dismiss_pill(true);
-                            if let Some((_, a)) = action {
+                            if let Some((_, a)) = self.pill.as_ref().and_then(|p| p.action.clone())
+                            {
+                                notices::acted(self);
                                 self.pill_action(a);
                             }
                         }
                         PillPart::Body => {
                             let prayer = self.pill.as_ref().is_some_and(|p| p.icon == Icon::Bell);
-                            self.dismiss_pill(true);
+                            notices::closed_by_you(self);
+                            self.dismiss_pill();
                             if prayer {
-                                self.open_panel();
+                                crate::prayer::open_panel(self);
                             }
                         }
                         _ => {}
@@ -1552,24 +1784,7 @@ impl App {
                     _ => {}
                 }
             }
-            Kind::Panel => {
-                let hit = panel::hit(&self.fonts, x, y);
-                match ev {
-                    Ev::Move | Ev::Exit => {
-                        let hit = if ev == Ev::Exit { None } else { hit };
-                        if hit != self.panel_hover {
-                            self.panel_hover = hit;
-                            self.render_panel();
-                        }
-                    }
-                    Ev::Up => {
-                        if let Some(h) = hit {
-                            self.panel_click(h);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            Kind::Panel => panels::on_mouse(self, ev, x, y),
         }
     }
 
@@ -1625,7 +1840,7 @@ impl App {
                 }
             }
             Ev::Move => self.on_pointer(g),
-            Ev::Exit => {}
+            Ev::Exit | Ev::RightUp => {}
         }
     }
 
@@ -1634,6 +1849,8 @@ impl App {
             self.close_dial();
         }
         if self.panel_open {
+            // A click in another app gives that app the keyboard: nothing to hand back.
+            self.panel_prev_app = None;
             self.close_panel();
         }
     }
@@ -1660,9 +1877,19 @@ impl App {
             "close" => {
                 self.close_dial();
                 self.close_panel();
-                self.dismiss_pill(false);
+                self.dismiss_pill();
             }
-            "panel" => self.open_panel(),
+            "panel" => crate::prayer::open_panel(self),
+            "focus" => panels::open_panel(self, panels::Kind::Focus),
+            "drink" => panels::open_panel(self, panels::Kind::Drink),
+            "history" => history::open(self, None),
+            "notices" => notices::open_panel(self),
+            "drink-undo" => habits::undo_drink(self),
+            "focus-stop" => habits::stop(self),
+            "state" => {
+                let line = self.state_line();
+                self.log(&format!("state: {line}"));
+            }
             "shortcut" => self.on_shortcut(),
             "tuck" => self.set_tucked(true),
             "untuck" => self.set_tucked(false),
@@ -1675,9 +1902,11 @@ impl App {
             }
             "disk" => crate::disk::open(self),
             "more-pick" => {
-                if self.dial_branch.is_some() {
-                    let j = self.dial_child.unwrap_or(MORE_DISK);
-                    self.pick_child(j);
+                if let Some(parent) = self.dial_branch {
+                    let j = self
+                        .dial_child
+                        .unwrap_or_else(|| menu::children(self, parent).1);
+                    self.pick_child(parent, j);
                 }
             }
             "disk-close" => super::disk_win::close(self),
@@ -1691,6 +1920,63 @@ impl App {
                 "start at login: {}",
                 if super::login::enabled() { "on" } else { "off" }
             )),
+            "settings" => crate::settings::open(self, crate::settings_model::Section::General),
+            "settings-close" => crate::settings::close(self),
+            "settings-state" => {
+                let line = crate::settings::state_line(self);
+                let login = if super::login::enabled() {
+                    "on"
+                } else if super::login::needs_approval() {
+                    "waiting for approval"
+                } else {
+                    "off"
+                };
+                self.log(&format!("settings state: {line}, login item {login}"));
+            }
+            "first-run" => crate::settings::open_first_run(self),
+            "first-run-skip" => crate::settings::skip_first_run(self),
+            _ if cmd.starts_with("settings:") => {
+                let name = &cmd["settings:".len()..];
+                match crate::settings_model::Section::ALL
+                    .iter()
+                    .find(|s| s.name().eq_ignore_ascii_case(name))
+                {
+                    Some(s) => crate::settings::go_to(self, *s),
+                    None => self.log(&format!("settings: no section {name}")),
+                }
+            }
+            _ if cmd.starts_with("settings-click:") => {
+                let xy: Vec<f32> = cmd["settings-click:".len()..]
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                if let [x, y] = xy[..] {
+                    crate::settings::click_at(self, x, y);
+                }
+            }
+            _ if cmd.starts_with("settings-type:") => {
+                crate::settings::on_text(self, &cmd["settings-type:".len()..]);
+            }
+            _ if cmd.starts_with("settings-key:") => {
+                // A Windows virtual key (0x.. or decimal), pressed and let go; ",down" or ",up"
+                // for one half (a modifier held while the shortcut is chosen).
+                let arg = &cmd["settings-key:".len()..];
+                let (num, half) = arg.split_once(',').unwrap_or((arg, ""));
+                let k = num
+                    .strip_prefix("0x")
+                    .map_or_else(|| num.parse().ok(), |h| u16::from_str_radix(h, 16).ok());
+                if let Some(k) = k {
+                    if half != "up" {
+                        crate::settings::on_key(self, k, true, false);
+                    }
+                    if half != "down" {
+                        crate::settings::on_key(self, k, false, false);
+                    }
+                }
+            }
+            _ if cmd.starts_with("settings-shot:") => {
+                super::settings_win::shot(self, &cmd["settings-shot:".len()..]);
+            }
             "windows" => {
                 for (name, w) in [
                     ("orb", &self.orb),
@@ -1711,14 +1997,42 @@ impl App {
                     ));
                 }
             }
+            _ if cmd.starts_with("orb-shot:") => {
+                // The drop as the shader draws it now (ring included), at 2x, then the badge.
+                let path = std::path::PathBuf::from(&cmd["orb-shot:".len()..]);
+                let mut p = self.orb_params();
+                let k = 2.0;
+                let size = (WIN * k).round();
+                let drop = ORB * k;
+                p.orb_origin = [(size - drop) / 2.0, (size - drop) / 2.0];
+                p.orb_size = drop;
+                p.ring_radius = 30.0 * k;
+                p.px1 = k;
+                let px = self.gpu.as_ref().and_then(|g| g.render(size as usize, &p));
+                match (px, path.parent(), path.file_stem()) {
+                    (Some(px), Some(dir), Some(stem)) => {
+                        crate::snapshot::write(
+                            dir,
+                            &stem.to_string_lossy(),
+                            size as u32,
+                            size as u32,
+                            px,
+                        );
+                        self.log(&format!(
+                            "orb-shot: ring mode {} progress {:.3}, badge \"{}\" -> {}",
+                            p.ring_mode,
+                            p.ring_progress,
+                            self.badge_shown,
+                            path.display()
+                        ));
+                    }
+                    _ => self.log("orb-shot: no Metal"),
+                }
+            }
             _ if cmd.starts_with("dial-shot:") => {
                 let path = cmd["dial-shot:".len()..].to_string();
-                let items = self.dial_items();
-                let kids = if self.dial_branch.is_some() {
-                    self.more_children()
-                } else {
-                    Vec::new()
-                };
+                let items = menu::items(self);
+                let kids = self.branch_children();
                 let branch = self.dial_branch.map(|parent| ui::DialBranch {
                     parent,
                     children: &kids,
@@ -1737,7 +2051,7 @@ impl App {
                     self.mirrored(),
                     self.dial_keyboard,
                     branch.as_ref(),
-                    None,
+                    habits::ring(self),
                     tags,
                 );
                 let p = std::path::Path::new(&path);
@@ -1751,6 +2065,18 @@ impl App {
                     );
                 }
             }
+            _ if cmd.starts_with("panel-shot:") => {
+                panels::shot(self, &cmd["panel-shot:".len()..]);
+            }
+            _ if cmd.starts_with("drink-log:") => {
+                let ml = cmd["drink-log:".len()..].parse().unwrap_or(250);
+                let p = habits::log_drink(self, ml);
+                notices::reply(self, p);
+            }
+            _ if cmd.starts_with("focus-start:") => {
+                let m = cmd["focus-start:".len()..].parse().unwrap_or(25);
+                habits::start_focus(self, m);
+            }
             _ if cmd.starts_with("disk-shot:") => {
                 super::disk_win::shot(self, &cmd["disk-shot:".len()..]);
             }
@@ -1763,6 +2089,7 @@ impl App {
                 self.log(&format!("resources: resident {rss:.1} MB"));
             }
             _ if cmd.starts_with("disk-") => crate::disk::test_command(self, cmd),
+            _ if self.tasks_test_command(cmd) => {}
             _ => {
                 if let Some(off) = cmd
                     .strip_prefix("remind")
@@ -1776,6 +2103,176 @@ impl App {
         }
     }
 
+    /// The test channel's Tasks and Today commands (one log line each). Rows are counted as the
+    /// Tasks window lists them (headers included) while it is open, else as the panel does.
+    /// Returns whether `cmd` was one of them.
+    fn tasks_test_command(&mut self, cmd: &str) -> bool {
+        use super::input::{Input, Mods};
+        use crate::{calendar, tasks, tasks_panel, tasks_window, tasks_window_panel};
+        let arg = |p: &str| cmd.strip_prefix(p).map(str::to_string);
+        let index = |p: &str| arg(p).and_then(|s| s.trim().parse::<usize>().ok());
+        let win = self.tasks.win.open;
+        match cmd {
+            "tasks" => tasks::open(self, None),
+            "today" => calendar::open(self),
+            "tasks-window" => tasks_window::show(self),
+            "tasks-window-close" => tasks_window::close(self),
+            "task-undo" if win => tasks_window::undo(self),
+            "task-undo" => {
+                self.log("task-undo: the panel has no Undo (as on Windows); open the Tasks window")
+            }
+            "tasks-state" => {
+                let line = self.tasks_state_line();
+                self.log(&format!("tasks state: {line}"));
+            }
+            "today-state" => {
+                let line = calendar::state_line(self);
+                self.log(&format!("today state: {line}"));
+            }
+            _ if cmd.starts_with("task-add:") => {
+                let text = arg("task-add:").unwrap_or_default();
+                let panel_types = self.panel_open && self.panel_kind == panels::Kind::Tasks;
+                if !super::tasks_win::has_keyboard(self) && !panel_types {
+                    tasks::open(self, None);
+                }
+                // One character at a time, as the input view delivers typing; then Return.
+                for c in text.chars() {
+                    self.on_input(Input::Text(c.to_string()));
+                }
+                self.on_input(Input::Key {
+                    vk: crate::sys::vk::VK_RETURN,
+                    mods: Mods::default(),
+                });
+                self.log(&format!(
+                    "task-add: \"{text}\" -> {} tasks",
+                    self.tasks.snap.tasks.len()
+                ));
+            }
+            _ if cmd.starts_with("task-check:") || cmd.starts_with("task-delete:") => {
+                let check = cmd.starts_with("task-check:");
+                let Some(i) = index(if check { "task-check:" } else { "task-delete:" }) else {
+                    self.log("task-check/delete: give a row number");
+                    return true;
+                };
+                if win {
+                    let h = if check {
+                        tasks_window_panel::Hit::Check(i)
+                    } else {
+                        tasks_window_panel::Hit::Delete(i)
+                    };
+                    let title = tasks_window::task_at(self, i).map(|t| t.title);
+                    tasks_window::click(self, Some(h));
+                    self.log(&format!("{cmd}: window row {i} {title:?}"));
+                } else {
+                    let h = if check {
+                        tasks_panel::Hit::Check(i)
+                    } else {
+                        tasks_panel::Hit::Delete(i)
+                    };
+                    tasks::click(self, h);
+                    self.log(&format!("{cmd}: panel row {i}"));
+                }
+            }
+            _ if cmd.starts_with("type:") => {
+                let text = arg("type:").unwrap_or_default();
+                for c in text.chars() {
+                    self.on_input(Input::Text(c.to_string()));
+                }
+                self.log(&format!("type: {} characters", text.chars().count()));
+            }
+            _ if cmd.starts_with("key:") => {
+                let s = arg("key:").unwrap_or_default();
+                let s = s.trim();
+                let vk = match s.strip_prefix("0x") {
+                    Some(h) => u16::from_str_radix(h, 16).ok(),
+                    None => s.parse().ok(),
+                };
+                match vk {
+                    Some(vk) => {
+                        self.on_input(Input::Key {
+                            vk,
+                            mods: Mods::default(),
+                        });
+                        self.log(&format!("key: {vk:#04x}"));
+                    }
+                    None => self.log("key: give a virtual-key number (13 or 0x0d)"),
+                }
+            }
+            _ if cmd.starts_with("tasks-shot:") => {
+                super::tasks_win::shot(self, &cmd["tasks-shot:".len()..]);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `tasks-state`: the store, the overdue count, the panel's field and first rows, the window.
+    fn tasks_state_line(&self) -> String {
+        use crate::tasks_panel::RowView;
+        let v = crate::tasks::view(self);
+        let rows: Vec<String> = v
+            .rows
+            .iter()
+            .take(8)
+            .map(|r| match r {
+                RowView::Task { title, done, .. } => {
+                    format!("{title}{}", if *done { " (done)" } else { "" })
+                }
+                RowView::Prayer { name, time } => format!("[{name} {time}]"),
+            })
+            .collect();
+        format!(
+            "{} tasks, {} open, {} overdue, store {}, panel {} \"{}\" field \"{}\" focused {}, rows: {}; {}",
+            self.tasks.snap.tasks.len(),
+            self.tasks.snap.tasks.values().filter(|t| !t.done).count(),
+            self.tasks.overdue,
+            crate::sys::data_dir().join("app.db").display(),
+            if self.panel_open && self.panel_kind == panels::Kind::Tasks { "open" } else { "closed" },
+            v.title,
+            self.tasks.field.text(),
+            self.tasks.focused,
+            rows.join(" | "),
+            crate::tasks_window::state_line(self),
+        )
+    }
+
+    /// One line for the test channel's `state`: the panel, drink, focus and the queue.
+    fn state_line(&self) -> String {
+        let kind = if self.panel_open {
+            format!("{:?}", self.panel_kind)
+        } else {
+            "none".into()
+        };
+        let (w, h) = (self.panel_win.w, self.panel_win.h);
+        let phase = match self.habits.focus.phase() {
+            app_habits::focus::Phase::Idle => "idle".to_string(),
+            p => format!("{p:?} ({})", habits::dial_focus_value(self)),
+        };
+        let timers: Vec<String> = self.timers.keys().map(|t| format!("{t:?}")).collect();
+        format!(
+            "panel {kind} {w:.0}x{h:.0}, drink {} ml, focus {phase}, notices {} waiting (badge {}), pill {}, timers [{}], away {}",
+            habits::drink_total(self),
+            self.notices.q.waiting(),
+            notices::badge_count(self),
+            self.pill.as_ref().map_or("none".into(), |p| format!("\"{}\"", p.title)),
+            timers.join(" "),
+            self.habits.away,
+        )
+    }
+
+    /// A shared unit's timer fired (`sys::Timer`, mac/sys.rs).
+    fn fire_timer(&mut self, t: Timer) {
+        match t {
+            Timer::Focus => habits::on_focus_timer(self),
+            Timer::Drink => habits::on_drink_timer(self),
+            Timer::Notices => notices::on_timer(self),
+            Timer::Panel => panels::on_timer(self),
+            Timer::Tasks => crate::tasks::on_timer(self),
+            Timer::CalCue => crate::calendar::on_cue_timer(self),
+            Timer::CalRead => crate::calendar::on_read_timer(self),
+        }
+    }
+
     // ---- the frame loop ----
 
     fn animating(&self) -> bool {
@@ -1783,9 +2280,22 @@ impl App {
             || !self.opacity.settled(0.002)
             || (self.dial.shown && !self.dial_reveal.settled(0.002))
             || (self.pill_win.shown && !self.pill_reveal.settled(0.002))
-            || (self.panel_open && crate::motion::active())
+            || panels::animating(self)
             || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002))
             || (self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty))
+            || super::tasks_win::animating(self)
+    }
+
+    /// The only thing moving is a rolling number in the open panel.
+    fn only_panel_rolls(&self) -> bool {
+        let other = !self.x.settled(0.3)
+            || !self.opacity.settled(0.002)
+            || (self.dial.shown && !self.dial_reveal.settled(0.002))
+            || (self.pill_win.shown && !self.pill_reveal.settled(0.002))
+            || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002))
+            || (self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty))
+            || super::tasks_win::animating(self);
+        !other && panels::only_rolling(self)
     }
 
     fn tick(&mut self) {
@@ -1807,7 +2317,7 @@ impl App {
             if self.pill_hover != PillPart::None {
                 self.pill_until = Some(now + Duration::from_secs(2));
             } else {
-                self.dismiss_pill(false);
+                self.dismiss_pill();
             }
         }
         if let Some((at, p, off)) = self.next_reminder {
@@ -1817,24 +2327,37 @@ impl App {
                 self.schedule_reminders();
             }
         }
-        if self.countdown_at.is_some_and(|t| now >= t) {
-            if let Some(p) = self.queue.countdown_tick(clock::now()) {
-                if self.pill_queued {
-                    self.show_pill(p, true);
+        // The shared units' timers, oldest first; each repeats (SetTimer) unless its handler
+        // disarms or re-arms it. A handler may change the others, so each is checked again.
+        let mut due: Vec<(Instant, Timer)> = self
+            .timers
+            .iter()
+            .filter(|(_, (at, _))| now >= *at)
+            .map(|(t, (at, _))| (*at, *t))
+            .collect();
+        due.sort_by_key(|d| d.0);
+        for (_, t) in due {
+            match self.timers.get(&t).copied() {
+                Some((at, every)) if now >= at => {
+                    self.timers.insert(t, (now + every, every));
+                    self.fire_timer(t);
                 }
+                _ => {}
             }
-            self.countdown_at = self.countdown_deadline();
         }
-        if self.queue_wait.is_some_and(|t| now >= t) && self.pill.is_none() {
-            self.after_pill();
+        if self.away_check_at.is_some_and(|t| now >= t) {
+            super::sys::on_away_check(self);
         }
         if now >= self.sun_at {
             self.refresh_day();
         }
         if self.branch_at.is_some_and(|t| now >= t) {
             self.branch_at = None;
-            if self.dial_open && self.dial_aim == Some(MORE) && self.dial_branch.is_none() {
-                self.open_branch(false);
+            if let Some(i) = self
+                .dial_aim
+                .filter(|i| self.dial_open && has_branch(*i) && self.dial_branch.is_none())
+            {
+                self.open_branch(i, false);
             }
         }
         if self.disk_check_at.is_some_and(|t| now >= t) {
@@ -1872,14 +2395,12 @@ impl App {
                 self.pill = None;
                 self.pill_closing = false;
                 self.arm_tuck();
-                self.after_pill();
+                notices::on_pill_gone(self);
             } else if !self.pill_reveal.settled(0.002) {
                 self.render_pill();
             }
         }
-        if self.panel_open {
-            self.render_panel();
-        }
+        panels::tick(self);
         if self.dial_branch.is_some() && !self.branch_reveal.settled(0.002) {
             self.branch_reveal.step(dt);
             self.render_dial();
@@ -1887,35 +2408,38 @@ impl App {
         if self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty) {
             super::disk_win::render(self);
         }
+        super::tasks_win::tick(self);
     }
 
     /// Sets the one timer to the next frame or the next deadline.
     fn schedule(&mut self) {
         let wait = if self.animating() {
-            FRAME
+            // A panel's rolling number alone (the countdowns each second) moves at 30 Hz: a
+            // 0.3 s digit roll looks the same and costs half.
+            if self.only_panel_rolls() {
+                2.0 * FRAME
+            } else {
+                FRAME
+            }
         } else {
             let now = Instant::now();
-            let mut next: Vec<Instant> = [
+            [
                 self.tuck_at,
                 self.pill_until,
                 self.next_reminder.map(|r| r.0),
-                self.countdown_at,
-                self.queue_wait,
                 Some(self.sun_at),
                 self.branch_at,
                 self.disk_check_at,
                 self.disk_release_at,
+                self.away_check_at,
+                super::tasks_win::deadline(self),
             ]
             .into_iter()
             .flatten()
-            .collect();
-            if self.panel_open {
-                next.push(now + Duration::from_millis(clock::ms_to_next_second()));
-            }
-            next.into_iter()
-                .min()
-                .map(|t| t.saturating_duration_since(now).as_secs_f64().max(0.001))
-                .unwrap_or(3600.0)
+            .chain(self.timers.values().map(|(at, _)| *at))
+            .min()
+            .map(|t| t.saturating_duration_since(now).as_secs_f64().max(0.001))
+            .unwrap_or(3600.0)
         };
         if let Some(t) = self.timer.take() {
             t.invalidate();
@@ -1980,15 +2504,42 @@ fn menu_item(
     item
 }
 
+/// What an input view typed (mac/input.rs): to whatever has the keyboard.
+fn route_input(i: super::input::Input) {
+    with_app(|a| a.on_input(i));
+}
+
+/// The panel window became key or stopped being key: the Tasks panel's caret follows.
+fn on_panel_key(on: bool) {
+    with_app(|a| {
+        if a.panel_open && a.panel_kind == panels::Kind::Tasks {
+            crate::tasks::on_activate(a, on);
+        }
+    });
+}
+
+impl App {
+    /// Typed input: the Tasks window when it has the keyboard, else the open panel.
+    pub(crate) fn on_input(&mut self, i: super::input::Input) {
+        if super::tasks_win::has_keyboard(self) {
+            super::tasks_win::on_input(self, i);
+        } else if self.panel_open {
+            panels::on_input(self, i);
+        }
+    }
+}
+
 pub fn run() {
     let mtm = MainThreadMarker::new().expect("Orby starts on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     let dir = clock::data_dir();
-    let prefs = Prefs::from_map(&read_settings(&dir));
+    let settings = crate::settings::Settings::load(&dir, Default::default());
     let day = clock::today();
-    let (times, tomorrow_subuh) = compute_times(&prefs, day);
+    let (times, tomorrow_subuh) =
+        crate::prayer::compute_times(&settings.prefs, settings.prefs.place.coords(), day);
+    let theme = crate::settings::theme_now(&settings.prefs);
 
     // The drop's place: kept from the last run, else the right edge, a third down.
     let saved: serde_json::Value = std::fs::read_to_string(dir.join("mac-orb.json"))
@@ -2030,6 +2581,34 @@ pub fn run() {
         false,
     );
     let panel_win = Win::new(mtm, Kind::Panel, panel::W, panel::H, LEVEL_PANEL, true);
+    let countdown_view = {
+        let (l, t, r, b) = panel::countdown_rect(&Fonts::new());
+        let frame = NSRect::new(
+            NSPoint::new(l as f64, t as f64),
+            NSSize::new((r - l) as f64, (b - t) as f64),
+        );
+        let v = NSView::initWithFrame(NSView::alloc(mtm), frame);
+        v.setWantsLayer(true);
+        panel_win.view.addSubview(&v);
+        v
+    };
+    // The rolling numbers of the other panels (Focus's time, Drink's total): while one rolls,
+    // only its part of the panel is drawn, onto this view (mac/panels.rs).
+    let roll_view = {
+        let v = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+        );
+        v.setWantsLayer(true);
+        v.setHidden(true);
+        panel_win.view.addSubview(&v);
+        v
+    };
+    // Typing in the panel (the Tasks quick add) goes through this view (mac/input.rs).
+    let panel_input = super::input::InputView::new(mtm);
+    panel_win.add_subview(&panel_input);
+    let panel_key_obs = panel_win.observe_key(on_panel_key);
+    super::input::set_sink(route_input);
 
     // The menu bar item.
     let target = MenuTarget::new(mtm);
@@ -2043,6 +2622,9 @@ pub fn run() {
     menu.addItem(&toggle);
     menu.addItem(&menu_item(mtm, "Prayer", sel!(openPrayer:), &target));
     menu.addItem(&menu_item(mtm, "Disk…", sel!(openDisk:), &target));
+    let settings_item = menu_item(mtm, "Settings…", sel!(openSettings:), &target);
+    settings_item.setKeyEquivalent(&NSString::from_str(","));
+    menu.addItem(&settings_item);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let login = menu_item(mtm, "Start at login", sel!(toggleLogin:), &target);
     menu.addItem(&login);
@@ -2057,6 +2639,8 @@ pub fn run() {
     let mut a = App {
         gpu: gpu.ok(),
         orb_layer,
+        badge_layer: None,
+        badge_shown: String::new(),
         orb,
         dial,
         pill_win,
@@ -2066,7 +2650,7 @@ pub fn run() {
         toggle_item: Some(toggle),
         login_item: Some(login),
         fonts: Fonts::new(),
-        theme: ui::theme(dark_mode()),
+        theme,
         scale,
         log_path: dir.join("orb-proto.log"),
         started: Instant::now(),
@@ -2094,10 +2678,20 @@ pub fn run() {
         pill_until: None,
         pill_hover: PillPart::None,
         pill_closing: false,
-        pill_queued: false,
         panel_open: false,
+        panel_kind: panels::Kind::Prayer,
         panel_hover: None,
-        prefs,
+        panel_back: None,
+        knob_drag: false,
+        panel_moving: false,
+        countdown_view,
+        roll_view,
+        roll_rect: None,
+        countdown_shown: String::new(),
+        countdown_rolling: false,
+        panel_dirty: true,
+        panel_min: -1,
+        settings,
         times,
         tomorrow_subuh,
         day,
@@ -2105,9 +2699,17 @@ pub fn run() {
         brightness: 1.0,
         sun_at: Instant::now(),
         next_reminder: None,
-        queue: Queue::new(),
-        queue_wait: None,
-        countdown_at: None,
+        notices: notices::Notices::load(&dir),
+        habits: habits::Habits::load(dir.join("habits.json")),
+        history: history::History::new(),
+        tasks: crate::tasks::Tasks::load(&dir),
+        cal: crate::calendar::Cal::load(&dir),
+        times_day: day,
+        panel_input,
+        panel_prev_app: None,
+        _panel_key_obs: panel_key_obs,
+        timers: HashMap::new(),
+        away_check_at: None,
         disk: crate::disk::Disk::load(),
         disk_check_at: None,
         disk_check_every: Duration::from_secs(600),
@@ -2120,21 +2722,28 @@ pub fn run() {
     a.log(&format!(
         "start: Orby for macOS, {gpu_note}, scale {scale}, {} theme, place {}",
         if a.theme.dark { "dark" } else { "light" },
-        a.prefs.place.short()
+        a.settings.prefs.place.short()
     ));
     a.day = (0, 0, 0); // computes and logs today's times
     a.refresh_day();
+    // Notices before any source can post; then prayer, drink and focus (as Windows starts).
+    notices::start(&mut a);
     a.schedule_reminders();
+    habits::schedule_drink(&mut a);
+    habits::arm_focus(&mut a);
+    // Tasks' due timer, then the calendar: its cached day, event pills, 10 min reads.
+    crate::tasks::schedule(&mut a);
+    crate::calendar::start(&mut a);
     a.place_orb();
     a.orb.show();
     a.render_orb();
     a.arm_tuck();
-    let hotkey = super::hotkey::register(|| with_app(|a| a.on_shortcut()));
-    a.log(if hotkey {
-        "shortcut Ctrl+Option+Space"
-    } else {
-        "shortcut Ctrl+Option+Space is taken"
-    });
+    // The shortcut (Carbon hot key) is registered by settings::start, which also shows the first
+    // run on a fresh data folder or starts the orb hidden, before any source can post.
+    if !super::hotkey::install(|| with_app(|a| a.on_shortcut())) {
+        a.log("shortcut: Carbon refused the handler");
+    }
+    crate::settings::start(&mut a);
     a.sync_login_item();
     a.log(&format!(
         "start at login: {}",
@@ -2188,8 +2797,25 @@ pub fn run() {
             a.log("woke from sleep");
             a.refresh_day();
             a.schedule_reminders();
+            habits::schedule_drink(a);
+            habits::arm_focus(a);
+            notices::pump(a);
         });
     });
+    // Light and dark switched in System Settings: a theme that follows the system follows it.
+    let appearance = RcBlock::new(|_n: NonNull<NSNotification>| {
+        with_app(crate::settings::on_system_theme);
+    });
+    let _appearance = unsafe {
+        NSDistributedNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(&NSString::from_str(
+                "AppleInterfaceThemeChangedNotification",
+            )),
+            None,
+            Some(&NSOperationQueue::mainQueue()),
+            &appearance,
+        )
+    };
     let _wake = unsafe {
         NSWorkspace::sharedWorkspace()
             .notificationCenter()

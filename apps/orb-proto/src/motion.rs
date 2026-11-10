@@ -18,16 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct2D::Common::*;
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct2D::*;
-#[cfg(windows)]
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-
 use crate::canvas::{line_height, text_width, Canvas, Color, Font};
-#[cfg(windows)]
-use crate::gfx::{D2dCanvas, Shared};
 
 thread_local! {
     /// The last moment any motion still moves.
@@ -57,14 +48,45 @@ pub fn active() -> bool {
     })
 }
 
+thread_local! {
+    /// Snapshot mode: every number shows its value and every list rests, so scenes are exact.
+    static STILL: Cell<bool> = const { Cell::new(false) };
+    static TRACK: Cell<bool> = const { Cell::new(false) };
+    static RECTS: RefCell<Vec<(f32, f32, f32, f32)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg_attr(windows, allow(dead_code))] // the macOS panel host
+/// Remembers where rolls draw while they move, for a host that redraws only that part
+/// (`track_rolls(true)` turns it on; macOS). Rects are in the canvas's untranslated space.
+pub fn track_rolls(on: bool) {
+    TRACK.with(|t| t.set(on));
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+/// The rects (l, t, r, b) of the rolls drawn since the last call, cleared.
+pub fn take_roll_rects() -> Vec<(f32, f32, f32, f32)> {
+    RECTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+fn note_roll(l: f32, t: f32, r: f32, b: f32) {
+    if TRACK.with(|t| t.get()) {
+        RECTS.with(|v| v.borrow_mut().push((l - 2.0, t, r + 2.0, b)));
+    }
+}
+
+/// Makes all motion still (snapshot mode).
+pub fn set_still(on: bool) {
+    STILL.with(|s| s.set(on));
+}
+
 #[cfg(windows)]
 fn reduced() -> bool {
-    crate::downloads::reduced_motion()
+    STILL.with(|s| s.get()) || crate::downloads::reduced_motion()
 }
 
 #[cfg(target_os = "macos")]
 fn reduced() -> bool {
-    crate::mac::reduced_motion()
+    STILL.with(|s| s.get()) || crate::mac::reduced_motion()
 }
 
 // ---- the critically damped spring ----
@@ -162,38 +184,6 @@ fn digits_value(s: &str) -> u64 {
         .fold(0u64, |v, d| v.saturating_mul(10).saturating_add(d as u64))
 }
 
-/// Draws `value` as a rolling number with its left edge at `x`, vertically centred in `h` like
-/// `gfx::text`. `key` names this number (one per place on screen, e.g. "drink.total"); when
-/// `value` differs from what that key showed last, its changed digits roll to the new ones.
-/// Non-digits (units, separators) never roll. Tabular figures keep every digit the same width.
-/// `roll_text` on a Direct2D context, for the panels that still draw with Direct2D.
-#[cfg(windows)]
-pub fn rolling_text(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    key: &'static str,
-    value: &str,
-    kind: Roll,
-    fmt: &IDWriteTextFormat,
-    x: f32,
-    y: f32,
-    h: f32,
-    b: &ID2D1SolidColorBrush,
-) {
-    let c = unsafe { b.GetColor() };
-    roll_text(
-        &mut D2dCanvas::new(g, dc),
-        key,
-        value,
-        kind,
-        fmt,
-        x,
-        y,
-        h,
-        c,
-    );
-}
-
 pub fn roll_text(
     cv: &mut dyn Canvas,
     key: &'static str,
@@ -230,6 +220,12 @@ pub fn roll_text(
         cv.text(value, fmt, x, y, text_width(value, fmt) + 2.0, h, c);
         return;
     }
+    note_roll(
+        x,
+        y,
+        x + text_width(value, fmt).max(text_width(&from, fmt)),
+        y + h,
+    );
     let up = digits_value(value) >= digits_value(&from);
     let cols = columns(&from, value, up);
     // One line's height: digits travel a full line per step.
@@ -270,23 +266,20 @@ pub fn roll_text(
     }
 }
 
-/// `rolling_text` with its right edge at `right`: the column helper for sizes, amounts and
-/// percents. The width snaps to the new value at once, so the column never slides.
-#[cfg(windows)]
-pub fn rolling_text_right(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+/// `roll_text` with its right edge at `right` (the portable `rolling_text_right`).
+pub fn roll_text_right(
+    cv: &mut dyn Canvas,
     key: &'static str,
     value: &str,
     kind: Roll,
-    fmt: &IDWriteTextFormat,
+    fmt: &Font,
     right: f32,
     y: f32,
     h: f32,
-    b: &ID2D1SolidColorBrush,
+    c: Color,
 ) {
     let w = text_width(value, fmt);
-    rolling_text(g, dc, key, value, kind, fmt, right - w, y, h, b);
+    roll_text(cv, key, value, kind, fmt, right - w, y, h, c);
 }
 
 // ---- ripple ----
@@ -396,43 +389,23 @@ pub fn ripple_reset_all() {
     RIPPLES.with(|r| r.borrow_mut().clear());
 }
 
-/// Draws one row with its ripple entry applied: moved `fx.dy` lower and faded to `fx.alpha` in a
-/// layer. At rest it just calls `draw`, so a settled list costs nothing extra.
+/// `with_row` on the portable `Canvas`: the same translation and layer, so a row drawn through
+/// `D2dCanvas` gives the pixels `with_row` gave.
 ///
-/// `motion::with_row(dc, motion::ripple_row("disk.rows", i), || draw_row(..))`
-#[cfg(windows)]
-pub fn with_row(dc: &ID2D1DeviceContext, fx: RowFx, draw: impl FnOnce()) {
+/// `motion::row(cv, motion::ripple_row("drink.rows", i), |cv| draw_row(cv, ..))`
+pub fn row(cv: &mut dyn Canvas, fx: RowFx, draw: impl FnOnce(&mut dyn Canvas)) {
     if fx == RowFx::REST {
-        draw();
+        draw(cv);
         return;
     }
     if fx.alpha <= 0.003 {
         return;
     }
-    unsafe {
-        let mut before = windows_numerics::Matrix3x2::default();
-        dc.GetTransform(&mut before);
-        let mut moved = before;
-        // A translation after the current transform: y moves in the row's own space.
-        moved.M32 += before.M22 * fx.dy;
-        moved.M31 += before.M21 * fx.dy;
-        dc.SetTransform(&moved);
-        let layer = D2D1_LAYER_PARAMETERS1 {
-            contentBounds: D2D_RECT_F {
-                left: -1e6,
-                top: -1e6,
-                right: 1e6,
-                bottom: 1e6,
-            },
-            maskTransform: windows_numerics::Matrix3x2::identity(),
-            opacity: fx.alpha,
-            ..Default::default()
-        };
-        dc.PushLayer(&layer, None);
-        draw();
-        dc.PopLayer();
-        dc.SetTransform(&before);
-    }
+    cv.push_translate(0.0, fx.dy);
+    cv.push_layer(fx.alpha);
+    draw(cv);
+    cv.pop_layer();
+    cv.pop_translate();
 }
 
 #[cfg(test)]

@@ -2,15 +2,14 @@
 //! glue from the drink log and focus sessions (habits.rs) to `history_model`. Prayer is never
 //! part of it.
 
-use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-
 use app_habits::drink::Source;
 use app_habits::Date;
 
+use crate::canvas::Canvas;
 use crate::history_model::{self as m, Ask, DrinkIn, Log, SessionIn, Span, Tab, View};
 use crate::history_panel::{self, Hit};
 use crate::panels::{self, Kind};
+use crate::sys::vk::*;
 use crate::ui::{DialChild, Icon};
 use crate::{habits, log_line, store, App};
 
@@ -66,16 +65,22 @@ fn log(app: &App) -> Log {
         .map(|s| SessionIn {
             ended: store::local(s.ended),
             minutes: s.minutes,
-            task: s.task.as_ref().map(|id| {
-                app.tasks
-                    .snap
-                    .tasks
-                    .get(&app_store::TaskId(id.clone()))
-                    .map_or_else(|| id.clone(), |t| t.title.clone())
-            }),
+            task: s
+                .task
+                .as_ref()
+                .map(|id| task_title(app, id).unwrap_or_else(|| id.clone())),
         })
         .collect();
     Log::new(&drinks, &sessions, app.habits.drink.config().goal_ml)
+}
+
+/// A task's title while it is still in the store.
+fn task_title(app: &App, id: &str) -> Option<String> {
+    app.tasks
+        .snap
+        .tasks
+        .get(&app_store::TaskId(id.to_string()))
+        .map(|t| t.title.clone())
 }
 
 fn ask(app: &App) -> Ask {
@@ -102,10 +107,10 @@ pub fn size(app: &App) -> (f32, f32) {
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    history_panel::hit(&app.g, &app.fonts, &view(app), x, y)
+    history_panel::hit(&app.fonts, &view(app), x, y)
 }
 
-pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
+pub fn draw_panel(app: &App, cv: &mut dyn Canvas, hover: Option<Hit>) {
     let log = log(app);
     let v = m::view(&log, &ask(app));
     // The pointer's day wins over the keyboard's.
@@ -127,7 +132,7 @@ pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
         };
         m::detail(&log, v.tab, span, c, &pace).map(|d| (i, d))
     });
-    history_panel::draw(&app.g, dc, &app.theme, &app.fonts, &v, detail, hover);
+    history_panel::draw(cv, &app.theme, &app.fonts, &v, detail, hover);
 }
 
 /// Opens History, on `tab` or the last tab used, on this week's page.
@@ -248,7 +253,7 @@ pub fn on_keydown(app: &mut App, vk: u16) -> bool {
     let v = view(app);
     let from = v.focus.and_then(|i| v.cells.get(i)).map(|c| c.date);
     let cur = from.or(app.history.focus).unwrap_or(t);
-    let target = match VIRTUAL_KEY(vk) {
+    let target = match vk {
         VK_LEFT => m::add_days(cur, -1),
         VK_RIGHT => m::add_days(cur, 1),
         VK_UP => m::add_days(cur, -7),
@@ -268,7 +273,7 @@ pub fn on_keydown(app: &mut App, vk: u16) -> bool {
         _ => return false,
     };
     // The first key only shows where it is.
-    let target = if app.history.focus.is_none() && vk != VK_HOME.0 {
+    let target = if app.history.focus.is_none() && vk != VK_HOME {
         cur
     } else {
         target

@@ -5,15 +5,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
-use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-use windows::Win32::UI::Input::{
-    RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE,
-};
-use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
-
 use app_habits::drink::{
     Drink, DrinkConfig, PrayerTimes, Presence, Reminder, ReminderContext, ReminderKind, Source,
 };
@@ -22,11 +13,13 @@ use app_habits::focus::{
 };
 use app_habits::{mins, Date, Moment};
 
+use crate::canvas::Canvas;
 use crate::notices;
 use crate::pill::{dismiss_pill, info_pill};
 use crate::store::{self, FocusPrefs, Saved, SavedSession};
+use crate::sys::{self, Timer};
 use crate::ui::{DialChild, Icon, Pill, PillAction};
-use crate::{drink_panel, focus_panel, log_line, orb, panels, App, TIMER_DRINK, TIMER_FOCUS};
+use crate::{drink_panel, focus_panel, log_line, orb, panels, App};
 
 pub struct Habits {
     pub focus: FocusTimer,
@@ -106,14 +99,11 @@ fn save(app: &mut App) {
 
 /// Local wall-clock now, to the second.
 pub fn now() -> Moment {
-    let st = unsafe { GetLocalTime() };
-    Date::new(st.wYear as i32, st.wMonth as u32, st.wDay as u32)
-        .map(|d| d.at(st.wHour as u32, st.wMinute as u32) + Duration::from_secs(st.wSecond as u64))
-        .unwrap_or(Moment::from_unix(0, 0))
+    sys::now()
 }
 
 fn ms_into_second() -> u64 {
-    unsafe { GetLocalTime() }.wMilliseconds as u64
+    sys::ms_into_second()
 }
 
 /// Milliseconds from now until `at` (whole seconds), landing just after that second begins.
@@ -196,9 +186,7 @@ pub fn dial_focus_value(app: &App) -> String {
 /// Wakes once per degree of the ring's sweep (so the ring creeps without a per-second loop) and
 /// exactly when the phase ends.
 pub fn arm_focus(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_FOCUS);
-    }
+    sys::disarm(app, Timer::Focus);
     let n = now();
     let f = &app.habits.focus;
     let (end, length) = match f.phase() {
@@ -212,12 +200,10 @@ pub fn arm_focus(app: &mut App) {
     };
     let step = (length.as_millis() / 360).clamp(1000, 10_000) as u32;
     let ms = ms_until(n, end).min(step);
-    unsafe {
-        SetTimer(Some(app.hwnd), TIMER_FOCUS, ms, None);
-    }
+    sys::arm(app, Timer::Focus, ms);
 }
 
-pub fn on_focus_timer(app: &mut App, _hwnd: HWND) {
+pub fn on_focus_timer(app: &mut App) {
     let out = app.habits.focus.tick(now());
     apply(app, out);
 }
@@ -806,24 +792,11 @@ fn prayer_times(app: &App) -> PrayerTimes {
     }
 }
 
-fn idle_ms() -> u32 {
-    let mut lii = LASTINPUTINFO {
-        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
-    };
-    unsafe {
-        if !GetLastInputInfo(&mut lii).as_bool() {
-            return 0;
-        }
-        GetTickCount().wrapping_sub(lii.dwTime)
-    }
-}
-
 fn context(app: &App, n: Moment) -> ReminderContext {
     let presence = if app.habits.locked {
         Presence::Locked
     } else {
-        match idle_ms() {
+        match sys::idle_ms() {
             ms if ms < 2000 => Presence::Active,
             ms => Presence::Idle {
                 since: n - Duration::from_millis(ms as u64),
@@ -842,9 +815,7 @@ fn context(app: &App, n: Moment) -> ReminderContext {
 /// One exact timer to the next drink reminder. While away it watches raw input instead, and
 /// after active hours it sleeps until tomorrow's first minute of them.
 pub fn schedule_drink(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_DRINK);
-    }
+    sys::disarm(app, Timer::Drink);
     let n = now();
     let ctx = context(app, n);
     let r = app.habits.drink.next_reminder(n, &ctx);
@@ -887,16 +858,12 @@ pub fn schedule_drink(app: &mut App) {
         }
     };
     if let Some(at) = wake {
-        unsafe {
-            SetTimer(Some(app.hwnd), TIMER_DRINK, ms_until(n, at), None);
-        }
+        sys::arm(app, Timer::Drink, ms_until(n, at));
     }
 }
 
-pub fn on_drink_timer(app: &mut App, _hwnd: HWND) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_DRINK);
-    }
+pub fn on_drink_timer(app: &mut App) {
+    sys::disarm(app, Timer::Drink);
     let n = now();
     let ctx = context(app, n);
     if let Some(r) = app.habits.drink.next_reminder(n, &ctx) {
@@ -941,9 +908,7 @@ pub fn test_drink_due(app: &mut App) {
     let n = now();
     match app.habits.focus.break_at(n) {
         Some(at) => {
-            unsafe {
-                let _ = KillTimer(Some(app.hwnd), TIMER_DRINK);
-            }
+            sys::disarm(app, Timer::Drink);
             app.habits.drink_due = Some(Reminder {
                 at,
                 kind: ReminderKind::Interval,
@@ -998,18 +963,11 @@ fn watch_input(app: &mut App, on: bool) {
         return;
     }
     app.habits.away = on;
-    let devices = [(1u16, 2u16), (1, 6)].map(|(page, usage)| RAWINPUTDEVICE {
-        usUsagePage: page,
-        usUsage: usage,
-        dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
-        hwndTarget: if on { app.hwnd } else { HWND::default() },
-    });
-    unsafe {
-        let _ = RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
-    }
+    sys::watch_input(app, on);
 }
 
-/// WM_INPUT while away: the first key or mouse move means the user is back.
+/// The first key or mouse move while away (Windows: WM_INPUT; macOS: the away check sees fresh
+/// input): the user is back.
 pub fn on_input(app: &mut App) {
     if app.habits.away {
         watch_input(app, false);
@@ -1118,12 +1076,12 @@ pub fn drink_click(app: &mut App, hit: drink_panel::Hit) {
     }
 }
 
-pub fn draw_focus_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<focus_panel::Hit>) {
-    focus_panel::draw(&app.g, dc, &app.theme, &app.fonts, &focus_view(app), hover);
+pub fn draw_focus_panel(app: &App, cv: &mut dyn Canvas, hover: Option<focus_panel::Hit>) {
+    focus_panel::draw(cv, &app.theme, &app.fonts, &focus_view(app), hover);
 }
 
-pub fn draw_drink_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<drink_panel::Hit>) {
-    drink_panel::draw(&app.g, dc, &app.theme, &app.fonts, &drink_view(app), hover);
+pub fn draw_drink_panel(app: &App, cv: &mut dyn Canvas, hover: Option<drink_panel::Hit>) {
+    drink_panel::draw(cv, &app.theme, &app.fonts, &drink_view(app), hover);
 }
 
 #[cfg(test)]

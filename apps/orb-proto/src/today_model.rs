@@ -42,7 +42,13 @@ impl Source {
             }
         }
         if lower.starts_with("file:///") {
-            let path = percent_decode(&s["file:///".len()..]).replace('/', "\\");
+            let rest = percent_decode(&s["file:///".len()..]);
+            // file:///C:/x on Windows, file:///Users/x on macOS.
+            let path = if cfg!(windows) {
+                rest.replace('/', "\\")
+            } else {
+                format!("/{rest}")
+            };
             return looks_like_path(&path).then(|| Source::File(PathBuf::from(path)));
         }
         if looks_like_path(s) && lower.ends_with(".ics") {
@@ -79,6 +85,8 @@ fn looks_like_path(s: &str) -> bool {
     let b = s.as_bytes();
     (b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
         || s.starts_with("\\\\")
+        // An absolute path on macOS.
+        || (!cfg!(windows) && s.len() > 1 && s.starts_with('/'))
 }
 
 fn percent_decode(s: &str) -> String {
@@ -339,12 +347,18 @@ mod tests {
             Source::parse("http://127.0.0.1:8765/cal.ics"),
             Some(Source::Http("http://127.0.0.1:8765/cal.ics".into()))
         );
-        assert_eq!(
-            Source::parse("file:///C:/Users/me/My%20Cal/work.ics"),
-            Some(Source::File(PathBuf::from(
-                "C:\\Users\\me\\My Cal\\work.ics"
-            )))
-        );
+        let (link, file) = if cfg!(windows) {
+            (
+                "file:///C:/Users/me/My%20Cal/work.ics",
+                "C:\\Users\\me\\My Cal\\work.ics",
+            )
+        } else {
+            (
+                "file:///Users/me/My%20Cal/work.ics",
+                "/Users/me/My Cal/work.ics",
+            )
+        };
+        assert_eq!(Source::parse(link), Some(Source::File(PathBuf::from(file))));
         assert_eq!(
             Source::parse("\"C:\\Users\\me\\My Cal\\work.ics\""),
             Some(Source::File(PathBuf::from(
@@ -367,10 +381,12 @@ mod tests {
     fn the_label_never_shows_the_secret_part_of_a_link() {
         let s = Source::parse("https://calendar.google.com/calendar/ical/me%40gmail.com/private-0123456789abcdef/basic.ics").unwrap();
         assert_eq!(s.label(), "calendar.google.com");
-        assert_eq!(
-            Source::parse("C:\\cal\\work.ics").unwrap().label(),
-            "work.ics"
-        );
+        let file = if cfg!(windows) {
+            "C:\\cal\\work.ics"
+        } else {
+            "/Users/me/cal/work.ics"
+        };
+        assert_eq!(Source::parse(file).unwrap().label(), "work.ics");
     }
 
     #[test]

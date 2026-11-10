@@ -1,9 +1,10 @@
 //! The calendar link and the Today panel. One ICS link (an https, webcal or file link, or a
-//! path) is kept in `%APPDATA%\orb-proto\settings.json` and read every 10 min on a worker
-//! thread with a small blocking HTTP client; the last good copy is cached in
-//! `calendar-cache.ics`, so the day shows at launch and while offline. One exact timer runs to
-//! the next event pill (10 min before, and at the start) or midnight. today_model.rs decides,
-//! today_panel.rs draws.
+//! path) is kept in `settings.json` in the data folder and read every 10 min on a worker
+//! thread with a small blocking HTTP client (ureq over native-tls: SChannel on Windows,
+//! Security.framework on macOS); the last good copy is cached in `calendar-cache.ics`, so the
+//! day shows at launch and while offline. One exact timer runs to the next event pill (10 min
+//! before, and at the start) or midnight. today_model.rs decides, today_panel.rs draws. Shared
+//! by both systems: what it asks of the system goes through `crate::sys`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,22 +17,19 @@ use app_core::prayer as pr;
 use app_habits::held::Priority;
 use app_store::{Task, TaskId};
 use serde_json::Value;
-use windows::core::{w, HSTRING};
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
-use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::canvas::Canvas;
 use crate::notices;
 use crate::panels::{self, Kind};
 use crate::pill::info_pill;
+use crate::sys::{self, Timer};
 use crate::tasks_model::{self as m, Selection};
 use crate::today_model::{self as tm, Cue, Fail, Source, Sync};
 use crate::today_panel::{self as tp, Card, Hit, Line, View};
 use crate::ui::{Icon, Pill, PillAction};
-use crate::{
-    log_line, prayer, settings, store, tasks, App, TIMER_CAL_CUE, TIMER_CAL_READ, WM_APP_CAL,
-};
+use crate::{log_line, prayer, store, tasks, App};
+
+use crate::settings;
 
 const READ_EVERY_MS: u32 = 10 * 60 * 1000;
 const CACHE: &str = "calendar-cache.ics";
@@ -181,7 +179,8 @@ fn fetch(src: &Source) -> Result<String, (Fail, String)> {
     }
 }
 
-/// Starts a read on a worker thread unless one is in flight. Its answer comes back as WM_APP_CAL.
+/// Starts a read on a worker thread unless one is in flight. Its answer wakes the UI thread
+/// (`sys::cal_waker`: WM_APP_CAL on Windows), which calls `on_read_done`.
 pub fn read_now(app: &mut App) {
     let Some(src) = app.cal.source.clone() else {
         return;
@@ -191,7 +190,7 @@ pub fn read_now(app: &mut App) {
     }
     let (tx, rx) = channel();
     app.cal.rx = Some(rx);
-    let hwnd = app.hwnd.0 as isize;
+    let waker = sys::cal_waker(app);
     log_line(app, &format!("calendar: reading {}", src.label()));
     std::thread::spawn(move || {
         let r = fetch(&src).and_then(|text| {
@@ -200,9 +199,7 @@ pub fn read_now(app: &mut App) {
             Ok((text, parsed))
         });
         if tx.send(r).is_ok() {
-            unsafe {
-                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_CAL, WPARAM(0), LPARAM(0));
-            }
+            waker.wake();
         }
     });
     panels::refresh(app);
@@ -243,13 +240,11 @@ pub fn on_read_timer(app: &mut App) {
     read_now(app);
 }
 
-fn arm_read_timer(app: &App) {
-    unsafe {
-        if app.cal.source.is_some() {
-            SetTimer(Some(app.hwnd), TIMER_CAL_READ, READ_EVERY_MS, None);
-        } else {
-            let _ = KillTimer(Some(app.hwnd), TIMER_CAL_READ);
-        }
+fn arm_read_timer(app: &mut App) {
+    if app.cal.source.is_some() {
+        sys::arm(app, Timer::CalRead, READ_EVERY_MS);
+    } else {
+        sys::disarm(app, Timer::CalRead);
     }
 }
 
@@ -288,7 +283,7 @@ fn set_source(app: &mut App, raw: Option<String>) {
 
 /// Tray "Add calendar link" and the panel's Paste: the link on the clipboard becomes the calendar.
 pub fn add_link_from_clipboard(app: &mut App) {
-    let text = tasks::read_clipboard(app.hwnd).unwrap_or_default();
+    let text = sys::read_clipboard(app).unwrap_or_default();
     match Source::parse(&text) {
         Some(src) => {
             let label = src.label();
@@ -340,9 +335,7 @@ fn rebuild(app: &mut App) {
 
 /// One exact timer: the next event pill, or midnight (a new day's occurrences).
 pub fn schedule_cues(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_CAL_CUE);
-    }
+    sys::disarm(app, Timer::CalCue);
     if app.cal.source.is_none() {
         return;
     }
@@ -351,9 +344,7 @@ pub fn schedule_cues(app: &mut App) {
     let next = tm::next_cue(&app.cal.occ, app.cal.fired_until);
     let target = next.map_or(midnight, |t| t.min(midnight));
     let ms = (target.unix_seconds() * 1000 - n.ms as i64 + 30).clamp(50, u32::MAX as i64) as u32;
-    unsafe {
-        SetTimer(Some(app.hwnd), TIMER_CAL_CUE, ms, None);
-    }
+    sys::arm(app, Timer::CalCue, ms);
     let what = next.map_or("none".to_string(), |t| tm::hhmm(t, n.offset));
     log_line(
         app,
@@ -362,9 +353,7 @@ pub fn schedule_cues(app: &mut App) {
 }
 
 pub fn on_cue_timer(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_CAL_CUE);
-    }
+    sys::disarm(app, Timer::CalCue);
     let n = now();
     if app.cal.occ_day != Some(n.today) {
         rebuild(app);
@@ -461,16 +450,7 @@ pub fn join(app: &mut App, url: &str) {
         return;
     }
     log_line(app, "calendar: join");
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            &HSTRING::from(url),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-    }
+    sys::open_url(url);
 }
 
 // ---- the panel ----
@@ -526,7 +506,10 @@ fn card(sync: &Sync, reading: bool, offset: i32) -> Option<Card> {
             icon: Icon::Clock,
             title: "Loading your day…".into(),
             body: vec![
-                "Prayer times are worked out on this PC.".into(),
+                format!(
+                    "Prayer times are worked out on this {}.",
+                    crate::settings_model::os::W.device
+                ),
                 "Events fill in when the calendar answers.".into(),
             ],
             buttons: Vec::new(),
@@ -730,12 +713,12 @@ pub fn height(app: &App) -> f32 {
     tp::height(&view(app))
 }
 
-pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
-    tp::draw(&app.g, dc, &app.theme, &app.fonts, &view(app), hover);
+pub fn draw_panel(app: &App, cv: &mut dyn Canvas, hover: Option<Hit>) {
+    tp::draw(cv, &app.theme, &app.fonts, &view(app), hover);
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    tp::hit(&app.g, &app.fonts, &view(app), x, y)
+    tp::hit(&app.fonts, &view(app), x, y)
 }
 
 fn act(app: &mut App, target: Target, join_only: bool) {
@@ -834,6 +817,37 @@ pub fn on_wheel(app: &mut App, delta: i16) {
         app.cal.scroll = s;
         panels::refresh(app);
     }
+}
+
+/// One line for a test drive: the link, the sync state, today's events and the panel's lines.
+#[cfg_attr(windows, allow(dead_code))] // the Mac's test channel (`today-state`)
+pub fn state_line(app: &App) -> String {
+    let n = now();
+    let events = tm::on_day(&app.cal.occ, n.day_start).len();
+    let v = view(app);
+    let lines: Vec<String> = v
+        .lines
+        .iter()
+        .take(8)
+        .map(|l| match l {
+            Line::Event { title, time, .. } => format!("event {time} {title}"),
+            Line::Task {
+                title, time, done, ..
+            } => format!("task {time} {title}{}", if *done { " (done)" } else { "" }),
+            Line::Marker { name, time } => format!("prayer {time} {name}"),
+            Line::Earlier { label, .. } => format!("earlier {label}"),
+            Line::Now(s) | Line::Quiet(s) => s.clone(),
+        })
+        .collect();
+    format!(
+        "link {}, sync {:?}, reading {}, {events} events today, {} lines, focus {:?}: {}",
+        app.cal.source.as_ref().map_or("none".into(), Source::label),
+        app.cal.sync,
+        app.cal.rx.is_some(),
+        v.lines.len(),
+        app.cal.focus,
+        lines.join(" | ")
+    )
 }
 
 /// Ms to just after the next minute: the now line, Join and "in 1 h 6 min" change then.

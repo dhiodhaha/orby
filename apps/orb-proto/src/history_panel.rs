@@ -1,15 +1,14 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The History panel (frames "v6.2 · 23" and "· 24"): the Drink and Focus tabs, the month and
 //! year grids, the summary numbers, the day detail, and the empty, first-week and loading
 //! layouts. Drawing and hit tests; `history_model.rs` decides every word and level.
 
-use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_METRICS};
-
-use crate::gfx::*;
+use crate::canvas::{
+    ellipse, line_height, line_to, path, pt, rgba, rrect, text_width, wrap_height, Canvas, Color,
+    Font, Stroke,
+};
 use crate::history_model::{Body, Cell, CellView, Detail, Parts, Span, Tab, View};
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{num_text, paint_icon, with_alpha, Fonts, Icon, Theme};
 
 const MONTH_W: f32 = 360.0;
 const YEAR_W: f32 = 700.0;
@@ -47,18 +46,14 @@ fn compact_text_w() -> f32 {
     COMPACT_W - 2.0 * PAD - 20.0 - SMALL_W
 }
 
-/// The height wrapped text takes at width `w`.
-fn wrapped_height(g: &Shared, s: &str, fmt: &IDWriteTextFormat, w: f32) -> f32 {
-    let t: Vec<u16> = s.encode_utf16().collect();
-    unsafe {
-        g.dw.CreateTextLayout(&t, fmt, w, 400.0)
-            .map(|l| {
-                let mut m = DWRITE_TEXT_METRICS::default();
-                let _ = l.GetMetrics(&mut m);
-                m.height
-            })
-            .unwrap_or(32.0)
+/// The height wrapped text takes at width `w`: whole lines, not rounded up to whole pixels
+/// (`wrap_height` rounds), so the button under it sits where it always has.
+fn wrapped_height(s: &str, fmt: &Font, w: f32) -> f32 {
+    let line = line_height(fmt);
+    if line <= 0.0 {
+        return 32.0;
     }
+    (wrap_height(s, fmt, w) / line).round().max(1.0) * line
 }
 
 fn inside(r: &Rect, x: f32, y: f32) -> bool {
@@ -120,7 +115,7 @@ fn tab_rect(w: f32, t: Tab) -> Rect {
 }
 
 /// Every control and cell, in logical px.
-fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
+fn rects(f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     let (w, _) = size(v);
     let mut out = vec![
         (Hit::Tab(Tab::Drink), tab_rect(w, Tab::Drink)),
@@ -131,8 +126,8 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
             action, text: body, ..
         } = &v.body
         {
-            let bw = g.text_width(action, &f.title) + 24.0;
-            let y = 62.0 + 22.0 + wrapped_height(g, body, &f.small_wrap, compact_text_w()) + 14.0;
+            let bw = text_width(action, &f.title) + 24.0;
+            let y = 62.0 + 22.0 + wrapped_height(body, &f.small_wrap, compact_text_w()) + 14.0;
             out.push((Hit::Action, (PAD, y, PAD + bw, y + 32.0)));
         }
         out.extend(
@@ -145,12 +140,12 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     }
     let y = 60.0;
     out.push((Hit::Prev, (PAD, y, PAD + 28.0, y + 28.0)));
-    let lw = g.text_width(&v.range, &f.title);
+    let lw = text_width(&v.range, &f.title);
     let nx = PAD + 28.0 + 4.0 + 6.0 + lw + 6.0 + 4.0;
     out.push((Hit::Next, (nx, y, nx + 28.0, y + 28.0)));
     let (yw, mw) = (
-        g.text_width("Year", &f.small_medium) + 20.0,
-        g.text_width("Month", &f.small_medium) + 20.0,
+        text_width("Year", &f.small_medium) + 20.0,
+        text_width("Month", &f.small_medium) + 20.0,
     );
     out.push((Hit::Span(Span::Year), (w - PAD - yw, y, w - PAD, y + 28.0)));
     out.push((
@@ -201,8 +196,8 @@ fn cell_rects(v: &View) -> Vec<Rect> {
     }
 }
 
-pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
-    let rs = rects(g, f, v);
+pub fn hit(f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
+    let rs = rects(f, v);
     // The year grid's 2 px gaps belong to the nearest day, so a sweep never flickers the detail.
     let slack = if !v.body.compact() && v.span == Span::Year {
         1.0
@@ -217,7 +212,7 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
         .map(|(h, _)| h)
 }
 
-fn level_ink(t: &Theme, l: u8) -> D2D1_COLOR_F {
+fn level_ink(t: &Theme, l: u8) -> Color {
     if l >= 3 {
         t.panel
     } else {
@@ -226,137 +221,85 @@ fn level_ink(t: &Theme, l: u8) -> D2D1_COLOR_F {
 }
 
 /// Small units sit on the digits' baseline: 26 px digits, 13 px muted units.
-fn draw_parts(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    f: &Fonts,
-    t: &Theme,
-    parts: &Parts,
-    x: f32,
-    y: f32,
-) {
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
+fn draw_parts(cv: &mut dyn Canvas, f: &Fonts, t: &Theme, parts: &Parts, x: f32, y: f32) {
+    let ink = t.text;
+    let muted = t.muted;
     let mut x = x;
     for (s, unit) in parts {
         if *unit {
-            let w = g.text_width(s, &f.body);
-            text(dc, s, &f.body, x + 2.0, y + 11.5, w + 2.0, 16.0, &muted);
+            let w = text_width(s, &f.body);
+            cv.text(s, &f.body, x + 2.0, y + 11.5, w + 2.0, 16.0, muted);
             x += w + 5.0;
         } else {
-            let w = g.text_width(s, &f.big);
-            text(dc, s, &f.big, x, y, w + 2.0, 30.0, &ink);
+            let w = text_width(s, &f.big);
+            cv.text(s, &f.big, x, y, w + 2.0, 30.0, ink);
             x += w;
         }
     }
 }
 
-fn panel_bg(dc: &ID2D1DeviceContext, t: &Theme, w: f32, h: f32) {
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, w, h, 20.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(
-            &rrect(0.5, 0.5, w - 0.5, h - 0.5, 19.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
+fn panel_bg(cv: &mut dyn Canvas, t: &Theme, w: f32, h: f32) {
+    cv.fill_rrect(&rrect(0.0, 0.0, w, h, 20.0), t.panel);
+    cv.stroke_rrect(
+        &rrect(0.5, 0.5, w - 0.5, h - 0.5, 19.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
 }
 
-fn header(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    w: f32,
-    hover: Option<Hit>,
-) {
-    text(
-        dc,
-        "History",
-        &f.panel_title,
-        PAD,
-        PAD,
-        120.0,
-        32.0,
-        &brush(dc, t.text),
-    );
+fn header(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, w: f32, hover: Option<Hit>) {
+    cv.text("History", &f.panel_title, PAD, PAD, 120.0, 32.0, t.text);
     let r = tabs_rect(w);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 16.0), &brush(dc, t.raised));
-        dc.DrawRoundedRectangle(
-            &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 15.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
+    cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 16.0), t.raised);
+    cv.stroke_rrect(
+        &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 15.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
     for tab in [Tab::Drink, Tab::Focus] {
         let tr = tab_rect(w, tab);
         let on = v.tab == tab;
-        unsafe {
-            if on {
-                dc.FillRoundedRectangle(
-                    &rrect(tr.0, tr.1, tr.2, tr.3, 14.0),
-                    &brush(dc, if t.dark { rgba(0x2A2A2A, 1.0) } else { t.panel }),
-                );
-                dc.DrawRoundedRectangle(
-                    &rrect(tr.0 + 0.5, tr.1 + 0.5, tr.2 - 0.5, tr.3 - 0.5, 13.5),
-                    &brush(dc, t.hair),
-                    1.0,
-                    None,
-                );
-            } else if hover == Some(Hit::Tab(tab)) {
-                dc.FillRoundedRectangle(&rrect(tr.0, tr.1, tr.2, tr.3, 14.0), &brush(dc, t.button));
-            }
+        if on {
+            cv.fill_rrect(
+                &rrect(tr.0, tr.1, tr.2, tr.3, 14.0),
+                if t.dark { rgba(0x2A2A2A, 1.0) } else { t.panel },
+            );
+            cv.stroke_rrect(
+                &rrect(tr.0 + 0.5, tr.1 + 0.5, tr.2 - 0.5, tr.3 - 0.5, 13.5),
+                t.hair,
+                1.0,
+                Stroke::Plain,
+            );
+        } else if hover == Some(Hit::Tab(tab)) {
+            cv.fill_rrect(&rrect(tr.0, tr.1, tr.2, tr.3, 14.0), t.button);
         }
         let name = if tab == Tab::Drink { "Drink" } else { "Focus" };
-        center_text(
-            g,
-            dc,
+        cv.center_text(
             name,
             &f.title,
             (tr.0 + tr.2) / 2.0,
             tr.1,
             28.0,
-            &brush(dc, if on { t.text } else { t.muted }),
+            if on { t.text } else { t.muted },
         );
     }
 }
 
-fn round_button(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    r: &Rect,
-    icon: Icon,
-    on: bool,
-    hov: bool,
-) {
+fn round_button(cv: &mut dyn Canvas, t: &Theme, r: &Rect, icon: Icon, on: bool, hov: bool) {
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
-    unsafe {
-        if on {
-            dc.FillEllipse(
-                &ellipse(cx, cy, 14.0),
-                &brush(dc, if hov { t.button_hover } else { t.button }),
-            );
-        }
+    if on {
+        cv.fill_ellipse(
+            &ellipse(cx, cy, 14.0),
+            if hov { t.button_hover } else { t.button },
+        );
     }
-    draw_icon(
-        g,
-        dc,
-        icon,
-        cx,
-        cy,
-        14.0,
-        &brush(dc, if on { t.text } else { t.track }),
-    );
+    paint_icon(cv, icon, cx, cy, 14.0, if on { t.text } else { t.track });
 }
 
 pub fn draw(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     v: &View,
@@ -364,14 +307,13 @@ pub fn draw(
     hover: Option<Hit>,
 ) {
     let (w, h) = size(v);
-    panel_bg(dc, t, w, h);
-    header(g, dc, t, f, v, w, hover);
-    let rs = rects(g, f, v);
+    panel_bg(cv, t, w, h);
+    header(cv, t, f, v, w, hover);
+    let rs = rects(f, v);
     let rect_of = |hit: Hit| rs.iter().find(|(x, _)| *x == hit).map(|(_, r)| *r);
     if v.body.compact() {
         compact(
-            g,
-            dc,
+            cv,
             t,
             f,
             v,
@@ -379,21 +321,21 @@ pub fn draw(
             hover == Some(Hit::Action),
         );
     } else {
-        controls(g, dc, t, f, v, &rs, hover);
+        controls(cv, t, f, v, &rs, hover);
         if let Body::Full { stats, .. } = &v.body {
-            stats_band(g, dc, t, f, w, stats);
+            stats_band(cv, t, f, w, stats);
         }
         match v.span {
             Span::Month => {
-                month_grid(g, dc, t, f, v);
-                legend(g, dc, t, f, v, w, month_grid_bottom() + 12.0);
-                by_task(g, dc, t, f, v, month_grid_bottom() + 12.0 + 16.0 + 16.0);
+                month_grid(cv, t, f, v);
+                legend(cv, t, f, v, w, month_grid_bottom() + 12.0);
+                by_task(cv, t, f, v, month_grid_bottom() + 12.0 + 16.0 + 16.0);
             }
             Span::Year => {
-                year_grid(g, dc, t, f, v);
+                year_grid(cv, t, f, v);
                 let ly = YEAR_Y + 7.0 * YEAR_STEP - 2.0 + 12.0;
-                legend(g, dc, t, f, v, w, ly);
-                key_hint(g, dc, t, f, ly + 16.0 + 10.0);
+                legend(cv, t, f, v, w, ly);
+                key_hint(cv, t, f, ly + 16.0 + 10.0);
             }
         }
     }
@@ -401,14 +343,13 @@ pub fn draw(
         let cr = cell_rects(v);
         if let Some(r) = cr.get(i) {
             let side = !v.body.compact() && v.span == Span::Year;
-            tooltip(g, dc, t, f, &d, r, side, w, h);
+            tooltip(cv, t, f, &d, r, side, w, h);
         }
     }
 }
 
 fn controls(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     v: &View,
@@ -417,18 +358,9 @@ fn controls(
 ) {
     for (hit, r) in rs {
         match hit {
-            Hit::Prev => round_button(
-                g,
-                dc,
-                t,
-                r,
-                Icon::ChevronLeft,
-                v.can_prev,
-                hover == Some(*hit),
-            ),
+            Hit::Prev => round_button(cv, t, r, Icon::ChevronLeft, v.can_prev, hover == Some(*hit)),
             Hit::Next => round_button(
-                g,
-                dc,
+                cv,
                 t,
                 r,
                 Icon::ChevronRight,
@@ -445,107 +377,86 @@ fn controls(
                     None
                 };
                 if let Some(c) = fill {
-                    unsafe {
-                        dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, c));
-                    }
+                    cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 14.0), c);
                 }
                 let name = if *s == Span::Month { "Month" } else { "Year" };
-                center_text(
-                    g,
-                    dc,
+                cv.center_text(
                     name,
                     &f.small_medium,
                     (r.0 + r.2) / 2.0,
                     r.1,
                     28.0,
-                    &brush(dc, if on { t.text } else { t.muted }),
+                    if on { t.text } else { t.muted },
                 );
             }
             _ => {}
         }
     }
-    text(
-        dc,
+    cv.text(
         &v.range,
         &f.title,
         PAD + 28.0 + 4.0 + 6.0,
         60.0,
         300.0,
         28.0,
-        &brush(dc, t.text),
+        t.text,
     );
 }
 
 fn stats_band(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     w: f32,
     stats: &[crate::history_model::Stat],
 ) {
-    let hair = brush(dc, t.hair);
-    unsafe {
-        dc.DrawLine(
-            pt(PAD, STATS_Y + 0.5),
-            pt(w - PAD, STATS_Y + 0.5),
-            &hair,
-            1.0,
-            None,
-        );
-        dc.DrawLine(
-            pt(PAD, STATS_B - 0.5),
-            pt(w - PAD, STATS_B - 0.5),
-            &hair,
-            1.0,
-            None,
-        );
-    }
+    let hair = t.hair;
+    cv.line(
+        pt(PAD, STATS_Y + 0.5),
+        pt(w - PAD, STATS_Y + 0.5),
+        hair,
+        1.0,
+        Stroke::Plain,
+    );
+    cv.line(
+        pt(PAD, STATS_B - 0.5),
+        pt(w - PAD, STATS_B - 0.5),
+        hair,
+        1.0,
+        Stroke::Plain,
+    );
     let cw = (w - 2.0 * PAD) / stats.len().max(1) as f32;
     for (i, s) in stats.iter().enumerate() {
         let x0 = PAD + cw * i as f32;
         let x = if i > 0 {
-            unsafe {
-                dc.DrawLine(
-                    pt(x0 + 0.5, STATS_Y + 12.0),
-                    pt(x0 + 0.5, STATS_B - 12.0),
-                    &hair,
-                    1.0,
-                    None,
-                );
-            }
+            cv.line(
+                pt(x0 + 0.5, STATS_Y + 12.0),
+                pt(x0 + 0.5, STATS_B - 12.0),
+                hair,
+                1.0,
+                Stroke::Plain,
+            );
             x0 + 12.0
         } else {
             x0
         };
-        draw_parts(g, dc, f, t, &s.value, x, STATS_Y + 12.0);
-        text(
-            dc,
-            &s.key,
-            &f.small,
-            x,
-            STATS_Y + 46.0,
-            cw - 14.0,
-            16.0,
-            &brush(dc, t.text),
-        );
-        text(
-            dc,
+        draw_parts(cv, f, t, &s.value, x, STATS_Y + 12.0);
+        cv.text(&s.key, &f.small, x, STATS_Y + 46.0, cw - 14.0, 16.0, t.text);
+        cv.text(
             &s.sub,
             &f.small,
             x,
             STATS_Y + 62.0,
             cw - 14.0,
             16.0,
-            &brush(dc, t.muted),
+            t.muted,
         );
     }
 }
 
 /// One day square. `small` is the year's 10 px square (no number, tighter rings).
 fn cell(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     c: &CellView,
@@ -556,301 +467,235 @@ fn cell(
 ) {
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
     let small = r.2 - r.0 < 16.0;
-    let (ink, show) = unsafe {
-        match c.kind {
-            Cell::Level(l) => {
-                dc.FillRoundedRectangle(
-                    &rrect(r.0, r.1, r.2, r.3, rad),
-                    &brush(dc, t.heat[l as usize]),
-                );
-                (level_ink(t, l), true)
-            }
-            Cell::Before => {
-                dc.DrawRoundedRectangle(
-                    &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, rad - 0.5),
-                    &brush(
-                        dc,
-                        if t.dark {
-                            rgba(0xFFFFFF, 0.09)
-                        } else {
-                            rgba(0x000000, 0.09)
-                        },
-                    ),
-                    1.0,
-                    None,
-                );
-                (t.muted, true)
-            }
-            Cell::Ahead if small => return,
-            Cell::Ahead => {
-                dc.DrawRoundedRectangle(
-                    &rrect(r.0 + 0.75, r.1 + 0.75, r.2 - 0.75, r.3 - 0.75, rad - 0.75),
-                    &brush(dc, t.passed),
-                    1.5,
-                    &dotted_stroke(g),
-                );
-                (t.muted, true)
-            }
-            Cell::Loading(alt) => {
-                dc.FillRoundedRectangle(
-                    &rrect(r.0, r.1, r.2, r.3, rad),
-                    &brush(dc, if alt { t.button } else { t.raised }),
-                );
-                (t.muted, false)
-            }
+    let (ink, show) = match c.kind {
+        Cell::Level(l) => {
+            cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, rad), t.heat[l as usize]);
+            (level_ink(t, l), true)
+        }
+        Cell::Before => {
+            cv.stroke_rrect(
+                &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, rad - 0.5),
+                if t.dark {
+                    rgba(0xFFFFFF, 0.09)
+                } else {
+                    rgba(0x000000, 0.09)
+                },
+                1.0,
+                Stroke::Plain,
+            );
+            (t.muted, true)
+        }
+        Cell::Ahead if small => return,
+        Cell::Ahead => {
+            cv.stroke_rrect(
+                &rrect(r.0 + 0.75, r.1 + 0.75, r.2 - 0.75, r.3 - 0.75, rad - 0.75),
+                t.passed,
+                1.5,
+                Stroke::Dotted,
+            );
+            (t.muted, true)
+        }
+        Cell::Loading(alt) => {
+            cv.fill_rrect(
+                &rrect(r.0, r.1, r.2, r.3, rad),
+                if alt { t.button } else { t.raised },
+            );
+            (t.muted, false)
         }
     };
     if number && show {
         let fmt = if c.today { &f.small_medium } else { &f.small };
-        center_text(
-            g,
-            dc,
-            &c.date.day().to_string(),
-            fmt,
-            cx,
-            cy - 8.0,
-            16.0,
-            &brush(dc, ink),
-        );
+        cv.center_text(&c.date.day().to_string(), fmt, cx, cy - 8.0, 16.0, ink);
     }
-    let ring = |width: f32, off: f32| unsafe {
+    let ring = |cv: &mut dyn Canvas, width: f32, off: f32| {
         let o = off + width / 2.0;
-        dc.DrawRoundedRectangle(
+        cv.stroke_rrect(
             &rrect(r.0 - o, r.1 - o, r.2 + o, r.3 + o, rad + o),
-            &brush(dc, t.text),
+            t.text,
             width,
-            None,
+            Stroke::Plain,
         );
     };
     let off = if small { 1.0 } else { 2.0 };
     if focused {
-        ring(2.0, off + if small { 0.5 } else { 0.0 });
+        ring(cv, 2.0, off + if small { 0.5 } else { 0.0 });
     } else if c.today {
-        ring(1.5, off);
+        ring(cv, 1.5, off);
     }
 }
 
-fn weekday_row(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    x0: f32,
-    cw: f32,
-    gap: f32,
-    y: f32,
-) {
-    let muted = brush(dc, t.muted);
+fn weekday_row(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, x0: f32, cw: f32, gap: f32, y: f32) {
+    let muted = t.muted;
     for (i, d) in ["M", "T", "W", "T", "F", "S", "S"].iter().enumerate() {
-        center_text(
-            g,
-            dc,
+        cv.center_text(
             d,
             &f.small,
             x0 + i as f32 * (cw + gap) + cw / 2.0,
             y,
             16.0,
-            &muted,
+            muted,
         );
     }
 }
 
-fn month_grid(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View) {
-    weekday_row(g, dc, t, f, PAD, month_cell(), GAP, STATS_B + 14.0);
+fn month_grid(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View) {
+    weekday_row(cv, t, f, PAD, month_cell(), GAP, STATS_B + 14.0);
     for (i, (c, r)) in v.cells.iter().zip(cell_rects(v)).enumerate() {
-        cell(g, dc, t, f, c, &r, 8.0, true, v.focus == Some(i));
+        cell(cv, t, f, c, &r, 8.0, true, v.focus == Some(i));
     }
 }
 
-fn year_grid(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View) {
-    let muted = brush(dc, t.muted);
+fn year_grid(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View) {
+    let muted = t.muted;
     for (col, name) in &v.months {
-        text(
-            dc,
+        cv.text(
             name,
             &f.small,
             YEAR_X + *col as f32 * YEAR_STEP,
             STATS_B + 14.0,
             40.0,
             16.0,
-            &muted,
+            muted,
         );
     }
     for (row, name) in [(0, "Mon"), (2, "Wed"), (4, "Fri")] {
-        text(
-            dc,
+        cv.text(
             name,
             &f.small,
             PAD,
             YEAR_Y + row as f32 * YEAR_STEP + YEAR_CELL / 2.0 - 8.0,
             28.0,
             16.0,
-            &muted,
+            muted,
         );
     }
     for (i, (c, r)) in v.cells.iter().zip(cell_rects(v)).enumerate() {
-        cell(g, dc, t, f, c, &r, 3.0, false, v.focus == Some(i));
+        cell(cv, t, f, c, &r, 3.0, false, v.focus == Some(i));
     }
 }
 
-fn legend(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View, w: f32, y: f32) {
-    let muted = brush(dc, t.muted);
-    text(dc, &v.legend, &f.small, PAD, y, w / 2.0, 16.0, &muted);
-    let top_w = g.text_width(v.legend_top, &f.small);
+fn legend(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, w: f32, y: f32) {
+    let muted = t.muted;
+    cv.text(&v.legend, &f.small, PAD, y, w / 2.0, 16.0, muted);
+    let top_w = text_width(v.legend_top, &f.small);
     let mut x = w - PAD - top_w;
-    text(dc, v.legend_top, &f.small, x, y, top_w + 2.0, 16.0, &muted);
+    cv.text(v.legend_top, &f.small, x, y, top_w + 2.0, 16.0, muted);
     x -= 4.0 + 5.0 * 13.0 - 3.0;
     for (i, c) in t.heat.iter().enumerate() {
         let sx = x + i as f32 * 13.0;
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(sx, y + 3.0, sx + 10.0, y + 13.0, 3.0),
-                &brush(dc, *c),
-            );
-        }
+        cv.fill_rrect(&rrect(sx, y + 3.0, sx + 10.0, y + 13.0, 3.0), *c);
     }
-    let less_w = g.text_width("Less", &f.small);
-    text(
-        dc,
+    let less_w = text_width("Less", &f.small);
+    cv.text(
         "Less",
         &f.small,
         x - 4.0 - less_w,
         y,
         less_w + 2.0,
         16.0,
-        &muted,
+        muted,
     );
 }
 
-fn by_task(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View, y: f32) {
+fn by_task(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, y: f32) {
     let Body::Full {
         by_task: Some(b), ..
     } = &v.body
     else {
         return;
     };
-    let (ink, muted, hair) = (brush(dc, t.text), brush(dc, t.muted), brush(dc, t.hair));
-    text(dc, &b.label, &f.small, PAD, y, 220.0, 16.0, &muted);
-    crate::ui::text_num(g, dc, &b.total, &f.small, MONTH_W - PAD, y, 16.0, &muted);
+    let (ink, muted, hair) = (t.text, t.muted, t.hair);
+    cv.text(&b.label, &f.small, PAD, y, 220.0, 16.0, muted);
+    num_text(cv, &b.total, &f.small, MONTH_W - PAD, y, 16.0, muted);
     let top = y + 18.0;
     for (i, row) in b.rows.iter().enumerate() {
         let ry = top + i as f32 * ROW_H;
         if i + 1 < b.rows.len() {
-            unsafe {
-                dc.DrawLine(
-                    pt(PAD, ry + ROW_H - 0.5),
-                    pt(MONTH_W - PAD, ry + ROW_H - 0.5),
-                    &hair,
-                    1.0,
-                    None,
-                );
-            }
+            cv.line(
+                pt(PAD, ry + ROW_H - 0.5),
+                pt(MONTH_W - PAD, ry + ROW_H - 0.5),
+                hair,
+                1.0,
+                Stroke::Plain,
+            );
         }
         let (cx, cy) = (PAD + 4.0 + 12.0, ry + ROW_H / 2.0);
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(cx - 12.0, cy - 12.0, cx + 12.0, cy + 12.0, 7.0),
-                &brush(dc, t.button),
-            );
-            dc.DrawRoundedRectangle(
-                &rrect(cx - 11.5, cy - 11.5, cx + 11.5, cy + 11.5, 6.5),
-                &hair,
-                1.0,
-                None,
-            );
-        }
+        cv.fill_rrect(
+            &rrect(cx - 12.0, cy - 12.0, cx + 12.0, cy + 12.0, 7.0),
+            t.button,
+        );
+        cv.stroke_rrect(
+            &rrect(cx - 11.5, cy - 11.5, cx + 11.5, cy + 11.5, 6.5),
+            hair,
+            1.0,
+            Stroke::Plain,
+        );
         let named = row.name.is_some();
-        draw_icon(
-            g,
-            dc,
+        paint_icon(
+            cv,
             if named { Icon::Check } else { Icon::Focus },
             cx,
             cy,
             14.0,
-            &ink,
+            ink,
         );
         let value = crate::history_model::minutes_text(row.minutes);
         let vx = MONTH_W - PAD - 4.0;
-        crate::ui::text_num(g, dc, &value, &f.body, vx, ry, ROW_H, &ink);
+        num_text(cv, &value, &f.body, vx, ry, ROW_H, ink);
         let bar_r = vx - 76.0 - crate::ui::NUM_COL_GAP;
         let bar_l = bar_r - 64.0;
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(bar_l, cy - 2.0, bar_r, cy + 2.0, 2.0),
-                &brush(dc, t.button),
-            );
-            dc.FillRoundedRectangle(
-                &rrect(
-                    bar_l,
-                    cy - 2.0,
-                    bar_l + (64.0 * row.share).max(4.0),
-                    cy + 2.0,
-                    2.0,
-                ),
-                &ink,
-            );
-        }
+        cv.fill_rrect(&rrect(bar_l, cy - 2.0, bar_r, cy + 2.0, 2.0), t.button);
+        cv.fill_rrect(
+            &rrect(
+                bar_l,
+                cy - 2.0,
+                bar_l + (64.0 * row.share).max(4.0),
+                cy + 2.0,
+                2.0,
+            ),
+            ink,
+        );
         let name = row.name.clone().unwrap_or_else(|| "No task".into());
         let nx = cx + 12.0 + 10.0;
-        text(
-            dc,
-            &ellipsize(g, &name, &f.body, bar_l - 10.0 - nx),
+        cv.text(
+            &ellipsize(&name, &f.body, bar_l - 10.0 - nx),
             &f.body,
             nx,
             ry,
             bar_l - 10.0 - nx,
             ROW_H,
-            if named { &ink } else { &muted },
+            if named { ink } else { muted },
         );
     }
 }
 
-fn ellipsize(g: &Shared, s: &str, fmt: &IDWriteTextFormat, max: f32) -> String {
-    if g.text_width(s, fmt) <= max {
+fn ellipsize(s: &str, fmt: &Font, max: f32) -> String {
+    if text_width(s, fmt) <= max {
         return s.to_string();
     }
     let chars: Vec<char> = s.chars().collect();
     (1..chars.len())
         .rev()
         .map(|n| chars[..n].iter().collect::<String>().trim_end().to_string() + "…")
-        .find(|c| g.text_width(c, fmt) <= max)
+        .find(|c| text_width(c, fmt) <= max)
         .unwrap_or_default()
 }
 
-fn kbd(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    label: &str,
-    x: f32,
-    y: f32,
-) -> f32 {
-    let w = g.text_width(label, &f.small) + 12.0;
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(x, y, x + w, y + 20.0, 6.0), &brush(dc, t.button));
-        dc.DrawRoundedRectangle(
-            &rrect(x + 0.5, y + 0.5, x + w - 0.5, y + 19.5, 5.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
-    center_text(
-        g,
-        dc,
-        label,
-        &f.small,
-        x + w / 2.0,
-        y + 2.0,
-        16.0,
-        &brush(dc, t.text),
+fn kbd(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, label: &str, x: f32, y: f32) -> f32 {
+    let w = text_width(label, &f.small) + 12.0;
+    cv.fill_rrect(&rrect(x, y, x + w, y + 20.0, 6.0), t.button);
+    cv.stroke_rrect(
+        &rrect(x + 0.5, y + 0.5, x + w - 0.5, y + 19.5, 5.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
     );
+    cv.center_text(label, &f.small, x + w / 2.0, y + 2.0, 16.0, t.text);
     w
 }
 
-fn key_hint(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, y: f32) {
-    let muted = brush(dc, t.muted);
+fn key_hint(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, y: f32) {
+    let muted = t.muted;
     let mut x = PAD;
     for (i, (keys, what)) in [
         (&["←", "→"][..], "a day"),
@@ -865,24 +710,23 @@ fn key_hint(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, y: f32) {
             x += 6.0;
         }
         for k in *keys {
-            x += kbd(g, dc, t, f, k, x, y) + 6.0;
+            x += kbd(cv, t, f, k, x, y) + 6.0;
         }
-        let ww = g.text_width(what, &f.small);
-        text(dc, what, &f.small, x, y + 2.0, ww + 2.0, 16.0, &muted);
+        let ww = text_width(what, &f.small);
+        cv.text(what, &f.small, x, y + 2.0, ww + 2.0, 16.0, muted);
         x += ww + 6.0;
     }
 }
 
 fn compact(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     v: &View,
     action: Option<Rect>,
     action_hover: bool,
 ) {
-    let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
+    let (ink, muted) = (t.text, t.muted);
     let lw = compact_text_w();
     let y = 62.0;
     match &v.body {
@@ -891,105 +735,80 @@ fn compact(
             text: body,
             action: label,
         } => {
-            text(dc, title, &f.title, PAD, y, lw, 18.0, &ink);
-            text(dc, body, &f.small_wrap, PAD, y + 22.0, lw, 60.0, &muted);
+            cv.text(title, &f.title, PAD, y, lw, 18.0, ink);
+            cv.text(body, &f.small_wrap, PAD, y + 22.0, lw, 60.0, muted);
             if let Some(r) = action {
-                unsafe {
-                    dc.FillRoundedRectangle(
-                        &rrect(r.0, r.1, r.2, r.3, 16.0),
-                        &brush(
-                            dc,
-                            if action_hover {
-                                with_alpha(t.text, 0.86)
-                            } else {
-                                t.text
-                            },
-                        ),
-                    );
-                }
-                center_text(
-                    g,
-                    dc,
-                    label,
-                    &f.title,
-                    (r.0 + r.2) / 2.0,
-                    r.1,
-                    32.0,
-                    &brush(dc, t.panel),
+                cv.fill_rrect(
+                    &rrect(r.0, r.1, r.2, r.3, 16.0),
+                    if action_hover {
+                        with_alpha(t.text, 0.86)
+                    } else {
+                        t.text
+                    },
                 );
+                cv.center_text(label, &f.title, (r.0 + r.2) / 2.0, r.1, 32.0, t.panel);
             }
         }
         Body::FirstWeek { value, since, note } => {
-            draw_parts(g, dc, f, t, value, PAD, y);
-            text(dc, since, &f.small, PAD, y + 34.0, lw, 16.0, &ink);
-            text(dc, note, &f.small_wrap, PAD, y + 60.0, lw, 80.0, &muted);
+            draw_parts(cv, f, t, value, PAD, y);
+            cv.text(since, &f.small, PAD, y + 34.0, lw, 16.0, ink);
+            cv.text(note, &f.small_wrap, PAD, y + 60.0, lw, 80.0, muted);
         }
         Body::Loading { done, total } => {
-            draw_icon(g, dc, Icon::Refresh, PAD + 7.0, y + 9.0, 14.0, &ink);
-            text(
-                dc,
+            paint_icon(cv, Icon::Refresh, PAD + 7.0, y + 9.0, 14.0, ink);
+            cv.text(
                 "Syncing with your phone",
                 &f.title,
                 PAD + 22.0,
                 y,
                 lw - 22.0,
                 18.0,
-                &ink,
+                ink,
             );
-            text(
-                dc,
+            cv.text(
                 "This PC's log is shown now. Days from your phone fill in as they arrive.",
                 &f.small_wrap,
                 PAD,
                 y + 22.0,
                 lw,
                 48.0,
-                &muted,
+                muted,
             );
             let by = y + 22.0 + 48.0 + 12.0;
             let share = *done as f32 / (*total).max(1) as f32;
-            unsafe {
-                dc.FillRoundedRectangle(
-                    &rrect(PAD, by, PAD + lw, by + 4.0, 2.0),
-                    &brush(dc, t.button),
-                );
-                dc.FillRoundedRectangle(
-                    &rrect(PAD, by, PAD + (lw * share).max(4.0), by + 4.0, 2.0),
-                    &ink,
-                );
-            }
-            text(
-                dc,
+            cv.fill_rrect(&rrect(PAD, by, PAD + lw, by + 4.0, 2.0), t.button);
+            cv.fill_rrect(
+                &rrect(PAD, by, PAD + (lw * share).max(4.0), by + 4.0, 2.0),
+                ink,
+            );
+            cv.text(
                 &format!("{done} of {total} days"),
                 &f.small,
                 PAD,
                 by + 10.0,
                 lw,
                 16.0,
-                &muted,
+                muted,
             );
-            unsafe {
-                let sk = brush(dc, t.button);
-                dc.FillRoundedRectangle(&rrect(PAD, by + 40.0, PAD + 72.0, by + 52.0, 6.0), &sk);
-                dc.FillRoundedRectangle(
-                    &rrect(PAD + 82.0, by + 40.0, PAD + 138.0, by + 52.0, 6.0),
-                    &sk,
-                );
-            }
+            let sk = t.button;
+            cv.fill_rrect(&rrect(PAD, by + 40.0, PAD + 72.0, by + 52.0, 6.0), sk);
+            cv.fill_rrect(
+                &rrect(PAD + 82.0, by + 40.0, PAD + 138.0, by + 52.0, 6.0),
+                sk,
+            );
         }
         Body::Full { .. } => {}
     }
     let c = (SMALL_W - 6.0 * SMALL_GAP) / 7.0;
-    weekday_row(g, dc, t, f, COMPACT_W - PAD - SMALL_W, c, SMALL_GAP, y);
-    for (i, (cv, r)) in v.cells.iter().zip(cell_rects(v)).enumerate() {
-        cell(g, dc, t, f, cv, &r, 6.0, true, v.focus == Some(i));
+    weekday_row(cv, t, f, COMPACT_W - PAD - SMALL_W, c, SMALL_GAP, y);
+    for (i, (cl, r)) in v.cells.iter().zip(cell_rects(v)).enumerate() {
+        cell(cv, t, f, cl, &r, 6.0, true, v.focus == Some(i));
     }
 }
 
 /// The day detail: above a month square (its caret pointing down), or beside a year square.
 fn tooltip(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     d: &Detail,
@@ -998,18 +817,18 @@ fn tooltip(
     pw: f32,
     ph: f32,
 ) {
-    let value_w = g.text_width(&d.value, &f.body)
+    let value_w = text_width(&d.value, &f.body)
         + if d.note.is_empty() {
             0.0
         } else {
-            4.0 + g.text_width(&d.note, &f.body)
+            4.0 + text_width(&d.note, &f.body)
         };
-    let mut w = g.text_width(&d.title, &f.title).max(value_w);
+    let mut w = text_width(&d.title, &f.title).max(value_w);
     if !d.line.is_empty() {
-        w = w.max(g.text_width(&d.line, &f.small));
+        w = w.max(text_width(&d.line, &f.small));
     }
     for (a, b) in &d.rows {
-        w = w.max(g.text_width(a, &f.small) + 16.0 + g.text_width(b, &f.small));
+        w = w.max(text_width(a, &f.small) + 16.0 + text_width(b, &f.small));
     }
     let w = (w + 26.0).ceil();
     let mut h = 10.0 + 16.0 + 4.0 + 18.0 + 10.0;
@@ -1068,79 +887,74 @@ fn tooltip(
             )
         }
     };
-    let bg = brush(dc, t.surface);
-    let hair = brush(dc, t.hair);
-    unsafe {
-        // A soft shadow: a few faint rings under the box.
-        let shadow = brush(dc, rgba(0x000000, if t.dark { 0.10 } else { 0.025 }));
-        for i in 1..=4 {
-            let s = i as f32 * 2.0;
-            dc.FillRoundedRectangle(
-                &rrect(
-                    x - s * 0.5,
-                    y - s * 0.25 + 2.0,
-                    x + w + s * 0.5,
-                    y + h + s,
-                    12.0 + s,
-                ),
-                &shadow,
-            );
-        }
-        dc.FillRoundedRectangle(&rrect(x, y, x + w, y + h, 12.0), &bg);
-        dc.DrawRoundedRectangle(
-            &rrect(x + 0.5, y + 0.5, x + w - 0.5, y + h - 0.5, 11.5),
-            &hair,
-            1.0,
-            None,
+    let bg = t.surface;
+    let hair = t.hair;
+    // A soft shadow: a few faint rings under the box.
+    let shadow = rgba(0x000000, if t.dark { 0.10 } else { 0.025 });
+    for i in 1..=4 {
+        let s = i as f32 * 2.0;
+        cv.fill_rrect(
+            &rrect(
+                x - s * 0.5,
+                y - s * 0.25 + 2.0,
+                x + w + s * 0.5,
+                y + h + s,
+                12.0 + s,
+            ),
+            shadow,
         );
-        let tri = path(g, caret[0], true, |k| {
-            line_to(k, caret[1]);
-            line_to(k, caret[2]);
-        });
-        dc.FillGeometry(&tri, &bg, None);
-        let edge = path(g, caret[0], false, |k| {
-            line_to(k, caret[1]);
-            line_to(k, caret[2]);
-        });
-        dc.DrawGeometry(&edge, &hair, 1.0, None);
     }
-    let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
+    cv.fill_rrect(&rrect(x, y, x + w, y + h, 12.0), bg);
+    cv.stroke_rrect(
+        &rrect(x + 0.5, y + 0.5, x + w - 0.5, y + h - 0.5, 11.5),
+        hair,
+        1.0,
+        Stroke::Plain,
+    );
+    let tri = path(caret[0], true, |k| {
+        line_to(k, caret[1]);
+        line_to(k, caret[2]);
+    });
+    cv.fill_path(&tri, bg);
+    let edge = path(caret[0], false, |k| {
+        line_to(k, caret[1]);
+        line_to(k, caret[2]);
+    });
+    cv.stroke_path(&edge, hair, 1.0, Stroke::Plain);
+    let (ink, muted) = (t.text, t.muted);
     let (tx, mut ty) = (x + 12.0, y + 10.0);
-    text(dc, &d.title, &f.title, tx, ty, w - 24.0, 16.0, &ink);
+    cv.text(&d.title, &f.title, tx, ty, w - 24.0, 16.0, ink);
     ty += 20.0;
-    let vw = g.text_width(&d.value, &f.body);
-    text(
-        dc,
+    let vw = text_width(&d.value, &f.body);
+    cv.text(
         &d.value,
         &f.body,
         tx,
         ty,
         vw + 2.0,
         18.0,
-        if d.quiet { &muted } else { &ink },
+        if d.quiet { muted } else { ink },
     );
     if !d.note.is_empty() {
-        text(dc, &d.note, &f.body, tx + vw + 4.0, ty, w, 18.0, &muted);
+        cv.text(&d.note, &f.body, tx + vw + 4.0, ty, w, 18.0, muted);
     }
     ty += 18.0;
     if !d.line.is_empty() {
-        text(dc, &d.line, &f.small, tx, ty + 2.0, w - 24.0, 16.0, &muted);
+        cv.text(&d.line, &f.small, tx, ty + 2.0, w - 24.0, 16.0, muted);
         ty += 18.0;
     }
     if !d.rows.is_empty() {
-        unsafe {
-            dc.DrawLine(
-                pt(tx, ty + 8.5),
-                pt(x + w - 12.0, ty + 8.5),
-                &hair,
-                1.0,
-                None,
-            );
-        }
+        cv.line(
+            pt(tx, ty + 8.5),
+            pt(x + w - 12.0, ty + 8.5),
+            hair,
+            1.0,
+            Stroke::Plain,
+        );
         ty += 16.0;
         for (a, b) in &d.rows {
-            text(dc, a, &f.small, tx, ty, w - 24.0, 16.0, &ink);
-            crate::ui::text_num(g, dc, b, &f.small, x + w - 12.0, ty, 16.0, &muted);
+            cv.text(a, &f.small, tx, ty, w - 24.0, 16.0, ink);
+            num_text(cv, b, &f.small, x + w - 12.0, ty, 16.0, muted);
             ty += 20.0;
         }
     }

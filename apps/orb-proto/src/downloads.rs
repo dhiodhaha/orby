@@ -40,8 +40,7 @@ use crate::panels::{self, Kind};
 use crate::pill::dismiss_pill;
 use crate::ui::{self, Icon, Pill, PillAction};
 use crate::{
-    habits, log_line, px, start_anim, store, tasks, with_app, App, MSG_MOUSELEAVE, TIMER_PILL,
-    WM_APP_DL,
+    habits, log_line, px, start_anim, store, with_app, App, MSG_MOUSELEAVE, TIMER_PILL, WM_APP_DL,
 };
 
 const GITHUB: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
@@ -315,7 +314,7 @@ pub fn start(app: &mut App) {
 
 /// WM_CLIPBOARDUPDATE: the text is read only to match a media link; nothing is fetched.
 pub fn on_clipboard(app: &mut App) {
-    let Some(text) = tasks::read_clipboard(app.hwnd) else {
+    let Some(text) = crate::sys::read_clipboard(app) else {
         return;
     };
     let text = text.trim().to_string();
@@ -1037,7 +1036,7 @@ fn done_path(app: &App, id: JobId) -> Option<PathBuf> {
 
 /// Paste in the panel, or tray "Paste a link into Downloads".
 pub fn paste(app: &mut App) {
-    let text = tasks::read_clipboard(app.hwnd).unwrap_or_default();
+    let text = crate::sys::read_clipboard(app).unwrap_or_default();
     match dm::paste_verdict(&text) {
         Ok(link) => {
             app.dl.field = Field::Empty;
@@ -1112,11 +1111,17 @@ pub fn height(app: &App) -> f32 {
 }
 
 pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
-    dp::draw(&app.g, dc, &app.theme, &app.fonts, &view(app), hover);
+    dp::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &view(app),
+        hover,
+    );
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    dp::hit(&app.g, &app.fonts, &view(app), x, y)
+    dp::hit(&app.fonts, &view(app), x, y)
 }
 
 pub fn click(app: &mut App, h: Hit) {
@@ -1271,7 +1276,13 @@ fn render_menu(app: &mut App) {
         return;
     };
     let dc = s.begin(&app.g);
-    dp::draw_menu(&app.g, dc, &app.theme, &app.fonts, chosen, hover);
+    dp::draw_menu(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        chosen,
+        hover,
+    );
     s.end(&app.g);
 }
 
@@ -1347,7 +1358,7 @@ pub fn open_offer_menu(app: &mut App) {
 fn open_job_menu(app: &mut App, row: usize, id: JobId) {
     let v = view(app);
     let (Some(chip), Some(job)) = (
-        dp::btn_rect(&app.g, &app.fonts, &v, row, Btn::Format),
+        dp::btn_rect(&app.fonts, &v, row, Btn::Format),
         app.dl.queue.get(id),
     ) else {
         return;

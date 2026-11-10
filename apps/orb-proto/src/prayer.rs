@@ -450,6 +450,7 @@ pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<panel::Hit>)
         qibla: format!("{:.0}° {}", b, qibla::compass(b)),
         reminders: app.settings.prefs.prayer_reminders,
         hover,
+        countdown_apart: false,
     };
     panel::draw(
         &mut crate::gfx::D2dCanvas::new(&app.g, dc),

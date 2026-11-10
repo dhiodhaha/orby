@@ -72,12 +72,8 @@ fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
     let (x, y) = (x - ox, y - oy);
     match app.panel_kind {
         Kind::Prayer => panel::hit(&app.fonts, x, y).map(Hit::Prayer),
-        Kind::Focus => {
-            focus_panel::hit(&app.g, &app.fonts, &habits::focus_view(app), x, y).map(Hit::Focus)
-        }
-        Kind::Drink => {
-            drink_panel::hit(&app.g, &app.fonts, &habits::drink_view(app), x, y).map(Hit::Drink)
-        }
+        Kind::Focus => focus_panel::hit(&app.fonts, &habits::focus_view(app), x, y).map(Hit::Focus),
+        Kind::Drink => drink_panel::hit(&app.fonts, &habits::drink_view(app), x, y).map(Hit::Drink),
         Kind::Tasks => tasks::hit(app, x, y).map(Hit::Tasks),
         Kind::Today => calendar::hit(app, x, y).map(Hit::Today),
         Kind::Downloads => downloads::hit(app, x, y).map(Hit::Downloads),
@@ -410,22 +406,22 @@ fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>)
         ),
         Kind::Focus => habits::draw_focus_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Focus(p) = h { Some(p) } else { None }),
         ),
         Kind::Drink => habits::draw_drink_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Drink(p) = h { Some(p) } else { None }),
         ),
         Kind::Tasks => tasks::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Tasks(p) = h { Some(p) } else { None }),
         ),
         Kind::Today => calendar::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Today(p) = h { Some(p) } else { None }),
         ),
         Kind::Downloads => downloads::draw_panel(
@@ -441,7 +437,7 @@ fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>)
         ),
         Kind::History => history::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| {
                 if let Hit::History(p) = h {
                     Some(p)
@@ -452,7 +448,7 @@ fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>)
         ),
         Kind::Notices => notices::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| {
                 if let Hit::Notices(p) = h {
                     Some(p)

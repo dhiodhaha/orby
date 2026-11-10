@@ -1,29 +1,26 @@
-//! Tasks on the orb, on `app_store` (`%APPDATA%\orb-proto\app.db`) and `app_quickadd`: the
+//! Tasks on the orb, on `app_store` (`app.db` in the data folder) and `app_quickadd`: the
 //! Tasks panel's state and input, the one exact timer to the next due task (its pill has Done),
 //! and the overdue count behind the orb's badge. tasks_model.rs decides; tasks_panel.rs draws.
+//! Shared by both systems: everything it asks of the system goes through `crate::sys`.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 use app_habits::held::Priority;
 use app_quickadd as qa;
 use app_store::{DeviceId, EntityRef, ListId, Snapshot, Store, Task, TaskId, UserId};
 
+use crate::canvas::Canvas;
 use crate::panels::{self, Kind};
 use crate::pill::dismiss_pill;
+use crate::sys::{self, vk, Timer};
 use crate::tasks_model::{self as m, Clock, Row, Selection, SideKey, Stamp, Tab};
 use crate::tasks_panel::{self as tp, FieldView, RowView, View};
 use crate::textfield::{Key, TextField};
 use crate::ui::{Icon, Pill, PillAction};
-use crate::{habits, log_line, notices, orb, prayer, App, TIMER_TASKS};
+use crate::{habits, log_line, notices, orb, prayer, App};
 
 const GRAMMAR: &str = "# list · / folder · @ person";
 
@@ -85,10 +82,13 @@ fn write_config(path: &Path, c: &Config) {
 }
 
 fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    sys::unix_ms()
+}
+
+/// Who you are in the store: the account name (Windows `USERNAME`, macOS `USER`).
+fn user_name() -> Option<String> {
+    let var = if cfg!(windows) { "USERNAME" } else { "USER" };
+    std::env::var(var).ok().filter(|s| !s.is_empty())
 }
 
 /// Local now, read once.
@@ -119,12 +119,7 @@ impl Tasks {
         if cfg.device.is_empty() {
             cfg.device = format!("pc-{:x}{:x}", unix_ms(), std::process::id());
         }
-        let me = UserId(
-            std::env::var("USERNAME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "me".into()),
-        );
+        let me = UserId(user_name().unwrap_or_else(|| "me".into()));
         let (mut store, store_error) =
             match Store::open(dir.join("app.db"), DeviceId(cfg.device.clone()), me.clone()) {
                 Ok(s) => (s, None),
@@ -238,9 +233,7 @@ fn report(app: &mut App, what: &str, r: app_store::Result<()>) {
 /// One exact timer to whichever comes first: the next timed task's minute, the minute a prayer
 /// marker leaves Today, or midnight (all-day tasks turn overdue and Today turns over then).
 pub fn schedule(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_TASKS);
-    }
+    sys::disarm(app, Timer::Tasks);
     let c = clock();
     let midnight = (m::add_days(c.today, 1), 0);
     let next = m::next_due_after(&app.tasks.snap, app.tasks.fired_until);
@@ -254,9 +247,7 @@ pub fn schedule(app: &mut App) {
     } else {
         habits::ms_until(habits::now(), moment_of(target))
     };
-    unsafe {
-        SetTimer(Some(app.hwnd), TIMER_TASKS, ms, None);
-    }
+    sys::arm(app, Timer::Tasks, ms);
     let next = next.map_or("none".to_string(), |(d, mi)| {
         format!("{} {}", m::weekday_name(d), m::hhmm(mi))
     });
@@ -265,9 +256,7 @@ pub fn schedule(app: &mut App) {
 }
 
 pub fn on_timer(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_TASKS);
-    }
+    sys::disarm(app, Timer::Tasks);
     // At midnight this fires before the 10 s stats timer, so load the new day's prayer times
     // first or Today would draw the new date without its markers.
     prayer::refresh_day(app);
@@ -431,7 +420,7 @@ pub fn add_from_today(app: &mut App) {
 pub fn on_panel_shown(app: &mut App) {
     let ok = panels::take_keyboard(app);
     // WM_ACTIVATE arrives inside that call, while the App is borrowed, so read the result.
-    app.tasks.focused = unsafe { GetForegroundWindow() } == app.panel_hwnd;
+    app.tasks.focused = sys::panel_is_key(app);
     log_line(
         app,
         &format!("tasks: panel takes the keyboard (foreground={ok})"),
@@ -661,7 +650,10 @@ pub fn view(app: &App) -> View {
     };
     let sync = match &t.store_error {
         Some(_) => "Couldn't open app.db, changes aren't saved".to_string(),
-        None => "On this PC only · sync is off".to_string(),
+        None => format!(
+            "On this {} only · sync is off",
+            crate::settings_model::os::W.device
+        ),
     };
     let understood = t.notice.clone().unwrap_or(understood);
     let side_scroll = t.side_scroll.clamp(0.0, tp::side_max_scroll(side.len()));
@@ -683,13 +675,13 @@ pub fn view(app: &App) -> View {
     }
 }
 
-pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<tp::Hit>) {
+pub fn draw_panel(app: &App, cv: &mut dyn Canvas, hover: Option<tp::Hit>) {
     let v = view(app);
-    tp::draw(&app.g, dc, &app.theme, &app.fonts, &v, hover);
+    tp::draw(cv, &app.theme, &app.fonts, &v, hover);
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<tp::Hit> {
-    tp::hit(&app.g, &app.fonts, &view(app), x, y)
+    tp::hit(&app.fonts, &view(app), x, y)
 }
 
 fn toggle_collapsed(app: &mut App, id: &str) {
@@ -735,10 +727,10 @@ pub fn click(app: &mut App, h: tp::Hit) {
             app.tasks.field.clear();
         }
         tp::Hit::Share => {
-            app.tasks.notice = Some(
-                "Sharing a space comes with sync, in a later update. Everything stays on this PC."
-                    .into(),
-            )
+            app.tasks.notice = Some(format!(
+                "Sharing a space comes with sync, in a later update. Everything stays on this {}.",
+                crate::settings_model::os::W.device
+            ))
         }
         tp::Hit::Add => return submit(app),
         tp::Hit::AllTasks => return crate::tasks_window::show(app),
@@ -782,8 +774,8 @@ pub fn click(app: &mut App, h: tp::Hit) {
 /// A press in the field puts the caret there (Shift extends the selection).
 pub fn press_field(app: &mut App, x: f32) {
     let v = view(app);
-    let b = tp::field_byte_at(&app.g, &app.fonts, &v, x);
-    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+    let b = tp::field_byte_at(&app.fonts, &v, x);
+    let shift = sys::shift_down();
     app.tasks.field.place(b, shift);
     panels::refresh(app);
 }
@@ -843,62 +835,39 @@ fn submit(app: &mut App) {
 }
 
 fn paste(app: &mut App) {
-    if let Some(s) = read_clipboard(app.panel_hwnd) {
+    if let Some(s) = sys::read_clipboard(app) {
         app.tasks.field.insert(&s);
     }
 }
 
-/// The clipboard's text (CF_UNICODETEXT), up to 4096 characters.
-pub fn read_clipboard(owner: HWND) -> Option<String> {
-    unsafe {
-        if OpenClipboard(Some(owner)).is_err() {
-            return None;
-        }
-        let mut out = None;
-        if let Ok(h) = GetClipboardData(13) {
-            let hg = windows::Win32::Foundation::HGLOBAL(h.0);
-            let p = GlobalLock(hg) as *const u16;
-            if !p.is_null() {
-                let mut n = 0;
-                while *p.add(n) != 0 && n < 4096 {
-                    n += 1;
-                }
-                out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
-                let _ = GlobalUnlock(hg);
-            }
-        }
-        let _ = CloseClipboard();
-        out
-    }
-}
-
-/// WM_KEYDOWN on the panel: editing keys, Enter adds, Ctrl+A and Ctrl+V.
-pub fn on_keydown(app: &mut App, vk: u16) -> bool {
-    let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-    let key = match VIRTUAL_KEY(vk) {
-        VK_LEFT => Some(Key::Left),
-        VK_RIGHT => Some(Key::Right),
-        VK_HOME => Some(Key::Home),
-        VK_END => Some(Key::End),
-        VK_BACK => Some(Key::Backspace),
-        VK_DELETE => Some(Key::Delete),
+/// A key on the panel (WM_KEYDOWN on Windows, the input view on the Mac): editing keys, Enter
+/// adds, Ctrl+A and Ctrl+V.
+pub fn on_keydown(app: &mut App, k: u16) -> bool {
+    let ctrl = sys::ctrl_down();
+    let shift = sys::shift_down();
+    let key = match k {
+        vk::VK_LEFT => Some(Key::Left),
+        vk::VK_RIGHT => Some(Key::Right),
+        vk::VK_HOME => Some(Key::Home),
+        vk::VK_END => Some(Key::End),
+        vk::VK_BACK => Some(Key::Backspace),
+        vk::VK_DELETE => Some(Key::Delete),
         _ => None,
     };
-    if let Some(k) = key {
-        app.tasks.field.key(k, ctrl, shift);
+    if let Some(key) = key {
+        app.tasks.field.key(key, ctrl, shift);
     } else {
-        match VIRTUAL_KEY(vk) {
-            VK_RETURN => {
+        match k {
+            vk::VK_RETURN => {
                 submit(app);
                 return true;
             }
-            VK_ESCAPE => {
+            vk::VK_ESCAPE => {
                 on_esc(app);
                 return true;
             }
-            VIRTUAL_KEY(0x41) if ctrl => app.tasks.field.select_all(),
-            VIRTUAL_KEY(0x56) if ctrl => paste(app),
+            0x41 if ctrl => app.tasks.field.select_all(),
+            0x56 if ctrl => paste(app),
             _ => return false,
         }
     }

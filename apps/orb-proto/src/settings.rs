@@ -1,42 +1,32 @@
-//! The Settings window and the first run. settings_model.rs holds the values, settings_panel.rs
-//! draws; this file keeps `settings.json` (shared with the calendar link, each writer keeps the
-//! other's keys), registers the global shortcut, writes the HKCU Run entry, asks Windows location
-//! on a worker thread, and applies every change at once: the theme, the shortcut, the place and
-//! the prayer reminders, the notice mutes.
+//! The Settings window and the first run, on both systems. settings_model.rs holds the values,
+//! settings_panel.rs draws; this file keeps `settings.json` (shared with the calendar link, each
+//! writer keeps the other's keys), runs the shortcut's capture, the place and its city search,
+//! the sections and the first run's steps, and applies every change at once: the theme, the
+//! shortcut, the place and the prayer reminders, the notice mutes.
+//!
+//! Everything it asks of the system goes through `settings_sys`: the window (Windows:
+//! settings_window.rs over Win32 and DirectComposition; macOS: mac/settings_win.rs, an NSWindow),
+//! the global shortcut (RegisterHotKey / a Carbon hot key), start at login (the HKCU Run entry /
+//! SMAppService) and a location fix (the WinRT Geolocator; none on the Mac).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 use serde_json::{Map, Value};
-use windows::core::{w, HSTRING, PCWSTR};
-use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
-use windows::Foundation::TimeSpan;
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Registry::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::gfx::Surface;
-use crate::hook::unpack;
 use crate::notices::{self, Notice, Priority, Source};
 use crate::orb;
 use crate::settings_model::{
     self as m, Capture, CaptureKey, Locate, Place, Prefs, Section, Shortcut, Startup, Step,
 };
 use crate::settings_panel::{self as sp, CityPick, Hit, Screen, SourceRow, View};
+use crate::settings_sys;
+use crate::sys::{self, vk};
 use crate::textfield::{Key, TextField};
 use crate::ui::{self, DialChild, Icon, Pill, PillAction};
-use crate::{
-    dial, log_line, panels, pill, prayer, px, with_app, App, HOTKEY_PROBE, HOTKEY_TOGGLE,
-    MSG_MOUSELEAVE, WM_APP_LOCATE,
-};
+use crate::{dial, log_line, panels, pill, prayer, App};
 
 const SETTINGS: &str = "settings.json";
-const RUN: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const APPROVED: PCWSTR =
-    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
 /// The notice sources the Notices section can switch off, in the panel's order.
 const SOURCES: [(Source, &str); 6] = [
     (
@@ -56,34 +46,33 @@ const SOURCES: [(Source, &str); 6] = [
 pub struct Settings {
     pub prefs: Prefs,
     dir: PathBuf,
-    pub hwnd: HWND,
-    surface: Option<Surface>,
+    /// The window and what the system keeps for it (settings_sys).
+    pub win: settings_sys::Win,
     /// What the window shows; None while it is hidden.
     pub screen: Option<Screen>,
-    hover: Option<Hit>,
-    focus: Option<Hit>,
-    tracking: bool,
-    scroll: f32,
-    capture: Option<Capture>,
+    pub(crate) hover: Option<Hit>,
+    pub(crate) focus: Option<Hit>,
+    pub(crate) scroll: f32,
+    pub(crate) capture: Option<Capture>,
     taken: Option<Shortcut>,
     /// The shortcut in use is registered (another app may hold it).
     pub hotkey_ok: bool,
     suggestion: Option<Shortcut>,
     /// The first run's "try it": the shortcut was pressed on the shortcut step.
     tried: bool,
-    want_windows: bool,
-    locate: Locate,
+    pub(crate) want_windows: bool,
+    pub(crate) locate: Locate,
     loc_rx: Option<Receiver<Locate>>,
     /// The radio's city: the first run's draft, or the city in use.
-    city: Option<String>,
-    picking: bool,
-    field: TextField,
+    pub(crate) city: Option<String>,
+    pub(crate) picking: bool,
+    pub(crate) field: TextField,
     rows: Vec<usize>,
     sel: usize,
     list_scroll: usize,
-    /// The first run's Start with Windows, written at Finish.
+    /// The first run's Start with Windows (Open at login), written at Finish.
     fr_start: bool,
-    startup: Startup,
+    pub(crate) startup: Startup,
     undo_shortcut: Option<Shortcut>,
 }
 
@@ -111,22 +100,20 @@ pub fn update_map(dir: &Path, f: impl FnOnce(&mut Map<String, Value>)) {
 }
 
 impl Settings {
-    pub fn load(dir: &Path, hwnd: HWND) -> Settings {
+    pub fn load(dir: &Path, win: settings_sys::Win) -> Settings {
         let prefs = Prefs::from_map(&read_map(dir));
         let city = match &prefs.place {
             Place::City { name } => Some(name.clone()),
             Place::Windows { .. } => None,
         };
         Settings {
-            want_windows: prefs.place.is_windows(),
+            want_windows: prefs.place.is_windows() && settings_sys::HAS_LOCATION,
             prefs,
             dir: dir.to_path_buf(),
-            hwnd,
-            surface: None,
+            win,
             screen: None,
             hover: None,
             focus: None,
-            tracking: false,
             scroll: 0.0,
             capture: None,
             taken: None,
@@ -141,7 +128,7 @@ impl Settings {
             rows: Vec::new(),
             sel: 0,
             list_scroll: 0,
-            fr_start: true,
+            fr_start: m::os::W.start_default,
             startup: Startup::Off,
             undo_shortcut: None,
         }
@@ -153,9 +140,9 @@ fn save(app: &mut App) {
     update_map(&app.settings.dir, |m| p.write_into(m));
 }
 
-/// The theme the app draws with, from the setting and Windows.
+/// The theme the app draws with, from the setting and the system's own.
 pub fn theme_now(prefs: &Prefs) -> ui::Theme {
-    ui::theme(prefs.theme.is_dark(ui::windows_dark()))
+    ui::theme(prefs.theme.is_dark(settings_sys::system_dark()))
 }
 
 // ---- launch ----
@@ -164,7 +151,7 @@ pub fn theme_now(prefs: &Prefs) -> ui::Theme {
 /// Windows location when the place follows it.
 pub fn start(app: &mut App) {
     let s = app.settings.prefs.shortcut;
-    app.settings.hotkey_ok = register(app, s);
+    app.settings.hotkey_ok = settings_sys::register(app, s);
     log_line(
         app,
         &format!(
@@ -173,7 +160,7 @@ pub fn start(app: &mut App) {
             app.settings.hotkey_ok
         ),
     );
-    if !app.settings.prefs.first_run_done {
+    if !app.settings.prefs.first_run_done && !settings_sys::no_first_run() {
         // At sign-in the welcome must not pull the keyboard out of whatever you already opened.
         first_run(app, false);
         return;
@@ -182,7 +169,7 @@ pub fn start(app: &mut App) {
         let p = Pill {
             icon: Icon::Keyboard,
             dot: false,
-            title: format!("Couldn't use {}", s.label()),
+            title: format!("Couldn't use {}", s.shown()),
             value: "another app uses it".into(),
             action: Some(("Change".into(), PillAction::OpenSettings)),
             closable: true,
@@ -194,54 +181,19 @@ pub fn start(app: &mut App) {
         orb::set_visible(app, false);
         notices::on_user_visibility(app);
     }
-    if app.settings.prefs.place.is_windows() {
+    if app.settings.prefs.place.is_windows() && settings_sys::HAS_LOCATION {
         locate(app);
     }
 }
 
 // ---- the shortcut ----
 
-fn register(app: &App, s: Shortcut) -> bool {
-    unsafe {
-        RegisterHotKey(
-            Some(app.hwnd),
-            HOTKEY_TOGGLE,
-            HOT_KEY_MODIFIERS(s.mods()) | MOD_NOREPEAT,
-            s.vk,
-        )
-        .is_ok()
-    }
-}
-
-fn unregister(app: &App) {
-    unsafe {
-        let _ = UnregisterHotKey(Some(app.hwnd), HOTKEY_TOGGLE);
-    }
-}
-
-/// Whether another app holds `s`: register it under a spare id and let it go again.
-fn is_free(app: &App, s: Shortcut) -> bool {
-    unsafe {
-        let ok = RegisterHotKey(
-            Some(app.hwnd),
-            HOTKEY_PROBE,
-            HOT_KEY_MODIFIERS(s.mods()) | MOD_NOREPEAT,
-            s.vk,
-        )
-        .is_ok();
-        if ok {
-            let _ = UnregisterHotKey(Some(app.hwnd), HOTKEY_PROBE);
-        }
-        ok
-    }
-}
-
 /// Moves the shortcut to `s`. On failure the old one stays (registered again) and the card says
 /// which one is taken.
 fn set_shortcut(app: &mut App, s: Shortcut) -> bool {
     let old = app.settings.prefs.shortcut;
-    unregister(app);
-    if register(app, s) {
+    settings_sys::unregister(app);
+    if settings_sys::register(app, s) {
         app.settings.prefs.shortcut = s;
         app.settings.hotkey_ok = true;
         app.settings.taken = None;
@@ -249,7 +201,7 @@ fn set_shortcut(app: &mut App, s: Shortcut) -> bool {
         log_line(app, &format!("settings: shortcut now {}", s.label()));
         return true;
     }
-    app.settings.hotkey_ok = register(app, old);
+    app.settings.hotkey_ok = settings_sys::register(app, old);
     app.settings.taken = Some(s);
     log_line(
         app,
@@ -262,14 +214,14 @@ fn begin_capture(app: &mut App) {
     app.settings.capture = Some(Capture::default());
     app.settings.taken = None;
     // The shortcut in use must reach the window as keys, so it can be chosen again.
-    unregister(app);
-    take_foreground(app);
+    settings_sys::unregister(app);
+    settings_sys::take_foreground(app);
 }
 
-fn cancel_capture(app: &mut App) {
+pub(crate) fn cancel_capture(app: &mut App) {
     if app.settings.capture.take().is_some() {
         let s = app.settings.prefs.shortcut;
-        app.settings.hotkey_ok = register(app, s);
+        app.settings.hotkey_ok = settings_sys::register(app, s);
     }
 }
 
@@ -280,11 +232,11 @@ fn save_capture(app: &mut App) {
     app.settings.capture = None;
     let old = app.settings.prefs.shortcut;
     if s == old {
-        app.settings.hotkey_ok = register(app, s);
+        app.settings.hotkey_ok = settings_sys::register(app, s);
         return;
     }
     // The old shortcut was let go for the capture; set_shortcut registers one of the two.
-    app.settings.hotkey_ok = register(app, old);
+    app.settings.hotkey_ok = settings_sys::register(app, old);
     if set_shortcut(app, s) {
         app.settings.tried = false;
         app.settings.undo_shortcut = Some(old);
@@ -293,7 +245,7 @@ fn save_capture(app: &mut App) {
                 icon: Icon::Keyboard,
                 dot: false,
                 title: "Shortcut".into(),
-                value: format!("now {}", s.label()),
+                value: format!("now {}", s.shown()),
                 action: Some(("Undo".into(), PillAction::UndoShortcut)),
                 closable: true,
                 ttl_ms: 6000,
@@ -312,8 +264,9 @@ pub fn undo_shortcut(app: &mut App) {
     }
 }
 
+/// The shortcut in use, as this system names its keys.
 pub fn shortcut_label(app: &App) -> String {
-    app.settings.prefs.shortcut.label()
+    app.settings.prefs.shortcut.shown()
 }
 
 /// During the first run the shortcut belongs to its "try it", and the orb stays put.
@@ -329,75 +282,11 @@ pub fn on_shortcut_pressed(app: &mut App) {
     }
 }
 
-// ---- start with Windows ----
-
-fn run_name() -> HSTRING {
-    // A test drive names its own entry, so the real one is never touched.
-    HSTRING::from(std::env::var("ORB_RUN_VALUE").unwrap_or_else(|_| "orb-proto".into()))
-}
-
-fn read_startup() -> Startup {
-    let name = run_name();
-    unsafe {
-        let mut size = 0u32;
-        let present = RegGetValueW(
-            HKEY_CURRENT_USER,
-            RUN,
-            &name,
-            RRF_RT_REG_SZ,
-            None,
-            None,
-            Some(&mut size),
-        )
-        .is_ok();
-        if !present {
-            return Startup::Off;
-        }
-        let mut buf = [0u8; 12];
-        let mut n = buf.len() as u32;
-        let approved = RegGetValueW(
-            HKEY_CURRENT_USER,
-            APPROVED,
-            &name,
-            RRF_RT_REG_BINARY,
-            None,
-            Some(buf.as_mut_ptr() as *mut _),
-            Some(&mut n),
-        )
-        .is_ok();
-        // Task Manager marks a switched-off entry with an odd first byte (03, 07).
-        if approved && n > 0 && buf[0] & 1 == 1 {
-            Startup::Blocked
-        } else {
-            Startup::On
-        }
-    }
-}
+// ---- start with Windows (open at login) ----
 
 fn write_startup(app: &mut App, on: bool) {
-    let name = run_name();
-    let ok = unsafe {
-        if on {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let cmd: Vec<u16> = format!("\"{}\"", exe.display())
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                RUN,
-                &name,
-                REG_SZ.0,
-                Some(cmd.as_ptr() as *const _),
-                (cmd.len() * 2) as u32,
-            )
-            .is_ok()
-        } else {
-            let r = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN, &name);
-            r.is_ok() || r == ERROR_FILE_NOT_FOUND
-        }
-    };
-    app.settings.startup = read_startup();
+    let ok = settings_sys::write_startup(app, on);
+    app.settings.startup = settings_sys::read_startup();
     log_line(
         app,
         &format!(
@@ -408,58 +297,32 @@ fn write_startup(app: &mut App, on: bool) {
     );
 }
 
+/// The startup entry may have changed outside (Task Manager, Login Items, the menu bar): the
+/// General section reads it again.
+pub fn refresh_startup(app: &mut App) {
+    if matches!(
+        app.settings.screen,
+        Some(Screen::Settings(Section::General))
+    ) {
+        let now = settings_sys::read_startup();
+        if now != app.settings.startup {
+            app.settings.startup = now;
+            render(app);
+        }
+    }
+}
+
 // ---- the place ----
 
 fn locate(app: &mut App) {
-    if app.settings.locate == Locate::Finding {
+    if !settings_sys::HAS_LOCATION || app.settings.locate == Locate::Finding {
         return;
     }
     app.settings.locate = Locate::Finding;
     let (tx, rx) = channel();
     app.settings.loc_rx = Some(rx);
-    let hwnd = app.hwnd.0 as isize;
-    std::thread::spawn(move || {
-        let out = ask_windows();
-        let _ = tx.send(out);
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(hwnd as *mut _)),
-                WM_APP_LOCATE,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
-    });
+    settings_sys::find_location(app, tx);
     log_line(app, "settings: asking Windows location");
-}
-
-/// Windows location through the WinRT Geolocator: a fix up to 10 min old, or a new one within 10 s.
-fn ask_windows() -> Locate {
-    let r = (|| -> windows::core::Result<Locate> {
-        if Geolocator::RequestAccessAsync()?.join()? != GeolocationAccessStatus::Allowed {
-            return Ok(Locate::Off);
-        }
-        let g = Geolocator::new()?;
-        let ten_min = TimeSpan {
-            Duration: 10 * 60 * 10_000_000,
-        };
-        let ten_s = TimeSpan {
-            Duration: 10 * 10_000_000,
-        };
-        let pos = g
-            .GetGeopositionAsyncWithAgeAndTimeout(ten_min, ten_s)?
-            .join()?;
-        let p = pos.Coordinate()?.Point()?.Position()?;
-        Ok(Locate::Found {
-            lat: p.Latitude,
-            lng: p.Longitude,
-        })
-    })();
-    match r {
-        Ok(l) => l,
-        Err(e) if e.code() == E_ACCESSDENIED => Locate::Off,
-        Err(_) => Locate::Failed,
-    }
 }
 
 pub fn on_located(app: &mut App) {
@@ -517,6 +380,9 @@ fn shown_coords(app: &App) -> (f64, f64) {
 }
 
 fn choose_windows(app: &mut App) {
+    if !settings_sys::HAS_LOCATION {
+        return;
+    }
     app.settings.want_windows = true;
     match app.settings.locate {
         Locate::Found { lat, lng } if !matches!(app.settings.screen, Some(Screen::FirstRun(_))) => {
@@ -543,7 +409,7 @@ fn open_picker(app: &mut App) {
     app.settings.list_scroll = 0;
     keep_sel_in_view(app);
     app.settings.focus = None;
-    take_foreground(app);
+    settings_sys::take_foreground(app);
 }
 
 fn pick_city(app: &mut App, i: usize) {
@@ -572,17 +438,20 @@ fn on_field_changed(app: &mut App) {
     app.settings.list_scroll = 0;
 }
 
+/// The city search's text changed from outside the keys (a paste or cut on the Mac).
+#[cfg_attr(windows, allow(dead_code))]
+pub fn on_field_edited(app: &mut App) {
+    if app.settings.picking {
+        on_field_changed(app);
+        render(app);
+    }
+}
+
 // ---- the theme ----
 
 pub fn apply_theme(app: &mut App) {
     app.theme = theme_now(&app.settings.prefs);
-    orb::render_orb(app);
-    if app.pill.is_some() {
-        pill::render_pill(app);
-    }
-    panels::redraw(app);
-    crate::disk_window::redraw(app);
-    crate::tasks_window::redraw(app);
+    settings_sys::redraw_others(app);
     render(app);
     let dark = app.theme.dark;
     log_line(
@@ -594,9 +463,12 @@ pub fn apply_theme(app: &mut App) {
     );
 }
 
-/// WM_SETTINGCHANGE "ImmersiveColorSet": Windows switched between light and dark.
+/// The system switched between light and dark (Windows: WM_SETTINGCHANGE "ImmersiveColorSet";
+/// macOS: AppleInterfaceThemeChangedNotification).
 pub fn on_system_theme(app: &mut App) {
-    if app.settings.prefs.theme == m::ThemeMode::Windows && ui::windows_dark() != app.theme.dark {
+    if app.settings.prefs.theme == m::ThemeMode::Windows
+        && settings_sys::system_dark() != app.theme.dark
+    {
         apply_theme(app);
     } else {
         render(app);
@@ -609,7 +481,7 @@ pub fn on_system_theme(app: &mut App) {
 pub fn open(app: &mut App, section: Section) {
     if takes_shortcut(app) {
         // The first run comes first.
-        take_foreground(app);
+        settings_sys::take_foreground(app);
         return;
     }
     dial::close_dial(app);
@@ -618,11 +490,11 @@ pub fn open(app: &mut App, section: Section) {
         if app.settings.screen != Some(Screen::Settings(section)) {
             go_section(app, section);
         }
-        take_foreground(app);
+        settings_sys::take_foreground(app);
         return;
     }
-    app.settings.startup = read_startup();
-    app.settings.want_windows = app.settings.prefs.place.is_windows();
+    app.settings.startup = settings_sys::read_startup();
+    app.settings.want_windows = app.settings.prefs.place.is_windows() && settings_sys::HAS_LOCATION;
     app.settings.city = match &app.settings.prefs.place {
         Place::City { name } => Some(name.clone()),
         Place::Windows { .. } => app.settings.city.clone(),
@@ -651,19 +523,22 @@ fn first_run(app: &mut App, activate: bool) {
     // the orb back over the welcome.
     notices::on_user_visibility(app);
     let s = &mut app.settings;
-    s.want_windows = true;
+    s.want_windows = settings_sys::HAS_LOCATION;
     s.city = match &s.prefs.place {
         Place::City { name } => Some(name.clone()),
         Place::Windows { .. } => Some("Yogyakarta".into()),
     };
-    s.fr_start = true;
+    s.fr_start = m::os::W.start_default;
     s.tried = false;
     s.picking = false;
     s.taken = None;
     s.capture = None;
     s.suggestion = None;
     if !app.settings.hotkey_ok {
-        app.settings.suggestion = m::SUGGESTIONS.iter().copied().find(|k| is_free(app, *k));
+        app.settings.suggestion = m::SUGGESTIONS
+            .iter()
+            .copied()
+            .find(|k| settings_sys::is_free(app, *k));
     }
     show(app, Screen::FirstRun(Step::Welcome), activate);
     log_line(app, "settings: first run");
@@ -674,16 +549,11 @@ fn show(app: &mut App, screen: Screen, activate: bool) {
     app.settings.hover = None;
     app.settings.focus = None;
     app.settings.scroll = 0.0;
-    place(app);
+    settings_sys::place(app);
     render(app);
-    unsafe {
-        let _ = ShowWindow(
-            app.settings.hwnd,
-            if activate { SW_SHOW } else { SW_SHOWNA },
-        );
-    }
+    settings_sys::show(app, activate);
     if activate {
-        take_foreground(app);
+        settings_sys::take_foreground(app);
     }
 }
 
@@ -695,7 +565,7 @@ fn go_section(app: &mut App, section: Section) {
     app.settings.hover = None;
     app.settings.screen = Some(Screen::Settings(section));
     if section == Section::General {
-        app.settings.startup = read_startup();
+        app.settings.startup = settings_sys::read_startup();
     }
     if section == Section::Prayer
         && app.settings.want_windows
@@ -725,6 +595,16 @@ fn go_step(app: &mut App, step: Step) {
     render(app);
 }
 
+/// Shows the section (a test command, the menu bar), or opens Settings on it.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn go_to(app: &mut App, section: Section) {
+    if matches!(app.settings.screen, Some(Screen::Settings(_))) {
+        go_section(app, section);
+    } else {
+        open(app, section);
+    }
+}
+
 pub fn close(app: &mut App) {
     if app.settings.screen.is_none() {
         return;
@@ -732,17 +612,14 @@ pub fn close(app: &mut App) {
     cancel_capture(app);
     app.settings.screen = None;
     app.settings.picking = false;
-    unsafe {
-        let _ = ShowWindow(app.settings.hwnd, SW_HIDE);
-    }
-    // The swap chain is 3 MB at 720 × 580; let it go while the window is hidden.
-    app.settings.surface = None;
+    // The window hides and lets its drawing surface go.
+    settings_sys::hide(app);
     log_line(app, "settings: closed");
 }
 
 fn finish_first_run(app: &mut App) {
     let on = app.settings.fr_start;
-    if on || read_startup() != Startup::Off {
+    if on || settings_sys::read_startup() != Startup::Off {
         write_startup(app, on);
     }
     app.settings.prefs.first_run_done = true;
@@ -764,15 +641,24 @@ fn finish_first_run(app: &mut App) {
     log_line(app, "settings: first run done");
 }
 
-/// Alt+F4 on the first run: the defaults stay (the place in use, no startup entry) and the orb
-/// comes out, so closing it never leaves the app with nothing on screen.
-fn skip_first_run(app: &mut App) {
+/// Alt+F4 (Cmd+W) on the first run: the defaults stay (the place in use, no startup entry) and
+/// the orb comes out, so closing it never leaves the app with nothing on screen.
+pub fn skip_first_run(app: &mut App) {
     app.settings.prefs.first_run_done = true;
     save(app);
     close(app);
     orb::set_visible(app, true);
     notices::on_user_visibility(app);
     log_line(app, "settings: first run closed early, defaults kept");
+}
+
+/// The window's close request (Alt+F4, Cmd+W): the first run keeps its defaults, Settings closes.
+pub fn on_close_request(app: &mut App) {
+    if takes_shortcut(app) {
+        skip_first_run(app);
+    } else {
+        close(app);
+    }
 }
 
 /// Commits the place step's choice (on Continue).
@@ -791,47 +677,16 @@ fn commit_place(app: &mut App) {
     }
 }
 
-fn place(app: &App) {
-    let Some(screen) = app.settings.screen else {
-        return;
-    };
-    let (w, h) = sp::size(screen);
-    let (w, h) = (px(app, w).ceil() as i32, px(app, h).ceil() as i32);
-    let wa = orb::work_area(app.hwnd);
-    let x = (wa.left + wa.right - w) / 2;
-    let y = (wa.top + wa.bottom - h) / 2;
-    unsafe {
-        let _ = SetWindowPos(
-            app.settings.hwnd,
-            None,
-            x,
-            y,
-            w,
-            h,
-            SWP_NOACTIVATE | SWP_NOZORDER,
-        );
-        let d = px(
-            app,
-            if matches!(screen, Screen::FirstRun(_)) {
-                40.0
-            } else {
-                32.0
-            },
-        )
-        .round() as i32;
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
-        let _ = SetWindowRgn(app.settings.hwnd, Some(rgn), true);
+/// The window's edge radius for its screen (the window's own rounding and the lip along it).
+pub fn edge_radius(screen: Screen) -> f32 {
+    if matches!(screen, Screen::FirstRun(_)) {
+        20.0
+    } else {
+        16.0
     }
 }
 
-fn take_foreground(app: &App) {
-    unsafe {
-        let _ = SetForegroundWindow(app.settings.hwnd);
-        let _ = SetFocus(Some(app.settings.hwnd));
-    }
-}
-
-fn view(app: &App) -> View<'_> {
+pub(crate) fn view(app: &App) -> View<'_> {
     let s = &app.settings;
     let screen = s.screen.unwrap_or(Screen::Settings(Section::General));
     let (lat, lng) = shown_coords(app);
@@ -863,7 +718,7 @@ fn view(app: &App) -> View<'_> {
     View {
         screen,
         prefs: &s.prefs,
-        windows_dark: ui::windows_dark(),
+        windows_dark: settings_sys::system_dark(),
         startup: s.startup,
         fr_start: s.fr_start,
         capture: s.capture,
@@ -903,45 +758,42 @@ fn weekday(y: i32, m: u32, d: u32) -> u32 {
     ((y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + d as i32).rem_euclid(7)) as u32
 }
 
-fn layout(app: &App) -> (Vec<(Hit, sp::Rect)>, f32) {
-    sp::layout(&app.g, &app.theme, &app.fonts, &view(app))
+/// Every control's rectangle in Tab order (logical px), and the content's bottom.
+pub(crate) fn layout(app: &App) -> (Vec<(Hit, sp::Rect)>, f32) {
+    sp::layout(&app.theme, &app.fonts, &view(app))
 }
 
-pub fn render(app: &mut App) {
-    let Some(screen) = app.settings.screen else {
-        return;
-    };
-    let (lw, lh) = sp::size(screen);
-    let (w, h) = (px(app, lw).ceil() as u32, px(app, lh).ceil() as u32);
-    match app.settings.surface.as_mut() {
-        None => {
-            app.settings.surface = Surface::new(&app.g, app.settings.hwnd, w, h, app.scale).ok()
-        }
-        Some(s) if s.w != w || s.h != h => {
-            let _ = s.resize(&app.g, w, h);
-            place(app);
-        }
-        _ => {}
+/// The control at a point in the window (logical px, y down).
+pub(crate) fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
+    let (hits, _) = layout(app);
+    sp::hit_at(&hits, x, y)
+}
+
+/// Empty space that drags the window: the first run's card, the Settings title band.
+pub(crate) fn drags_at(app: &App, x: f32, y: f32) -> bool {
+    if hit(app, x, y).is_some() {
+        return false;
     }
-    let v = view(app);
-    let Some(s) = app.settings.surface.as_ref() else {
+    match app.settings.screen {
+        Some(Screen::FirstRun(_)) => !app.settings.picking || y < 80.0,
+        Some(Screen::Settings(_)) => y < 60.0,
+        None => false,
+    }
+}
+
+/// Draws the window now (the system's half sizes its surface first).
+pub fn render(app: &mut App) {
+    if app.settings.screen.is_none() {
         return;
-    };
-    let dc = s.begin(&app.g);
-    sp::draw(&app.g, dc, &app.theme, &app.fonts, &v);
-    // The T3 lip along the window's edge (depth.rs); radius as in `place`'s region.
-    let rad = if matches!(screen, Screen::FirstRun(_)) {
-        20.0
-    } else {
-        16.0
-    };
-    crate::depth::lip(&app.g, dc, &app.theme, 0.0, 0.0, lw, lh, rad, 1.0);
-    s.end(&app.g);
+    }
+    settings_sys::prepare(app);
+    let v = view(app);
+    settings_sys::paint(app, &v);
 }
 
 // ---- input ----
 
-fn click(app: &mut App, h: Hit) {
+pub(crate) fn click(app: &mut App, h: Hit) {
     log_line(app, &format!("settings: click {h:?}"));
     match h {
         Hit::Section(s) => go_section(app, s),
@@ -982,8 +834,8 @@ fn click(app: &mut App, h: Hit) {
                 }
             }
         }
-        Hit::StartupApps => open_uri("ms-settings:startupapps"),
-        Hit::LocationSettings => open_uri("ms-settings:privacy-location"),
+        Hit::StartupApps => settings_sys::open_startup_settings(),
+        Hit::LocationSettings => settings_sys::open_location_settings(),
         Hit::PlaceWindows => choose_windows(app),
         Hit::PlaceCity => open_picker(app),
         Hit::CityBack => app.settings.picking = false,
@@ -1019,17 +871,7 @@ fn click(app: &mut App, h: Hit) {
                 }
             }
         }
-        Hit::PickAdzan(subuh) => {
-            // The picker's modal loop runs from the orb window's message, with the app free.
-            unsafe {
-                let _ = PostMessageW(
-                    Some(app.hwnd),
-                    crate::WM_APP_PRAYER,
-                    WPARAM(subuh as usize),
-                    LPARAM(0),
-                );
-            }
-        }
+        Hit::PickAdzan(subuh) => settings_sys::pick_adzan(app, subuh),
         Hit::ClearAdzanSubuh => {
             app.settings.prefs.adzan_subuh_file = None;
             save(app);
@@ -1039,8 +881,8 @@ fn click(app: &mut App, h: Hit) {
             notices::set_source_on(app, s, on);
         }
         Hit::OpenData => {
-            let dir = app.settings.dir.display().to_string();
-            open_uri(&dir);
+            let dir = app.settings.dir.clone();
+            settings_sys::open_folder(&dir);
         }
         Hit::Next => {
             if let Some(Screen::FirstRun(step)) = app.settings.screen {
@@ -1068,6 +910,26 @@ fn click(app: &mut App, h: Hit) {
     render(app);
 }
 
+/// A click (button up) at a point in the window: the control under it, else nothing; the Tab
+/// ring goes away either way.
+pub(crate) fn click_at(app: &mut App, x: f32, y: f32) {
+    let h = hit(app, x, y);
+    app.settings.focus = None;
+    match h {
+        Some(h) => click(app, h),
+        None => render(app),
+    }
+}
+
+/// The pointer moved over the window (None: it left).
+pub(crate) fn hover_at(app: &mut App, at: Option<(f32, f32)>) {
+    let h = at.and_then(|(x, y)| hit(app, x, y));
+    if h != app.settings.hover {
+        app.settings.hover = h;
+        render(app);
+    }
+}
+
 /// One reminder on or off, from the Settings switch or the Prayer panel chip: both show the new
 /// value at once, whichever of the two windows is open.
 pub fn toggle_reminder(app: &mut App, i: usize) {
@@ -1081,6 +943,7 @@ pub fn toggle_reminder(app: &mut App, i: usize) {
 
 /// The adzan file picker closed: keep the path (the file stays where you have it; nothing is
 /// copied or uploaded).
+#[cfg_attr(not(windows), allow(dead_code))] // the Mac offers no adzan file yet
 pub fn on_adzan_picked(app: &mut App, subuh: bool, path: Option<String>) {
     let Some(path) = path else {
         return;
@@ -1110,19 +973,6 @@ pub fn on_adzan_picked(app: &mut App, subuh: bool, path: Option<String>) {
 pub fn on_sources_changed(app: &mut App) {
     if app.settings.screen == Some(Screen::Settings(Section::Notices)) {
         render(app);
-    }
-}
-
-fn open_uri(s: &str) {
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            &HSTRING::from(s),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
     }
 }
 
@@ -1162,50 +1012,52 @@ fn clamp_scroll(app: &mut App) {
     app.settings.scroll = app.settings.scroll.clamp(0.0, max);
 }
 
-/// Keys in the window. Returns whether they were used. Alt combinations (`sys`) only count while
-/// a shortcut is being chosen; otherwise Alt+Tab and Alt+F4 stay with Windows.
-fn on_key(app: &mut App, vk: u16, down: bool, sys: bool) -> bool {
-    let k = VIRTUAL_KEY(vk);
+/// Keys in the window (Windows virtual keys on both systems). Returns whether they were used.
+/// Alt combinations (`alt_sys`, WM_SYSKEYDOWN) only count while a shortcut is being chosen;
+/// otherwise Alt+Tab and Alt+F4 stay with the system.
+pub(crate) fn on_key(app: &mut App, k: u16, down: bool, alt_sys: bool) -> bool {
     if let Some(mut c) = app.settings.capture {
-        let r = c.key(vk as u32, down);
+        let r = c.key(k as u32, down);
         app.settings.capture = Some(c);
         match r {
             CaptureKey::Cancel => cancel_capture(app),
-            CaptureKey::Ignored if down && k == VK_RETURN && c.got.is_some() => save_capture(app),
+            CaptureKey::Ignored if down && k == vk::VK_RETURN && c.got.is_some() => {
+                save_capture(app)
+            }
             _ => {}
         }
         render(app);
         return true;
     }
-    if !down || sys {
+    if !down || alt_sys {
         return false;
     }
-    let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+    let ctrl = sys::ctrl_down();
+    let shift = sys::shift_down();
     if app.settings.picking {
         let n = app.settings.rows.len();
         match k {
-            VK_ESCAPE => app.settings.picking = false,
-            VK_UP if n > 0 => {
+            vk::VK_ESCAPE => app.settings.picking = false,
+            vk::VK_UP if n > 0 => {
                 app.settings.sel = app.settings.sel.saturating_sub(1);
                 keep_sel_in_view(app);
             }
-            VK_DOWN if n > 0 => {
+            vk::VK_DOWN if n > 0 => {
                 app.settings.sel = (app.settings.sel + 1).min(n - 1);
                 keep_sel_in_view(app);
             }
-            VK_RETURN => {
+            vk::VK_RETURN => {
                 if let Some(i) = app.settings.rows.get(app.settings.sel).copied() {
                     pick_city(app, i);
                 }
             }
-            VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_BACK | VK_DELETE => {
+            vk::VK_LEFT | vk::VK_RIGHT | vk::VK_HOME | vk::VK_END | vk::VK_BACK | vk::VK_DELETE => {
                 let key = match k {
-                    VK_LEFT => Key::Left,
-                    VK_RIGHT => Key::Right,
-                    VK_HOME => Key::Home,
-                    VK_END => Key::End,
-                    VK_BACK => Key::Backspace,
+                    vk::VK_LEFT => Key::Left,
+                    vk::VK_RIGHT => Key::Right,
+                    vk::VK_HOME => Key::Home,
+                    vk::VK_END => Key::End,
+                    vk::VK_BACK => Key::Backspace,
                     _ => Key::Delete,
                 };
                 app.settings.field.key(key, ctrl, shift);
@@ -1217,13 +1069,13 @@ fn on_key(app: &mut App, vk: u16, down: bool, sys: bool) -> bool {
         return true;
     }
     match k {
-        VK_TAB => move_focus(app, shift),
-        VK_RETURN | VK_SPACE => {
+        vk::VK_TAB => move_focus(app, shift),
+        vk::VK_RETURN | vk::VK_SPACE => {
             if let Some(h) = app.settings.focus {
                 click(app, h);
                 return true;
             }
-            if k == VK_RETURN {
+            if k == vk::VK_RETURN {
                 // Enter without a ring takes the step's main button.
                 if let Some(Screen::FirstRun(step)) = app.settings.screen {
                     click(
@@ -1239,7 +1091,7 @@ fn on_key(app: &mut App, vk: u16, down: bool, sys: bool) -> bool {
             }
             return false;
         }
-        VK_ESCAPE => match app.settings.screen {
+        vk::VK_ESCAPE => match app.settings.screen {
             Some(Screen::FirstRun(step)) if step != Step::Welcome => {
                 go_step(app, step.back());
                 return true;
@@ -1250,13 +1102,13 @@ fn on_key(app: &mut App, vk: u16, down: bool, sys: bool) -> bool {
                 return true;
             }
         },
-        VK_UP | VK_DOWN if matches!(app.settings.focus, Some(Hit::Section(_))) => {
+        vk::VK_UP | vk::VK_DOWN if matches!(app.settings.focus, Some(Hit::Section(_))) => {
             let Some(Hit::Section(cur)) = app.settings.focus else {
                 return false;
             };
             let i = Section::ALL.iter().position(|s| *s == cur).unwrap_or(0);
             let n = Section::ALL.len();
-            let next = Section::ALL[if k == VK_UP {
+            let next = Section::ALL[if k == vk::VK_UP {
                 (i + n - 1) % n
             } else {
                 (i + 1) % n
@@ -1265,11 +1117,11 @@ fn on_key(app: &mut App, vk: u16, down: bool, sys: bool) -> bool {
             go_section(app, next);
             return true;
         }
-        VK_UP | VK_DOWN | VK_NEXT | VK_PRIOR => {
+        vk::VK_UP | vk::VK_DOWN | vk::VK_NEXT | vk::VK_PRIOR => {
             let d = match k {
-                VK_UP => -40.0,
-                VK_DOWN => 40.0,
-                VK_PRIOR => -300.0,
+                vk::VK_UP => -40.0,
+                vk::VK_DOWN => 40.0,
+                vk::VK_PRIOR => -300.0,
                 _ => 300.0,
             };
             app.settings.scroll += d;
@@ -1281,14 +1133,27 @@ fn on_key(app: &mut App, vk: u16, down: bool, sys: bool) -> bool {
     true
 }
 
-fn on_char(app: &mut App, unit: u16) {
+/// One UTF-16 unit from WM_CHAR.
+#[cfg_attr(not(windows), allow(dead_code))] // the Mac types whole strings (on_text)
+pub(crate) fn on_char(app: &mut App, unit: u16) {
     if app.settings.picking && app.settings.field.type_utf16(unit) {
         on_field_changed(app);
         render(app);
     }
 }
 
-fn on_wheel(app: &mut App, delta: i16) {
+/// Committed text (the Mac's input system: a key, an accent, a paste from the character viewer).
+#[cfg_attr(windows, allow(dead_code))] // Windows types through WM_CHAR (on_char)
+pub(crate) fn on_text(app: &mut App, s: &str) {
+    if app.settings.picking && !s.is_empty() {
+        app.settings.field.insert(s);
+        on_field_changed(app);
+        render(app);
+    }
+}
+
+/// The wheel: `delta` as Windows gives it (+120 a notch away from you, which scrolls up).
+pub(crate) fn on_wheel(app: &mut App, delta: i16) {
     if app.settings.picking {
         let fit = sp::city_rows_fit(matches!(app.settings.screen, Some(Screen::FirstRun(_))));
         let n = app.settings.rows.len();
@@ -1308,6 +1173,46 @@ fn on_wheel(app: &mut App, delta: i16) {
     render(app);
 }
 
+/// The window became active or went to the background. Clicking away while choosing a shortcut
+/// gives the old one back at once. Coming back (from Startup apps, say) reads the startup entry
+/// again.
+pub(crate) fn on_activate(app: &mut App, active: bool) {
+    if !active && app.settings.capture.is_some() {
+        cancel_capture(app);
+        render(app);
+    } else if active {
+        refresh_startup(app);
+    }
+}
+
+/// One line for tests: the screen, theme, shortcut, place, method and startup.
+#[cfg_attr(windows, allow(dead_code))] // the Mac's test channel
+pub(crate) fn state_line(app: &App) -> String {
+    let s = &app.settings;
+    let screen = match s.screen {
+        None => "closed".to_string(),
+        Some(Screen::Settings(sec)) => sec.name().to_string(),
+        Some(Screen::FirstRun(step)) => format!("first run {} of 5", step.index() + 1),
+    };
+    format!(
+        "{screen}, theme {:?} (dark {}), shortcut {} (registered {}), capture {}, place {}, picking {} \"{}\", method {}, reminders {:?}, sound {:?}, startup {:?}, scroll {:.0}",
+        s.prefs.theme,
+        app.theme.dark,
+        s.prefs.shortcut.label(),
+        s.hotkey_ok,
+        s.capture
+            .map_or("none".into(), |c| c.got.map_or("waiting".into(), |g| g.label())),
+        s.prefs.place.words(),
+        s.picking,
+        s.field.text(),
+        s.prefs.prayer_method.name(),
+        s.prefs.prayer_reminders,
+        s.prefs.at_time_sound,
+        s.startup,
+        s.scroll,
+    )
+}
+
 // ---- the dial and pills ----
 
 pub fn dial_child(app: &App) -> DialChild {
@@ -1317,165 +1222,6 @@ pub fn dial_child(app: &App) -> DialChild {
         icon: Some(Icon::Gear),
         name: "Settings".into(),
         value: "General".into(),
-    }
-}
-
-pub unsafe extern "system" fn settings_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_NCHITTEST => {
-            // Empty space drags the window: the first run's card, the Settings title band.
-            let (sx, sy) = unpack(lparam);
-            let mut p = POINT {
-                x: sx as i32,
-                y: sy as i32,
-            };
-            let _ = ScreenToClient(hwnd, &mut p);
-            let caption = with_app(|app| {
-                let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
-                let (hits, _) = layout(app);
-                if sp::hit_at(&hits, x, y).is_some() {
-                    return false;
-                }
-                match app.settings.screen {
-                    Some(Screen::FirstRun(_)) => !app.settings.picking || y < 80.0,
-                    Some(Screen::Settings(_)) => y < 60.0,
-                    None => false,
-                }
-            })
-            .unwrap_or(false);
-            if caption {
-                return LRESULT(HTCAPTION as isize);
-            }
-            return LRESULT(HTCLIENT as isize);
-        }
-        WM_MOUSEMOVE => {
-            with_app(|app| {
-                let (x, y) = unpack(lparam);
-                let (hits, _) = layout(app);
-                let h = sp::hit_at(&hits, x / app.scale, y / app.scale);
-                if !app.settings.tracking {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut tme);
-                    app.settings.tracking = true;
-                }
-                if h != app.settings.hover {
-                    app.settings.hover = h;
-                    render(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        MSG_MOUSELEAVE => {
-            with_app(|app| {
-                app.settings.tracking = false;
-                if app.settings.hover.is_some() {
-                    app.settings.hover = None;
-                    render(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        WM_LBUTTONDOWN => return LRESULT(0),
-        WM_LBUTTONUP => {
-            with_app(|app| {
-                let (x, y) = unpack(lparam);
-                let (hits, _) = layout(app);
-                app.settings.focus = None;
-                if let Some(h) = sp::hit_at(&hits, x / app.scale, y / app.scale) {
-                    click(app, h);
-                } else {
-                    render(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        WM_MOUSEWHEEL => {
-            let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16;
-            with_app(|app| on_wheel(app, delta));
-            return LRESULT(0);
-        }
-        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
-            let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-            let sys = msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
-            let used = with_app(|app| on_key(app, wparam.0 as u16, down, sys)).unwrap_or(false);
-            if used {
-                return LRESULT(0);
-            }
-        }
-        WM_SYSCHAR => {
-            // Alt+letter while choosing a shortcut must not beep.
-            if with_app(|app| app.settings.capture.is_some()).unwrap_or(false) {
-                return LRESULT(0);
-            }
-        }
-        WM_CHAR => {
-            with_app(|app| on_char(app, wparam.0 as u16));
-            return LRESULT(0);
-        }
-        WM_ACTIVATE => {
-            // Clicking away while choosing a shortcut gives the old one back at once. Coming
-            // back (from Startup apps, say) reads the Run entry again.
-            let active = (wparam.0 & 0xffff) as u32 != WA_INACTIVE;
-            with_app(|app| {
-                if !active && app.settings.capture.is_some() {
-                    cancel_capture(app);
-                    render(app);
-                } else if active
-                    && matches!(
-                        app.settings.screen,
-                        Some(Screen::Settings(Section::General))
-                    )
-                {
-                    let now = read_startup();
-                    if now != app.settings.startup {
-                        app.settings.startup = now;
-                        render(app);
-                    }
-                }
-            });
-        }
-        WM_CLOSE => {
-            with_app(|app| {
-                if takes_shortcut(app) {
-                    skip_first_run(app);
-                } else {
-                    close(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        _ => {}
-    }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-/// The window: an ordinary top-level window (taskbar, Alt+Tab), drawn by DirectComposition.
-pub fn make_window(hinst: HINSTANCE) -> windows::core::Result<HWND> {
-    unsafe {
-        CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
-            w!("OrbSettings"),
-            w!("Orby settings"),
-            WS_POPUP,
-            0,
-            0,
-            720,
-            580,
-            None,
-            None,
-            Some(hinst),
-            None,
-        )
     }
 }
 

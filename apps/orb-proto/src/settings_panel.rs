@@ -1,22 +1,19 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Settings window (frame "v6.2 · 22", 720 × 580: a sidebar of sections and the section's
 //! cards) and the first run (frame "v6.2 · 21", five steps in one small window). One painter
-//! walks the layout: with a device context it draws, without one it only records where each
-//! control is, so drawing, hit testing and Tab order can never disagree.
+//! walks the layout: with a canvas it draws, without one it only records where each control
+//! is, so drawing, hit testing and Tab order can never disagree.
 
-use windows::Win32::Graphics::Direct2D::Common::*;
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
+use std::cell::RefCell;
 
-use crate::gfx::*;
+use crate::canvas::{self, clipped_text, ellipse, pt, rgba, rrect, Canvas, Color, Font, Stroke};
 use crate::notices_model::Source;
 use crate::settings_model::{
-    self as m, AtTimeSound, Capture, Locate, PrayerMethod, Section, Shortcut, Startup, Step,
+    self as m, os, AtTimeSound, Capture, Locate, PrayerMethod, Section, Shortcut, Startup, Step,
     ThemeMode, CITIES,
 };
-use crate::tasks_panel::clipped_text;
 use crate::textfield::TextField;
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{paint_icon, with_alpha, Fonts, Icon, Theme};
 
 pub type Rect = (f32, f32, f32, f32);
 
@@ -120,10 +117,9 @@ pub struct View<'a> {
     pub focus: Option<Hit>,
 }
 
-/// Draws when it has a device context, and always records each control's rectangle.
+/// Draws when it has a canvas, and always records each control's rectangle.
 pub struct Painter<'a> {
-    g: &'a Shared,
-    dc: Option<&'a ID2D1DeviceContext>,
+    cv: Option<RefCell<&'a mut dyn Canvas>>,
     t: &'a Theme,
     f: &'a Fonts,
     hover: Option<Hit>,
@@ -134,92 +130,62 @@ pub struct Painter<'a> {
 }
 
 impl<'a> Painter<'a> {
-    fn col(&self, c: D2D1_COLOR_F) -> ID2D1SolidColorBrush {
-        brush(self.dc.expect("drawing"), c)
-    }
-
-    fn fill(&self, r: Rect, rad: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, rad), &brush(dc, c)) };
+    /// Runs `draw` on the canvas when there is one (layout passes have none).
+    fn draw(&self, draw: impl FnOnce(&mut dyn Canvas)) {
+        if let Some(cv) = &self.cv {
+            draw(&mut **cv.borrow_mut());
         }
     }
 
-    /// The T3 lip on a card or control (depth.rs).
+    fn fill(&self, r: Rect, rad: f32, c: Color) {
+        self.draw(|cv| cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, rad), c));
+    }
+
+    /// The T3 lip on a card or control (ui.rs).
     fn lip(&self, r: Rect, rad: f32, a: f32) {
-        if let Some(dc) = self.dc {
-            crate::depth::lip(self.g, dc, self.t, r.0, r.1, r.2, r.3, rad, a);
-        }
+        let t = self.t;
+        self.draw(|cv| crate::ui::lip(cv, t, r.0, r.1, r.2, r.3, rad, a));
     }
 
-    fn stroke(&self, r: Rect, rad: f32, c: D2D1_COLOR_F, w: f32) {
-        if let Some(dc) = self.dc {
-            unsafe {
-                dc.DrawRoundedRectangle(
-                    &rrect(
-                        r.0 + w / 2.0,
-                        r.1 + w / 2.0,
-                        r.2 - w / 2.0,
-                        r.3 - w / 2.0,
-                        rad,
-                    ),
-                    &brush(dc, c),
-                    w,
-                    None,
-                )
-            };
-        }
+    fn stroke(&self, r: Rect, rad: f32, c: Color, w: f32) {
+        self.draw(|cv| {
+            cv.stroke_rrect(
+                &rrect(
+                    r.0 + w / 2.0,
+                    r.1 + w / 2.0,
+                    r.2 - w / 2.0,
+                    r.3 - w / 2.0,
+                    rad,
+                ),
+                c,
+                w,
+                Stroke::Plain,
+            )
+        });
     }
 
-    fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            unsafe { dc.DrawLine(pt(x0, y0), pt(x1, y1), &brush(dc, c), 1.0, None) };
-        }
+    fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, c: Color) {
+        self.draw(|cv| cv.line(pt(x0, y0), pt(x1, y1), c, 1.0, Stroke::Plain));
     }
 
-    fn text(
-        &self,
-        s: &str,
-        fmt: &IDWriteTextFormat,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        c: D2D1_COLOR_F,
-    ) {
-        if let Some(dc) = self.dc {
-            clipped_text(self.g, dc, s, fmt, x, y, w, h, &self.col(c));
-        }
+    fn text(&self, s: &str, fmt: &Font, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        self.draw(|cv| clipped_text(cv, s, fmt, x, y, w, h, c));
     }
 
-    fn right(&self, s: &str, fmt: &IDWriteTextFormat, right: f32, y: f32, h: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            right_text(self.g, dc, s, fmt, right, y, h, &self.col(c));
-        }
+    fn right(&self, s: &str, fmt: &Font, right: f32, y: f32, h: f32, c: Color) {
+        self.draw(|cv| cv.right_text(s, fmt, right, y, h, c));
     }
 
-    fn wrap(
-        &self,
-        s: &str,
-        fmt: &IDWriteTextFormat,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        c: D2D1_COLOR_F,
-    ) {
-        if let Some(dc) = self.dc {
-            text(dc, s, fmt, x, y, w, h, &self.col(c));
-        }
+    fn wrap(&self, s: &str, fmt: &Font, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        self.draw(|cv| cv.text(s, fmt, x, y, w, h, c));
     }
 
-    fn icon(&self, i: Icon, cx: f32, cy: f32, size: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            draw_icon(self.g, dc, i, cx, cy, size, &self.col(c));
-        }
+    fn icon(&self, i: Icon, cx: f32, cy: f32, size: f32, c: Color) {
+        self.draw(|cv| paint_icon(cv, i, cx, cy, size, c));
     }
 
-    fn width(&self, s: &str, fmt: &IDWriteTextFormat) -> f32 {
-        self.g.text_width(s, fmt)
+    fn width(&self, s: &str, fmt: &Font) -> f32 {
+        canvas::text_width(s, fmt)
     }
 
     fn hit(&mut self, h: Hit, r: Rect) {
@@ -317,14 +283,7 @@ impl<'a> Painter<'a> {
         } else {
             t.surface
         };
-        if let Some(dc) = self.dc {
-            unsafe {
-                dc.FillEllipse(
-                    &ellipse(kx, cy, 7.0),
-                    &brush(dc, with_alpha(knob, a.max(0.8))),
-                )
-            };
-        }
+        self.draw(|cv| cv.fill_ellipse(&ellipse(kx, cy, 7.0), with_alpha(knob, a.max(0.8))));
         if enabled {
             self.ring(h, r, 10.0);
             self.hit(h, (r.0 - 6.0, r.1 - 6.0, r.2 + 4.0, r.3 + 6.0));
@@ -333,19 +292,17 @@ impl<'a> Painter<'a> {
 
     fn radio(&self, cx: f32, cy: f32, on: bool) {
         let t = *self.t;
-        if let Some(dc) = self.dc {
-            unsafe {
-                dc.DrawEllipse(
-                    &ellipse(cx, cy, 7.5),
-                    &brush(dc, if on { t.text } else { t.muted }),
-                    1.5,
-                    None,
-                );
-                if on {
-                    dc.FillEllipse(&ellipse(cx, cy, 4.0), &brush(dc, t.text));
-                }
+        self.draw(|cv| {
+            cv.stroke_ellipse(
+                &ellipse(cx, cy, 7.5),
+                if on { t.text } else { t.muted },
+                1.5,
+                Stroke::Plain,
+            );
+            if on {
+                cv.fill_ellipse(&ellipse(cx, cy, 4.0), t.text);
             }
-        }
+        });
     }
 
     /// Keycaps from `x`, vertically centred on `cy`. Returns the right edge.
@@ -443,15 +400,13 @@ impl<'a> Painter<'a> {
 }
 
 fn painter<'a>(
-    g: &'a Shared,
-    dc: Option<&'a ID2D1DeviceContext>,
+    cv: Option<&'a mut dyn Canvas>,
     t: &'a Theme,
     f: &'a Fonts,
     v: &View,
 ) -> Painter<'a> {
     Painter {
-        g,
-        dc,
+        cv: cv.map(RefCell::new),
         t,
         f,
         hover: v.hover,
@@ -470,8 +425,8 @@ pub fn size(screen: Screen) -> (f32, f32) {
 }
 
 /// Every control's rectangle, in Tab order; the content's height for scrolling.
-pub fn layout(g: &Shared, t: &Theme, f: &Fonts, v: &View) -> (Vec<(Hit, Rect)>, f32) {
-    let mut p = painter(g, None, t, f, v);
+pub fn layout(t: &Theme, f: &Fonts, v: &View) -> (Vec<(Hit, Rect)>, f32) {
+    let mut p = painter(None, t, f, v);
     let bottom = paint(&mut p, v);
     (p.hits, bottom)
 }
@@ -483,8 +438,8 @@ pub fn hit_at(hits: &[(Hit, Rect)], x: f32, y: f32) -> Option<Hit> {
         .map(|(h, _)| *h)
 }
 
-pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View) {
-    let mut p = painter(g, Some(dc), t, f, v);
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View) {
+    let mut p = painter(Some(cv), t, f, v);
     paint(&mut p, v);
 }
 
@@ -544,7 +499,7 @@ fn paint_settings(p: &mut Painter, v: &View, s: Section) -> f32 {
         y += 34.0;
     }
     p.text(
-        "On this PC only · sync is off",
+        &format!("On this {} only · sync is off", os::W.device),
         &p.f.small,
         20.0,
         H - 36.0,
@@ -591,20 +546,11 @@ fn paint_settings(p: &mut Painter, v: &View, s: Section) -> f32 {
         return H;
     }
     let clip = (CONTENT_TOP, CONTENT_BOTTOM);
-    if let Some(dc) = p.dc {
-        unsafe {
-            dc.PushAxisAlignedClip(
-                &D2D_RECT_F {
-                    left: SIDE + 1.0,
-                    top: clip.0,
-                    right: W - 1.0,
-                    bottom: clip.1,
-                },
-                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-            )
-        };
-        unsafe { dc.SetTransform(&translate(0.0, -v.scroll)) };
-    }
+    // The window draws from an identity transform, so this is the old absolute translate.
+    p.draw(|cv| {
+        cv.push_clip(SIDE + 1.0, clip.0, W - 1.0, clip.1);
+        cv.push_translate(0.0, -v.scroll);
+    });
     // Hits are recorded in window coordinates, so shift them by the scroll as they land.
     let first = p.hits.len();
     p.clip = (clip.0 + v.scroll, clip.1 + v.scroll);
@@ -621,35 +567,18 @@ fn paint_settings(p: &mut Painter, v: &View, s: Section) -> f32 {
         r.1 -= v.scroll;
         r.3 -= v.scroll;
     }
-    if let Some(dc) = p.dc {
-        unsafe { dc.SetTransform(&translate(0.0, 0.0)) };
-        unsafe { dc.PopAxisAlignedClip() };
-    }
+    p.draw(|cv| {
+        cv.pop_translate();
+        cv.pop_clip();
+    });
     bottom
-}
-
-fn translate(x: f32, y: f32) -> windows_numerics::Matrix3x2 {
-    windows_numerics::Matrix3x2 {
-        M11: 1.0,
-        M12: 0.0,
-        M21: 0.0,
-        M22: 1.0,
-        M31: x,
-        M32: y,
-    }
 }
 
 fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
     let t = *p.t;
     let mut y = p.group(top, "Startup");
     let c = p.card(y, &[56.0, 56.0]);
-    p.row_words(
-        y,
-        56.0,
-        "Start with Windows",
-        "Opens quietly as the orb when you sign in",
-        50.0,
-    );
+    p.row_words(y, 56.0, os::W.start, os::W.start_sub, 50.0);
     p.toggle(
         X1 - 14.0,
         y + 28.0,
@@ -657,7 +586,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
         true,
         Hit::StartWithWindows,
     );
-    let sc = v.prefs.shortcut.label();
+    let sc = v.prefs.shortcut.shown();
     p.row_words(
         y + 56.0,
         56.0,
@@ -677,8 +606,8 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
         y = p.problem(
             y,
             "Couldn't add to startup",
-            "Windows blocked it. Allow Orby there.",
-            Some(("Startup apps", Hit::StartupApps)),
+            os::W.blocked,
+            Some((os::W.startup_apps, Hit::StartupApps)),
         ) + 8.0;
     }
 
@@ -712,7 +641,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
                 true,
                 Some(Hit::ChangeShortcut),
             );
-            let parts = v.prefs.shortcut.parts();
+            let parts = v.prefs.shortcut.shown_parts();
             let cw = p.caps_width(&parts);
             p.caps(&parts, left - 10.0 - cw, y + 28.0);
             y = c + 8.0;
@@ -774,7 +703,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
                 t.muted,
             );
             let by = y + 128.0;
-            let reset = format!("Reset to {}", Shortcut::DEFAULT.label());
+            let reset = format!("Reset to {}", Shortcut::DEFAULT.shown());
             let rw = p.width(&reset, &p.f.small_medium) + 26.0;
             p.button(
                 (X0 + 14.0, by - 14.0, X0 + 14.0 + rw, by + 14.0),
@@ -798,14 +727,14 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
     if let Some(s) = v.taken {
         y = p.problem(
             y,
-            &format!("Couldn't use {}", s.label()),
+            &format!("Couldn't use {}", s.shown()),
             "Another app already uses it.",
             Some(("Pick another", Hit::PickAnother)),
         ) + 8.0;
     } else if !v.hotkey_ok && v.capture.is_none() {
         y = p.problem(
             y,
-            &format!("Couldn't use {}", v.prefs.shortcut.label()),
+            &format!("Couldn't use {}", v.prefs.shortcut.shown()),
             "Another app already uses it.",
             Some(("Pick another", Hit::ChangeShortcut)),
         ) + 8.0;
@@ -845,8 +774,8 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
 
 fn segmented(p: &mut Painter, right: f32, cy: f32, on: ThemeMode) {
     let t = *p.t;
-    let fmt = p.f.small_medium.clone();
-    let fmt = &fmt;
+    let f = p.f;
+    let fmt = &f.small_medium;
     let ws: Vec<f32> = ThemeMode::ALL
         .iter()
         .map(|m| p.width(m.name(), fmt) + 24.0)
@@ -888,6 +817,40 @@ fn city_words(city: Option<&str>, chosen: bool) -> String {
         .unwrap_or_else(|| "Any kabupaten or kota".into())
 }
 
+/// The location row where the system gives no fix yet (the Mac): a dim radio, no hit.
+fn place_row_disabled(p: &mut Painter, x0: f32, x1: f32, y: f32, row: f32, compact: bool) {
+    let t = *p.t;
+    let mid = y + row / 2.0;
+    let dim = with_alpha(t.text, 0.4);
+    p.draw(|cv| {
+        cv.stroke_ellipse(
+            &ellipse(x0 + 18.0, mid, 7.5),
+            with_alpha(t.muted, 0.5),
+            1.5,
+            Stroke::Plain,
+        );
+    });
+    let w = x1 - x0 - 46.0;
+    p.text(
+        "Location",
+        if compact { &p.f.body } else { &p.f.title },
+        x0 + 36.0,
+        mid - 17.0,
+        w,
+        17.0,
+        dim,
+    );
+    p.text(
+        "Not on the Mac yet. Pick a city.",
+        &p.f.small,
+        x0 + 36.0,
+        mid + 1.0,
+        w,
+        16.0,
+        with_alpha(t.muted, 0.8),
+    );
+}
+
 /// The two place choices: Windows location and a city (the Prayer section and the first run).
 fn place_rows(
     p: &mut Painter,
@@ -916,6 +879,12 @@ fn place_rows(
     let mut y = top;
     for (h, title, sub, on) in rows {
         let r = (x0, y, x1, y + row);
+        if h == Hit::PlaceWindows && !os::W.location {
+            // No location fix on this system yet: the row stays, quiet and out of reach.
+            place_row_disabled(p, x0, x1, y, row, compact);
+            y += row;
+            continue;
+        }
         if on && compact {
             p.fill(r, 8.0, t.button);
         } else if p.hovered(h) {
@@ -1155,7 +1124,7 @@ fn adjust_row(p: &mut Painter, v: &View, top: f32) {
 
 /// Diam, Bunyi or Adzan, and the adzan files.
 fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
-    let adzan = v.prefs.at_time_sound == AtTimeSound::Adzan;
+    let adzan = os::shown_sound(v.prefs.at_time_sound) == AtTimeSound::Adzan;
     let rows: &[f32] = if adzan { &[56.0, 56.0, 56.0] } else { &[56.0] };
     let c = p.card(top, rows);
     p.row_words(
@@ -1165,7 +1134,12 @@ fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
         "Silent in full screen and while presenting",
         250.0,
     );
-    sound_segmented(p, X1 - 12.0, top + 28.0, v.prefs.at_time_sound);
+    sound_segmented(
+        p,
+        X1 - 12.0,
+        top + 28.0,
+        os::shown_sound(v.prefs.at_time_sound),
+    );
     if adzan {
         let y = top + 56.0;
         let main = v
@@ -1173,7 +1147,7 @@ fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
             .adzan_file
             .as_deref()
             .map(m::file_name)
-            .unwrap_or_else(|| "Choose an mp3 or wav on this PC".into());
+            .unwrap_or_else(|| format!("Choose an mp3 or wav on this {}", os::W.device));
         p.row_words(y, 56.0, "Adzan", &main, 120.0);
         p.button_at(
             X1 - 12.0,
@@ -1213,9 +1187,9 @@ fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
 
 fn sound_segmented(p: &mut Painter, right: f32, cy: f32, on: AtTimeSound) {
     let t = *p.t;
-    let fmt = p.f.small_medium.clone();
-    let fmt = &fmt;
-    let ws: Vec<f32> = AtTimeSound::ALL
+    let f = p.f;
+    let fmt = &f.small_medium;
+    let ws: Vec<f32> = os::sounds()
         .iter()
         .map(|s| p.width(s.name(), fmt) + 24.0)
         .collect();
@@ -1223,7 +1197,7 @@ fn sound_segmented(p: &mut Painter, right: f32, cy: f32, on: AtTimeSound) {
     let r = (right - total, cy - 16.0, right, cy + 16.0);
     p.fill(r, 10.0, t.button);
     let mut x = r.0 + 4.0;
-    for (s, w) in AtTimeSound::ALL.iter().zip(ws) {
+    for (s, w) in os::sounds().iter().zip(ws) {
         let ir = (x, r.1 + 4.0, x + w, r.3 - 4.0);
         let h = Hit::AtTime(*s);
         if *s == on {
@@ -1307,7 +1281,7 @@ fn account(p: &mut Painter, top: f32) -> f32 {
         t.text,
     );
     p.text(
-        "Everything works on this PC, offline.",
+        &format!("Everything works on this {}, offline.", os::W.device),
         &p.f.small,
         X0 + 58.0,
         top + 33.0,
@@ -1317,7 +1291,7 @@ fn account(p: &mut Painter, top: f32) -> f32 {
     );
     p.button_at(X1 - 14.0, top + 32.0, "Sign in", false, false, None);
     let y = c + 12.0;
-    p.wrap("Sync, family spaces and signed-in devices come in a later version. Nothing leaves this PC until then.", &p.f.small_wrap, X0, y, X1 - X0, 40.0, t.muted);
+    p.wrap(&format!("Sync, family spaces and signed-in devices come in a later version. Nothing leaves this {} until then.", os::W.device), &p.f.small_wrap, X0, y, X1 - X0, 40.0, t.muted);
     y + 44.0
 }
 
@@ -1326,8 +1300,9 @@ fn about(p: &mut Painter, v: &View, top: f32) -> f32 {
     p.text("Orby", &p.f.big, X0, top, 300.0, 36.0, t.text);
     p.text(
         &format!(
-            "Version {} · orb prototype for Windows",
-            env!("CARGO_PKG_VERSION")
+            "Version {} · orb prototype for {}",
+            env!("CARGO_PKG_VERSION"),
+            os::W.os
         ),
         &p.f.small,
         X0,
@@ -1347,13 +1322,20 @@ fn about(p: &mut Painter, v: &View, top: f32) -> f32 {
         true,
         Some(Hit::OpenData),
     );
-    p.row_words(y + 56.0, 56.0, "Sync", "Off. Nothing leaves this PC.", 0.0);
+    p.row_words(
+        y + 56.0,
+        56.0,
+        "Sync",
+        &format!("Off. Nothing leaves this {}.", os::W.device),
+        0.0,
+    );
     p.row_words(
         y + 112.0,
         56.0,
         "Prayer times",
         &format!(
-            "Worked out on this PC with the {} method",
+            "Worked out on this {} with the {} method",
+            os::W.device,
             v.prefs.prayer_method.name()
         ),
         0.0,
@@ -1494,9 +1476,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
             let bx = (x0, 56.0, x1, 204.0);
             p.fill(bx, 12.0, t.raised);
             p.stroke(bx, 12.0, t.hair, 1.0);
-            if let Some(dc) = p.dc {
-                sphere(p.g, dc, t, (bx.0 + bx.2) / 2.0, (bx.1 + bx.3) / 2.0, 52.0);
-            }
+            p.draw(|cv| sphere(cv, t, (bx.0 + bx.2) / 2.0, (bx.1 + bx.3) / 2.0, 52.0));
             p.text(
                 "Welcome to Orby",
                 &p.f.heading,
@@ -1542,7 +1522,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 t.text,
             );
             p.text(
-                "Worked out on this PC, offline.",
+                &format!("Worked out on this {}, offline.", os::W.device),
                 &p.f.body,
                 x0,
                 80.0,
@@ -1607,7 +1587,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                     let (parts, whole) = c.caps();
                     (parts, if whole { None } else { Some("press a key") })
                 }
-                None => (v.prefs.shortcut.parts(), None),
+                None => (v.prefs.shortcut.shown_parts(), None),
             };
             let pw = prompt.map_or(0.0, |s| p.width(s, &p.f.small) + 10.0);
             let cw = if parts.is_empty() {
@@ -1650,7 +1630,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                     Some(Hit::CaptureSave),
                 );
             } else if taken.is_some() {
-                let use_label = v.suggestion.map(|s| format!("Use {}", s.label()));
+                let use_label = v.suggestion.map(|s| format!("Use {}", s.shown()));
                 let pick_w = p.width("Pick another", &p.f.small_medium) + 26.0;
                 let total = pick_w
                     + use_label
@@ -1691,7 +1671,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 p.icon(Icon::Alert, x0 + 11.0, y + 11.0, 13.0, t.ember);
                 let w = x1 - x0 - 30.0;
                 p.text(
-                    &format!("Couldn't use {}", s.label()),
+                    &format!("Couldn't use {}", s.shown()),
                     &p.f.title,
                     x0 + 30.0,
                     y - 2.0,
@@ -1727,7 +1707,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                     );
                 } else {
                     p.text(
-                        &format!("Try it: press {}", v.prefs.shortcut.label()),
+                        &format!("Try it: press {}", v.prefs.shortcut.shown()),
                         &p.f.small,
                         x0 + 32.0,
                         y,
@@ -1738,17 +1718,9 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 }
             }
             p.line(x0, 258.0, x1, 258.0, t.hair);
+            p.text(os::W.start, &p.f.title, x0, 268.0, 190.0, 18.0, t.text);
             p.text(
-                "Start with Windows",
-                &p.f.title,
-                x0,
-                268.0,
-                190.0,
-                18.0,
-                t.text,
-            );
-            p.text(
-                "Opens quietly when you sign in",
+                os::W.first_run_start_sub,
                 &p.f.small,
                 x0,
                 286.0,
@@ -1801,7 +1773,10 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 t.muted,
             );
             p.wrap(
-                "Share task spaces with family and keep your PCs in step.",
+                &format!(
+                    "Share task spaces with family and keep your {}s in step.",
+                    os::W.device
+                ),
                 &p.f.small_wrap,
                 x0,
                 84.0,
@@ -1846,7 +1821,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 false,
                 None,
             );
-            p.wrap("Sync is off in this version. Skip it and everything still works on this PC, offline.", &p.f.small_wrap, x0, 272.0, x1 - x0, 50.0, t.muted);
+            p.wrap(&format!("Sync is off in this version. Skip it and everything still works on this {}, offline.", os::W.device), &p.f.small_wrap, x0, 272.0, x1 - x0, 50.0, t.muted);
             p.button_at(x1, by, "Skip for now", false, true, Some(Hit::Next));
             p.button_at(
                 x0 + p.width("Back", &p.f.small_medium) + 26.0,
@@ -1869,7 +1844,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 (Icon::Pin, place, "Kemenag RI".to_string()),
                 (
                     Icon::Keyboard,
-                    v.prefs.shortcut.label(),
+                    v.prefs.shortcut.shown(),
                     "show or hide".to_string(),
                 ),
                 (
@@ -1896,15 +1871,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 );
             }
             if v.fr_start {
-                p.text(
-                    "Starts with Windows.",
-                    &p.f.small,
-                    x0,
-                    214.0,
-                    x1 - x0,
-                    18.0,
-                    t.muted,
-                );
+                p.text(os::W.started, &p.f.small, x0, 214.0, x1 - x0, 18.0, t.muted);
             }
             p.button_at(x1, by, "Finish", true, true, Some(Hit::Finish));
             p.button_at(
@@ -1920,66 +1887,33 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
 }
 
 /// The welcome card's picture of the drop: a neutral chrome sphere (no colour, no gold).
-fn sphere(g: &Shared, dc: &ID2D1DeviceContext, t: Theme, cx: f32, cy: f32, r: f32) {
-    let _ = g;
+fn sphere(cv: &mut dyn Canvas, t: Theme, cx: f32, cy: f32, r: f32) {
     let stops = [
-        D2D1_GRADIENT_STOP {
-            position: 0.0,
-            color: rgba(0xFFFFFF, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 0.28,
-            color: rgba(0xD9D9DE, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 0.62,
-            color: rgba(0x4A4A52, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 0.86,
-            color: rgba(0x17171B, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 1.0,
-            color: rgba(0x8A8A92, 1.0),
-        },
+        (0.0, rgba(0xFFFFFF, 1.0)),
+        (0.28, rgba(0xD9D9DE, 1.0)),
+        (0.62, rgba(0x4A4A52, 1.0)),
+        (0.86, rgba(0x17171B, 1.0)),
+        (1.0, rgba(0x8A8A92, 1.0)),
     ];
-    unsafe {
-        let rt: &ID2D1RenderTarget = dc;
-        let Ok(coll) =
-            rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
-        else {
-            return;
-        };
-        let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-            center: pt(cx, cy),
-            gradientOriginOffset: pt(-r * 0.38, -r * 0.42),
-            radiusX: r,
-            radiusY: r,
-        };
-        let Ok(b) = dc.CreateRadialGradientBrush(&props, None, &coll) else {
-            return;
-        };
-        dc.FillEllipse(&ellipse(cx, cy, r), &b);
-        // The window's highlight and the floor's reflection, as on the drop.
-        dc.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: pt(cx + r * 0.42, cy - r * 0.5),
-                radiusX: r * 0.2,
-                radiusY: r * 0.12,
-            },
-            &brush(dc, rgba(0xFFFFFF, 0.92)),
-        );
-        dc.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: pt(cx - r * 0.5, cy + r * 0.62),
-                radiusX: r * 0.16,
-                radiusY: r * 0.1,
-            },
-            &brush(dc, rgba(0xFFFFFF, 0.55)),
-        );
-        dc.DrawEllipse(&ellipse(cx, cy, r - 0.5), &brush(dc, t.hair), 1.0, None);
-    }
+    cv.fill_radial(&ellipse(cx, cy, r), pt(-r * 0.38, -r * 0.42), &stops);
+    // The window's highlight and the floor's reflection, as on the drop.
+    cv.fill_ellipse(
+        &canvas::Ellipse {
+            point: pt(cx + r * 0.42, cy - r * 0.5),
+            rx: r * 0.2,
+            ry: r * 0.12,
+        },
+        rgba(0xFFFFFF, 0.92),
+    );
+    cv.fill_ellipse(
+        &canvas::Ellipse {
+            point: pt(cx - r * 0.5, cy + r * 0.62),
+            rx: r * 0.16,
+            ry: r * 0.1,
+        },
+        rgba(0xFFFFFF, 0.55),
+    );
+    cv.stroke_ellipse(&ellipse(cx, cy, r - 0.5), t.hair, 1.0, Stroke::Plain);
 }
 
 /// The city list's rows that fit, so the keyboard can keep the selection in view.

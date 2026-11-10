@@ -31,7 +31,8 @@
 //! - notices.rs: the notice queue every pill goes through, quiet times, the badge count and the
 //!   Notices panel (notices_model.rs decides, notices_panel.rs draws)
 //! - settings.rs: the Settings window and the first run, settings.json, the shortcut, start with
-//!   Windows, Windows location (settings_model.rs decides, settings_panel.rs draws)
+//!   Windows, Windows location (settings_model.rs decides, settings_panel.rs draws; shared, over
+//!   settings_sys.rs: settings_window.rs here, mac/settings_win.rs on the Mac)
 //! - hook.rs: the low-level mouse hook
 //! - tray.rs: the tray icon and menu commands
 //!
@@ -42,23 +43,50 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 // Shared by both systems.
+mod calendar;
 mod canvas;
+mod dial_menu;
 mod disk;
 mod disk_model;
 mod disk_panel;
 mod disk_scenes;
 mod disk_sys;
+mod downloads_model;
+mod downloads_panel;
+mod drink_panel;
+mod focus_panel;
+mod habits;
+mod habits_scenes;
+mod history;
+mod history_model;
+mod history_panel;
 mod motion;
+mod notices;
 mod notices_model;
+mod notices_panel;
 mod panel;
 mod png;
+mod settings;
 mod settings_model;
+mod settings_panel;
+mod settings_scenes;
+mod settings_sys;
 mod snapshot;
+mod store;
+mod sys;
+mod tasks;
+mod tasks_model;
+mod tasks_panel;
+mod tasks_scenes;
+mod tasks_window;
+mod tasks_window_panel;
+mod textfield;
+mod today_model;
+mod today_panel;
+mod today_scenes;
 mod ui;
 
 // Windows: Direct2D, DirectComposition and Win32 windows.
-#[cfg(windows)]
-mod calendar;
 #[cfg(windows)]
 mod depth;
 #[cfg(windows)]
@@ -70,35 +98,15 @@ mod disk_window;
 #[cfg(windows)]
 mod downloads;
 #[cfg(windows)]
-mod downloads_model;
-#[cfg(windows)]
-mod downloads_panel;
-#[cfg(windows)]
-mod drink_panel;
-#[cfg(windows)]
-mod focus_panel;
-#[cfg(windows)]
 mod frame;
 #[cfg(windows)]
 mod gfx;
-#[cfg(windows)]
-mod habits;
-#[cfg(windows)]
-mod history;
-#[cfg(windows)]
-mod history_model;
-#[cfg(windows)]
-mod history_panel;
 #[cfg(windows)]
 mod hook;
 #[cfg(windows)]
 mod khgt;
 #[cfg(windows)]
 mod morph;
-#[cfg(windows)]
-mod notices;
-#[cfg(windows)]
-mod notices_panel;
 #[cfg(windows)]
 mod orb;
 #[cfg(windows)]
@@ -108,27 +116,7 @@ mod pill;
 #[cfg(windows)]
 mod prayer;
 #[cfg(windows)]
-mod settings;
-#[cfg(windows)]
-mod settings_panel;
-#[cfg(windows)]
-mod store;
-#[cfg(windows)]
-mod tasks;
-#[cfg(windows)]
-mod tasks_model;
-#[cfg(windows)]
-mod tasks_panel;
-#[cfg(windows)]
-mod tasks_window;
-#[cfg(windows)]
-mod tasks_window_panel;
-#[cfg(windows)]
-mod textfield;
-#[cfg(windows)]
-mod today_model;
-#[cfg(windows)]
-mod today_panel;
+mod settings_window;
 #[cfg(windows)]
 mod tray;
 
@@ -140,6 +128,15 @@ include!("app_windows.rs");
 mod mac;
 #[cfg(target_os = "macos")]
 pub(crate) use mac::app::App;
+// The window modules the shared units call, as shims over the Mac App (same paths as Windows).
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)] // start_anim: for the units that animate on their own (next stages)
+pub(crate) use mac::shim::{log_line, start_anim};
+#[cfg(target_os = "macos")]
+use mac::{
+    panels,
+    shim::{dial, orb, pill, prayer},
+};
 
 #[cfg(target_os = "macos")]
 fn main() {

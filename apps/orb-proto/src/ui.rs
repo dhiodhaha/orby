@@ -3,13 +3,11 @@
 //! tabular figures everywhere, and the shared number column helper `text_num`.
 
 #[cfg(windows)]
-use windows::Win32::Graphics::Direct2D::*;
-#[cfg(windows)]
 use windows::Win32::Graphics::DirectWrite::*;
 
 use crate::canvas::*;
 #[cfg(windows)]
-use crate::gfx::{self, Shared};
+use crate::gfx::Shared;
 
 #[derive(Clone, Copy)]
 pub struct Theme {
@@ -196,24 +194,9 @@ pub const NUM_COL_SIZE: f32 = 64.0;
 /// The gap between number columns.
 pub const NUM_COL_GAP: f32 = 10.0;
 
-/// Draws a number (a size, time, count or percent) with its right edge at `right`, so digits line
-/// up row to row. All text has tabular figures on (gfx.rs applies `tnum` to every layout), so a
-/// right-aligned column is all a number needs. Use one of the `NUM_COL_*` widths to lay out the
-/// column; for a value that should roll when it changes, use `motion::rolling_text_right`.
-///
-/// `text_num(g, dc, "182 GB", &f.title, right, y, h, &ink)`
-#[cfg(windows)]
-pub fn text_num(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    s: &str,
-    fmt: &IDWriteTextFormat,
-    right: f32,
-    y: f32,
-    h: f32,
-    b: &ID2D1SolidColorBrush,
-) {
-    gfx::right_text(g, dc, s, fmt, right, y, h, b);
+/// `text_num` on the portable `Canvas`: a number with its right edge at `right`.
+pub fn num_text(cv: &mut dyn Canvas, s: &str, f: &Font, right: f32, y: f32, h: f32, c: Color) {
+    cv.right_text(s, f, right, y, h, c);
 }
 
 // ---- icons (Lucide-style, drawn on a 24 grid, stroke 1.6) ----
@@ -298,19 +281,6 @@ impl Icon {
     }
 }
 
-#[cfg(windows)]
-/// A 28 px title-band button (close, maximize): no fill until hovered, a 14 px muted icon.
-pub fn title_button(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    r: (f32, f32, f32, f32),
-    icon: Icon,
-    hover: bool,
-) {
-    paint_title_button(&mut gfx::D2dCanvas::new(g, dc), t, r, icon, hover);
-}
-
 /// A 28 px title-band button (close, maximize): no fill until hovered, a 14 px muted icon.
 pub fn paint_title_button(
     cv: &mut dyn Canvas,
@@ -324,21 +294,6 @@ pub fn paint_title_button(
     }
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
     paint_icon(cv, icon, cx, cy, 14.0, t.muted);
-}
-
-/// `paint_icon` on a Direct2D context, for the panels that still draw with Direct2D.
-#[cfg(windows)]
-pub fn draw_icon(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    icon: Icon,
-    cx: f32,
-    cy: f32,
-    size: f32,
-    b: &ID2D1SolidColorBrush,
-) {
-    let c = unsafe { b.GetColor() };
-    paint_icon(&mut gfx::D2dCanvas::new(g, dc), icon, cx, cy, size, c);
 }
 
 /// The lip's colour: white, black 4% at the bottom; dark, white 6% at the top.
@@ -996,6 +951,19 @@ pub struct Pill {
     pub action: Option<(String, PillAction)>,
     pub closable: bool,
     pub ttl_ms: u32,
+}
+
+/// A plain answer pill: an icon, two words, a close, gone after 4 s.
+pub fn info_pill(icon: Icon, title: &str, value: &str) -> Pill {
+    Pill {
+        icon,
+        dot: false,
+        title: title.into(),
+        value: value.into(),
+        action: None,
+        closable: true,
+        ttl_ms: 4000,
+    }
 }
 
 #[derive(Clone, Copy, Default)]

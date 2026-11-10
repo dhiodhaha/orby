@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::gfx::{self, Surface};
 use crate::hook::unpack;
 use crate::orb::{set_tucked, work_area, Side, Spring, INSET, WIN};
-use crate::ui::{self, Icon, Pill, PillAction, PillLayout, PillPart};
+use crate::ui::{self, Pill, PillAction, PillLayout, PillPart};
 use crate::{
     calendar, disk, downloads, habits, notices, orb, px, start_anim, tasks, tasks_model, with_app,
     App, MSG_MOUSELEAVE, TIMER_PILL, TIMER_SHAKE,
@@ -692,17 +692,7 @@ fn pill_action(app: &mut App, a: PillAction) {
     }
 }
 
-pub fn info_pill(icon: Icon, title: &str, value: &str) -> Pill {
-    Pill {
-        icon,
-        dot: false,
-        title: title.into(),
-        value: value.into(),
-        action: None,
-        closable: true,
-        ttl_ms: 4000,
-    }
-}
+pub use crate::ui::info_pill;
 
 /// One animation frame: the reveal and spread springs and the shake, then hide the window once
 /// the pill has closed.

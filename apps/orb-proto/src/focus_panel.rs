@@ -1,12 +1,9 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Focus panel (frame "v6.2 · 07"): running (the ring, session dots, held notices and the
 //! buttons) and setup (the knob, presets, task, breaks, start by itself). Drawing and hit tests.
 
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-
-use crate::gfx::*;
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::canvas::{ellipse, on_circle, pt, rrect, text_width, Canvas, Font, Stroke};
+use crate::ui::{lip, paint_icon, with_alpha, Fonts, Icon, Theme};
 
 pub const W: f32 = 360.0;
 pub const KNOB_MIN: u32 = 5;
@@ -152,16 +149,8 @@ fn buttons(run: &Run) -> Vec<(&'static str, Hit)> {
     }
 }
 
-fn row_of(
-    g: &Shared,
-    fmt: &IDWriteTextFormat,
-    labels: &[String],
-    y: f32,
-    h: f32,
-    gap: f32,
-    pad: f32,
-) -> Vec<Rect> {
-    let widths: Vec<f32> = labels.iter().map(|l| g.text_width(l, fmt) + pad).collect();
+fn row_of(fmt: &Font, labels: &[String], y: f32, h: f32, gap: f32, pad: f32) -> Vec<Rect> {
+    let widths: Vec<f32> = labels.iter().map(|l| text_width(l, fmt) + pad).collect();
     let total = widths.iter().sum::<f32>() + gap * (widths.len().saturating_sub(1)) as f32;
     let mut x = (W - total) / 2.0;
     widths
@@ -187,7 +176,7 @@ fn task_label(task: &Option<String>) -> String {
 }
 
 /// Every tappable rect, shared by drawing and hit testing so they can't drift apart.
-fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
+fn rects(f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     let mut out = Vec::new();
     match v {
         View::Setup { task, .. } => {
@@ -200,7 +189,7 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
                     KNOB_C.1 + 80.0,
                 ),
             ));
-            for (i, r) in row_of(g, &f.title, &preset_labels(), 220.0, 28.0, 6.0, 28.0)
+            for (i, r) in row_of(&f.title, &preset_labels(), 220.0, 28.0, 6.0, 28.0)
                 .into_iter()
                 .enumerate()
             {
@@ -208,9 +197,9 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
                     out.push((Hit::Preset(*p), r));
                 }
             }
-            let tw = g.text_width(&task_label(task), &f.title) + 28.0;
+            let tw = text_width(&task_label(task), &f.title) + 28.0;
             out.push((Hit::Task, (W - 20.0 - tw, 274.0, W - 20.0, 302.0)));
-            let cw = g.text_width("Change", &f.title) + 28.0;
+            let cw = text_width("Change", &f.title) + 28.0;
             out.push((Hit::Breaks, (W - 20.0 - cw, 326.0, W - 20.0, 354.0)));
             out.push((Hit::AutoStart, (W - 20.0 - 40.0, 374.0, W - 20.0, 398.0)));
             out.push((Hit::Start, (16.0, 418.0, W - 16.0, 450.0)));
@@ -218,7 +207,7 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
         View::Running { run, .. } => {
             let y = height(v) - 16.0 - 32.0;
             let labels: Vec<String> = buttons(run).iter().map(|b| b.0.to_string()).collect();
-            for (r, (_, hit)) in row_of(g, &f.title, &labels, y, 32.0, 8.0, 28.0)
+            for (r, (_, hit)) in row_of(&f.title, &labels, y, 32.0, 8.0, 28.0)
                 .into_iter()
                 .zip(buttons(run))
             {
@@ -229,8 +218,8 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     out
 }
 
-pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
-    rects(g, f, v)
+pub fn hit(f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
+    rects(f, v)
         .into_iter()
         .find(|(h, r)| {
             if *h == Hit::Knob {
@@ -243,8 +232,7 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
 }
 
 fn button(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     label: &str,
@@ -265,43 +253,32 @@ fn button(
     } else {
         fill
     };
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, h / 2.0), &brush(dc, fill));
-    }
+    cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, h / 2.0), fill);
     if !primary {
-        crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, h / 2.0, 1.0);
+        lip(cv, t, r.0, r.1, r.2, r.3, h / 2.0, 1.0);
     }
-    let ink = brush(dc, if primary { t.panel } else { t.text });
-    center_text(g, dc, label, &f.title, (r.0 + r.2) / 2.0, r.1, h, &ink);
+    let ink = if primary { t.panel } else { t.text };
+    cv.center_text(label, &f.title, (r.0 + r.2) / 2.0, r.1, h, ink);
 }
 
 fn mmss(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-pub fn draw(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
-    let text_b = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
+    let text_b = t.text;
+    let muted = t.muted;
     let hgt = height(v);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, W, hgt, 20.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(
-            &rrect(0.5, 0.5, W - 0.5, hgt - 0.5, 19.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
-    let rs = rects(g, f, v);
+    cv.fill_rrect(&rrect(0.0, 0.0, W, hgt, 20.0), t.panel);
+    cv.stroke_rrect(
+        &rrect(0.5, 0.5, W - 0.5, hgt - 0.5, 19.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
+    let rs = rects(f, v);
     let rect_of = |h: Hit| rs.iter().find(|(k, _)| *k == h).map(|(_, r)| *r);
-    let st = round_stroke(g);
+    let st = Stroke::Round;
     match v {
         View::Setup {
             minutes,
@@ -311,25 +288,14 @@ pub fn draw(
             auto_start,
             task,
         } => {
-            text(
-                dc,
-                "New focus",
-                &f.panel_title,
-                16.0,
-                14.0,
-                160.0,
-                20.0,
-                &text_b,
-            );
-            right_text(
-                g,
-                dc,
+            cv.text("New focus", &f.panel_title, 16.0, 14.0, 160.0, 20.0, text_b);
+            cv.right_text(
                 "turn, scroll or use arrows",
                 &f.small,
                 W - 16.0,
                 15.0,
                 18.0,
-                &muted,
+                muted,
             );
 
             // The knob: ticks up to the value are ink 2 px, the rest muted 1.5 px.
@@ -340,44 +306,31 @@ pub fn draw(
                 let a = knob_deg(val);
                 let on = val <= *minutes;
                 let (r0, w, b) = if on {
-                    (60.0, 2.0, &text_b)
+                    (60.0, 2.0, text_b)
                 } else {
-                    (64.0, 1.5, &muted)
+                    (64.0, 1.5, muted)
                 };
                 let r0 = if val == *minutes { 54.0 } else { r0 };
-                unsafe {
-                    dc.DrawLine(
-                        on_circle(cx, cy, r0, a),
-                        on_circle(cx, cy, 72.0, a),
-                        b,
-                        w,
-                        &st,
-                    );
-                }
+                cv.line(
+                    on_circle(cx, cy, r0, a),
+                    on_circle(cx, cy, 72.0, a),
+                    b,
+                    w,
+                    st,
+                );
             }
-            unsafe {
-                dc.FillEllipse(&ellipse(cx, cy, 46.0), &brush(dc, t.raised));
-                dc.DrawEllipse(&ellipse(cx, cy, 46.0), &brush(dc, t.hair), 1.0, None);
-            }
-            center_text(
-                g,
-                dc,
-                &minutes.to_string(),
-                &f.big,
-                cx,
-                cy - 24.0,
-                36.0,
-                &text_b,
-            );
-            center_text(g, dc, "min", &f.small, cx, cy + 10.0, 16.0, &muted);
+            cv.fill_ellipse(&ellipse(cx, cy, 46.0), t.raised);
+            cv.stroke_ellipse(&ellipse(cx, cy, 46.0), t.hair, 1.0, Stroke::Plain);
+            cv.center_text(&minutes.to_string(), &f.big, cx, cy - 24.0, 36.0, text_b);
+            cv.center_text("min", &f.small, cx, cy + 10.0, 16.0, muted);
             let p5 = on_circle(cx, cy, 82.0, SWEEP_FROM - 8.0);
             let p90 = on_circle(cx, cy, 82.0, SWEEP_FROM + SWEEP + 8.0);
-            center_text(g, dc, "5", &f.small, p5.X, p5.Y - 2.0, 16.0, &muted);
-            center_text(g, dc, "90", &f.small, p90.X, p90.Y - 2.0, 16.0, &muted);
+            cv.center_text("5", &f.small, p5.X, p5.Y - 2.0, 16.0, muted);
+            cv.center_text("90", &f.small, p90.X, p90.Y - 2.0, 16.0, muted);
 
             // Presets; Custom is lit when the knob sits between them.
             let labels = preset_labels();
-            for (i, r) in row_of(g, &f.title, &labels, 220.0, 28.0, 6.0, 28.0)
+            for (i, r) in row_of(&f.title, &labels, 220.0, 28.0, 6.0, 28.0)
                 .into_iter()
                 .enumerate()
             {
@@ -389,63 +342,51 @@ pub fn draw(
                     .get(i)
                     .is_some_and(|p| hover == Some(Hit::Preset(*p)));
                 if selected || hov {
-                    unsafe {
-                        dc.FillRoundedRectangle(
-                            &rrect(r.0, r.1, r.2, r.3, 14.0),
-                            &brush(
-                                dc,
-                                if hov && !selected {
-                                    t.button
-                                } else {
-                                    t.button_hover
-                                },
-                            ),
-                        );
-                    }
+                    cv.fill_rrect(
+                        &rrect(r.0, r.1, r.2, r.3, 14.0),
+                        if hov && !selected {
+                            t.button
+                        } else {
+                            t.button_hover
+                        },
+                    );
                 }
-                center_text(
-                    g,
-                    dc,
+                cv.center_text(
                     &labels[i],
                     if selected { &f.title } else { &f.body },
                     (r.0 + r.2) / 2.0,
                     r.1,
                     28.0,
-                    if selected { &text_b } else { &muted },
+                    if selected { text_b } else { muted },
                 );
             }
 
             // Rows.
-            let hair = brush(dc, t.hair);
+            let hair = t.hair;
             for y in [262.0, 314.0, 366.0] {
-                unsafe {
-                    dc.DrawLine(pt(20.0, y), pt(W - 20.0, y), &hair, 1.0, None);
-                }
+                cv.line(pt(20.0, y), pt(W - 20.0, y), hair, 1.0, Stroke::Plain);
             }
-            text(
-                dc,
+            cv.text(
                 "Focus on a task",
                 &f.title,
                 20.0,
                 270.0,
                 200.0,
                 18.0,
-                &text_b,
+                text_b,
             );
-            text(
-                dc,
+            cv.text(
                 "Optional. Sessions are logged against it.",
                 &f.small,
                 20.0,
                 288.0,
                 240.0,
                 16.0,
-                &muted,
+                muted,
             );
             if let Some(r) = rect_of(Hit::Task) {
                 button(
-                    g,
-                    dc,
+                    cv,
                     t,
                     f,
                     &task_label(task),
@@ -454,59 +395,54 @@ pub fn draw(
                     hover == Some(Hit::Task),
                 );
             }
-            text(dc, "Breaks", &f.title, 20.0, 322.0, 200.0, 18.0, &text_b);
-            text(
-                dc,
+            cv.text("Breaks", &f.title, 20.0, 322.0, 200.0, 18.0, text_b);
+            cv.text(
                 &format!("{short_break} min, then {long_break} min after every {every} sessions"),
                 &f.small,
                 20.0,
                 340.0,
                 260.0,
                 16.0,
-                &muted,
+                muted,
             );
             if let Some(r) = rect_of(Hit::Breaks) {
-                button(g, dc, t, f, "Change", r, false, hover == Some(Hit::Breaks));
+                button(cv, t, f, "Change", r, false, hover == Some(Hit::Breaks));
             }
-            text(
-                dc,
+            cv.text(
                 "Start the next session by itself",
                 &f.title,
                 20.0,
                 377.0,
                 240.0,
                 18.0,
-                &text_b,
+                text_b,
             );
             if let Some(r) = rect_of(Hit::AutoStart) {
-                unsafe {
-                    let track = if *auto_start {
-                        t.text
-                    } else if hover == Some(Hit::AutoStart) {
-                        t.button_hover
-                    } else {
-                        t.button
-                    };
-                    dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 12.0), &brush(dc, track));
-                    if !auto_start {
-                        dc.DrawRoundedRectangle(
-                            &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 11.5),
-                            &hair,
-                            1.0,
-                            None,
-                        );
-                    }
-                    let kx = if *auto_start { r.2 - 12.0 } else { r.0 + 12.0 };
-                    dc.FillEllipse(
-                        &ellipse(kx, (r.1 + r.3) / 2.0, 9.0),
-                        &brush(dc, if *auto_start { t.panel } else { t.muted }),
+                let track = if *auto_start {
+                    t.text
+                } else if hover == Some(Hit::AutoStart) {
+                    t.button_hover
+                } else {
+                    t.button
+                };
+                cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 12.0), track);
+                if !auto_start {
+                    cv.stroke_rrect(
+                        &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 11.5),
+                        hair,
+                        1.0,
+                        Stroke::Plain,
                     );
                 }
+                let kx = if *auto_start { r.2 - 12.0 } else { r.0 + 12.0 };
+                cv.fill_ellipse(
+                    &ellipse(kx, (r.1 + r.3) / 2.0, 9.0),
+                    if *auto_start { t.panel } else { t.muted },
+                );
             }
             if let Some(r) = rect_of(Hit::Start) {
                 button(
-                    g,
-                    dc,
+                    cv,
                     t,
                     f,
                     &format!("Start {minutes} min"),
@@ -527,63 +463,30 @@ pub fn draw(
             held,
             task,
         } => {
-            text(
-                dc,
-                "Focus",
-                &f.panel_title,
-                16.0,
-                14.0,
-                160.0,
-                20.0,
-                &text_b,
-            );
+            cv.text("Focus", &f.panel_title, 16.0, 14.0, 160.0, 20.0, text_b);
             let right = match run {
                 Run::Break { long: true } => "Long break".to_string(),
                 Run::Break { long: false } => "Short break".to_string(),
                 _ => format!("Session {session} of {of}"),
             };
-            right_text(g, dc, &right, &f.small, W - 16.0, 15.0, 18.0, &muted);
+            cv.right_text(&right, &f.small, W - 16.0, 15.0, 18.0, muted);
             let top = running_top(task);
             if let Some(name) = task {
-                text(dc, "Focus on", &f.small, 16.0, 44.0, 60.0, 28.0, &muted);
-                let w = g.text_width(name, &f.title) + 24.0;
-                unsafe {
-                    dc.FillRoundedRectangle(
-                        &rrect(76.0, 44.0, 76.0 + w, 72.0, 14.0),
-                        &brush(dc, t.button),
-                    );
-                }
-                text(dc, name, &f.title, 88.0, 44.0, w, 28.0, &text_b);
+                cv.text("Focus on", &f.small, 16.0, 44.0, 60.0, 28.0, muted);
+                let w = text_width(name, &f.title) + 24.0;
+                cv.fill_rrect(&rrect(76.0, 44.0, 76.0 + w, 72.0, 14.0), t.button);
+                cv.text(name, &f.title, 88.0, 44.0, w, 28.0, text_b);
             }
 
             // The ring: dotted is time left, solid is time spent (the orb's own motif).
             let (cx, cy) = (W / 2.0, top + RING_R);
-            unsafe {
-                dc.DrawEllipse(
-                    &ellipse(cx, cy, RING_R),
-                    &brush(dc, t.track),
-                    1.5,
-                    &dotted_stroke(g),
-                );
-            }
-            draw_arc(
-                g,
-                dc,
-                cx,
-                cy,
-                RING_R,
-                0.0,
-                360.0 * progress,
-                &text_b,
-                2.5,
-                &st,
-            );
+            cv.stroke_ellipse(&ellipse(cx, cy, RING_R), t.track, 1.5, Stroke::Dotted);
+            cv.arc(cx, cy, RING_R, 0.0, 360.0 * progress, text_b, 2.5, st);
             // The minutes left roll on the quick spring each second (motion.rs).
             let left = mmss(*left_secs);
-            let lw = g.text_width(&left, &f.timer);
-            crate::motion::rolling_text(
-                g,
-                dc,
+            let lw = text_width(&left, &f.timer);
+            crate::motion::roll_text(
+                cv,
                 "focus.timer",
                 &left,
                 crate::motion::Roll::Quick,
@@ -591,7 +494,7 @@ pub fn draw(
                 cx - lw / 2.0,
                 cy - 34.0,
                 52.0,
-                &text_b,
+                text_b,
             );
             let sub = match run {
                 Run::Focus => format!("left of {}", mmss(*length_secs)),
@@ -599,77 +502,65 @@ pub fn draw(
                 Run::Paused { prayer: None } => "paused".to_string(),
                 Run::Break { .. } => format!("break, left of {}", mmss(*length_secs)),
             };
-            center_text(g, dc, &sub, &f.small, cx, cy + 18.0, 16.0, &muted);
+            cv.center_text(&sub, &f.small, cx, cy + 18.0, 16.0, muted);
 
             // Session dots: done ones filled, the current one half filled.
             let dy = top + RING_R * 2.0 + 18.0;
             let x0 = cx - (*of as f32 - 1.0) * 6.0;
             for i in 0..*of {
                 let x = x0 + i as f32 * 12.0;
-                unsafe {
-                    if i < *done {
-                        dc.FillEllipse(&ellipse(x, dy, 3.0), &text_b);
-                    } else if i == *done && !matches!(run, Run::Break { .. }) {
-                        dc.DrawEllipse(&ellipse(x, dy, 2.6), &text_b, 0.8, None);
-                        dc.PushAxisAlignedClip(
-                            &windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
-                                left: x - 4.0,
-                                top: dy - 4.0,
-                                right: x,
-                                bottom: dy + 4.0,
-                            },
-                            D2D1_ANTIALIAS_MODE_ALIASED,
-                        );
-                        dc.FillEllipse(&ellipse(x, dy, 3.0), &text_b);
-                        dc.PopAxisAlignedClip();
-                    } else {
-                        dc.FillEllipse(&ellipse(x, dy, 3.0), &brush(dc, t.track));
-                    }
+                if i < *done {
+                    cv.fill_ellipse(&ellipse(x, dy, 3.0), text_b);
+                } else if i == *done && !matches!(run, Run::Break { .. }) {
+                    cv.stroke_ellipse(&ellipse(x, dy, 2.6), text_b, 0.8, Stroke::Plain);
+                    // The clip's edges sit on whole logical pixels, so the canvas's
+                    // antialiased clip cuts the same as the aliased one did.
+                    cv.push_clip(x - 4.0, dy - 4.0, x, dy + 4.0);
+                    cv.fill_ellipse(&ellipse(x, dy, 3.0), text_b);
+                    cv.pop_clip();
+                } else {
+                    cv.fill_ellipse(&ellipse(x, dy, 3.0), t.track);
                 }
             }
 
             if holding(run) {
                 let (l, tp, r, b) = (16.0, dy + 16.0, W - 16.0, dy + 16.0 + 56.0);
-                unsafe {
-                    dc.FillRoundedRectangle(&rrect(l, tp, r, b, 12.0), &brush(dc, t.raised));
-                    dc.DrawRoundedRectangle(
-                        &rrect(l + 0.5, tp + 0.5, r - 0.5, b - 0.5, 11.5),
-                        &brush(dc, t.hair),
-                        1.0,
-                        None,
-                    );
-                }
-                draw_icon(g, dc, Icon::Bell, l + 20.0, tp + 28.0, 15.0, &muted);
+                cv.fill_rrect(&rrect(l, tp, r, b, 12.0), t.raised);
+                cv.stroke_rrect(
+                    &rrect(l + 0.5, tp + 0.5, r - 0.5, b - 0.5, 11.5),
+                    t.hair,
+                    1.0,
+                    Stroke::Plain,
+                );
+                paint_icon(cv, Icon::Bell, l + 20.0, tp + 28.0, 15.0, muted);
                 let line1 = match held {
                     0 => "Notices wait for your break.".to_string(),
                     1 => "1 notice waits for your break.".to_string(),
                     n => format!("{n} notices wait for your break."),
                 };
-                text(
-                    dc,
+                cv.text(
                     &line1,
                     &f.small_medium,
                     l + 38.0,
                     tp + 10.0,
                     r - l - 48.0,
                     18.0,
-                    &text_b,
+                    text_b,
                 );
-                text(
-                    dc,
+                cv.text(
                     "Prayer time still comes through.",
                     &f.small,
                     l + 38.0,
                     tp + 28.0,
                     r - l - 48.0,
                     18.0,
-                    &muted,
+                    muted,
                 );
             }
 
             for (label, h) in buttons(run) {
                 if let Some(r) = rect_of(h) {
-                    button(g, dc, t, f, label, r, h == Hit::Primary, hover == Some(h));
+                    button(cv, t, f, label, r, h == Hit::Primary, hover == Some(h));
                 }
             }
         }

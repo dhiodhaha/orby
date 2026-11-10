@@ -1,11 +1,9 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Drink panel (frame "v6.2 · 08"): the glass, quick buttons, today's log with Undo on the
 //! latest entry, the last 7 days and the next reminder. Drawing and hit tests.
 
-use windows::Win32::Graphics::Direct2D::*;
-
-use crate::gfx::*;
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::canvas::{arc_to, line_to, path, pt, rrect, text_width, Canvas, Stroke};
+use crate::ui::{lip, paint_icon, with_alpha, Fonts, Icon, Theme};
 
 pub const W: f32 = 340.0;
 pub const MAX_ROWS: usize = 4;
@@ -68,7 +66,7 @@ fn glass_label(ml: u32) -> String {
     format!("+{ml}")
 }
 
-fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
+fn rects(f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     let mut out = Vec::new();
     let mut x = 16.0;
     for ml in &v.glasses {
@@ -77,12 +75,12 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
         } else {
             glass_label(*ml)
         };
-        let w = g.text_width(&label, &f.title) + 28.0;
+        let w = text_width(&label, &f.title) + 28.0;
         out.push((Hit::Glass(*ml), (x, 196.0, x + w, 228.0)));
         x += w + 8.0;
     }
     if !v.rows.is_empty() {
-        let w = g.text_width("Undo", &f.title) + 24.0;
+        let w = text_width("Undo", &f.title) + 24.0;
         out.push((
             Hit::Undo,
             (W - 20.0 - w, ROWS_Y + 4.0, W - 20.0, ROWS_Y + 32.0),
@@ -93,15 +91,15 @@ fn rects(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     out
 }
 
-pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
-    rects(g, f, v)
+pub fn hit(f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
+    rects(f, v)
         .into_iter()
         .find(|(_, r)| x >= r.0 && x <= r.2 && y >= r.1 && y <= r.3)
         .map(|(h, _)| h)
 }
 
 /// The glass: tapered, the empty part a dotted outline (still to come), the water solid.
-fn glass(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, fill: f32) {
+fn glass(cv: &mut dyn Canvas, t: &Theme, fill: f32) {
     let (top, bottom) = (52.0, 176.0);
     let (tl, tr, bl, br) = (26.0, 94.0, 32.0, 88.0);
     let x_at = |y: f32, left: bool| {
@@ -112,7 +110,7 @@ fn glass(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, fill: f32) {
             tr + (br - tr) * k
         }
     };
-    let outline = path(g, pt(tl, top), false, |k| {
+    let outline = path(pt(tl, top), false, |k| {
         line_to(k, pt(tr, top));
         line_to(k, pt(br, bottom - 6.0));
         arc_to(k, pt(br - 6.0, bottom), 6.0, false, true);
@@ -120,77 +118,57 @@ fn glass(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, fill: f32) {
         arc_to(k, pt(bl, bottom - 6.0), 6.0, false, true);
         line_to(k, pt(tl, top));
     });
-    unsafe {
-        dc.DrawGeometry(&outline, &brush(dc, t.passed), 1.5, &dotted_stroke(g));
-    }
+    cv.stroke_path(&outline, t.passed, 1.5, Stroke::Dotted);
     let fill = fill.clamp(0.0, 1.0);
     if fill <= 0.0 {
         return;
     }
     let wy = bottom - (bottom - top) * fill;
-    let water = path(g, pt(x_at(wy, true), wy), true, |k| {
+    let water = path(pt(x_at(wy, true), wy), true, |k| {
         line_to(k, pt(x_at(wy, false), wy));
         line_to(k, pt(br, bottom - 6.0));
         arc_to(k, pt(br - 6.0, bottom), 6.0, false, true);
         line_to(k, pt(bl + 6.0, bottom));
         arc_to(k, pt(bl, bottom - 6.0), 6.0, false, true);
     });
-    unsafe {
-        dc.FillGeometry(&water, &brush(dc, t.water), None);
-        dc.DrawLine(
-            pt(x_at(wy, true) + 1.0, wy),
-            pt(x_at(wy, false) - 1.0, wy),
-            &brush(dc, t.meniscus),
-            1.5,
-            &round_stroke(g),
-        );
-    }
+    cv.fill_path(&water, t.water);
+    cv.line(
+        pt(x_at(wy, true) + 1.0, wy),
+        pt(x_at(wy, false) - 1.0, wy),
+        t.meniscus,
+        1.5,
+        Stroke::Round,
+    );
 }
 
-pub fn draw(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
-    let text_b = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    let hair = brush(dc, t.hair);
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
+    let text_b = t.text;
+    let muted = t.muted;
+    let hair = t.hair;
     let hgt = height(v);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, W, hgt, 20.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(&rrect(0.5, 0.5, W - 0.5, hgt - 0.5, 19.5), &hair, 1.0, None);
-    }
-    text(
-        dc,
-        "Drink",
-        &f.panel_title,
-        16.0,
-        14.0,
-        120.0,
-        20.0,
-        &text_b,
+    cv.fill_rrect(&rrect(0.0, 0.0, W, hgt, 20.0), t.panel);
+    cv.stroke_rrect(
+        &rrect(0.5, 0.5, W - 0.5, hgt - 0.5, 19.5),
+        hair,
+        1.0,
+        Stroke::Plain,
     );
-    right_text(
-        g,
-        dc,
+    cv.text("Drink", &f.panel_title, 16.0, 14.0, 120.0, 20.0, text_b);
+    cv.right_text(
         &format!("Goal {} ml", v.goal),
         &f.small,
         W - 16.0,
         15.0,
         18.0,
-        &muted,
+        muted,
     );
 
-    glass(g, dc, t, v.total as f32 / v.goal.max(1) as f32);
+    glass(cv, t, v.total as f32 / v.goal.max(1) as f32);
     let total = v.total.to_string();
-    let tw = g.text_width(&total, &f.big);
+    let tw = text_width(&total, &f.big);
     // The total rolls to its new value after a drink is logged (or undone).
-    crate::motion::rolling_text(
-        g,
-        dc,
+    crate::motion::roll_text(
+        cv,
         "drink.total",
         &total,
         crate::motion::Roll::Slow,
@@ -198,31 +176,21 @@ pub fn draw(
         118.0,
         70.0,
         36.0,
-        &text_b,
+        text_b,
     );
-    text(
-        dc,
+    cv.text(
         &format!("/ {} ml", v.goal),
         &f.body,
         118.0 + tw + 6.0,
         78.0,
         140.0,
         30.0,
-        &muted,
+        muted,
     );
-    text(
-        dc,
-        &v.to_go,
-        &f.small,
-        118.0,
-        114.0,
-        W - 134.0,
-        16.0,
-        &muted,
-    );
-    text(dc, &v.pace, &f.small, 118.0, 130.0, W - 134.0, 16.0, &muted);
+    cv.text(&v.to_go, &f.small, 118.0, 114.0, W - 134.0, 16.0, muted);
+    cv.text(&v.pace, &f.small, 118.0, 130.0, W - 134.0, 16.0, muted);
 
-    let rs = rects(g, f, v);
+    let rs = rects(f, v);
     for (h, r) in &rs {
         let hov = hover == Some(*h);
         match h {
@@ -244,82 +212,63 @@ pub fn draw(
                 } else {
                     t.button
                 };
-                unsafe {
-                    dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 16.0), &brush(dc, fill));
-                }
+                cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 16.0), fill);
                 if !primary {
-                    crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 16.0, 1.0);
+                    lip(cv, t, r.0, r.1, r.2, r.3, 16.0, 1.0);
                 }
-                center_text(
-                    g,
-                    dc,
+                cv.center_text(
                     &label,
                     &f.title,
                     (r.0 + r.2) / 2.0,
                     r.1,
                     32.0,
-                    &brush(dc, if primary { t.panel } else { t.text }),
+                    if primary { t.panel } else { t.text },
                 );
             }
             Hit::Undo => {
-                unsafe {
-                    dc.FillRoundedRectangle(
-                        &rrect(r.0, r.1, r.2, r.3, 14.0),
-                        &brush(dc, if hov { t.button_hover } else { t.button }),
-                    );
-                }
-                crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 14.0, 1.0);
-                center_text(
-                    g,
-                    dc,
-                    "Undo",
-                    &f.title,
-                    (r.0 + r.2) / 2.0,
-                    r.1,
-                    28.0,
-                    &text_b,
+                cv.fill_rrect(
+                    &rrect(r.0, r.1, r.2, r.3, 14.0),
+                    if hov { t.button_hover } else { t.button },
                 );
+                lip(cv, t, r.0, r.1, r.2, r.3, 14.0, 1.0);
+                cv.center_text("Undo", &f.title, (r.0 + r.2) / 2.0, r.1, 28.0, text_b);
             }
             Hit::Week => {}
         }
     }
 
     // Today's log, latest first.
-    text(dc, "Today", &f.small, 16.0, 244.0, 100.0, 16.0, &muted);
+    cv.text("Today", &f.small, 16.0, 244.0, 100.0, 16.0, muted);
     if v.rows.is_empty() {
-        text(
-            dc,
+        cv.text(
             "Nothing logged yet today.",
             &f.body,
             20.0,
             ROWS_Y,
             W - 40.0,
             ROW_H,
-            &muted,
+            muted,
         );
     }
     for (i, row) in v.rows.iter().take(MAX_ROWS).enumerate() {
         let y0 = ROWS_Y + ROW_H * i as f32;
         if i > 0 {
-            unsafe {
-                dc.DrawLine(pt(16.0, y0), pt(W - 16.0, y0), &hair, 1.0, None);
-            }
+            cv.line(pt(16.0, y0), pt(W - 16.0, y0), hair, 1.0, Stroke::Plain);
         }
         // Rows ripple in when the panel opens (motion.rs).
-        crate::motion::with_row(dc, crate::motion::ripple_row("drink.rows", i), || {
-            text(dc, &row.time, &f.small, 20.0, y0, 48.0, ROW_H, &muted);
+        crate::motion::row(cv, crate::motion::ripple_row("drink.rows", i), |cv| {
+            cv.text(&row.time, &f.small, 20.0, y0, 48.0, ROW_H, muted);
             let amount = format!("{} ml", row.ml);
-            let aw = g.text_width(&amount, &f.title);
-            text(dc, &amount, &f.title, 70.0, y0, aw + 2.0, ROW_H, &text_b);
-            text(
-                dc,
+            let aw = text_width(&amount, &f.title);
+            cv.text(&amount, &f.title, 70.0, y0, aw + 2.0, ROW_H, text_b);
+            cv.text(
                 &row.source,
                 &f.body,
                 70.0 + aw + 5.0,
                 y0,
                 140.0,
                 ROW_H,
-                &muted,
+                muted,
             );
         });
     }
@@ -327,19 +276,16 @@ pub fn draw(
     // The last 7 days: met days grey, short days track, today ink; the goal is a dashed line.
     let wy = week_y(v);
     let week_hover = hover == Some(Hit::Week);
-    text(
-        dc,
+    cv.text(
         "Last 7 days",
         &f.small,
         16.0,
         wy,
         120.0,
         16.0,
-        if week_hover { &text_b } else { &muted },
+        if week_hover { text_b } else { muted },
     );
-    right_text(
-        g,
-        dc,
+    cv.right_text(
         if week_hover {
             "Open History"
         } else {
@@ -349,7 +295,7 @@ pub fn draw(
         W - 16.0,
         wy,
         16.0,
-        if week_hover { &text_b } else { &muted },
+        if week_hover { text_b } else { muted },
     );
     let bottom = wy + 24.0 + BARS_H;
     let n = v.week.len().max(1) as f32;
@@ -373,30 +319,26 @@ pub fn draw(
         } else {
             t.track
         };
-        unsafe {
-            dc.FillRoundedRectangle(&rrect(x, bottom - h, x + bw, bottom, 3.0), &brush(dc, c));
-        }
+        cv.fill_rrect(&rrect(x, bottom - h, x + bw, bottom, 3.0), c);
         let (fmt, ink) = if b.today {
-            (&f.small_medium, &text_b)
+            (&f.small_medium, text_b)
         } else {
-            (&f.small, &muted)
+            (&f.small, muted)
         };
-        center_text(g, dc, &b.label, fmt, x + bw / 2.0, bottom + 4.0, 16.0, ink);
+        cv.center_text(&b.label, fmt, x + bw / 2.0, bottom + 4.0, 16.0, ink);
     }
     let gy = bottom - v.goal as f32 / scale * BARS_H;
-    unsafe {
-        dc.DrawLine(
-            pt(16.0, gy),
-            pt(W - 16.0, gy),
-            &brush(dc, with_alpha(t.muted, 0.8)),
-            1.0,
-            &dashed_stroke(g),
-        );
-    }
+    cv.line(
+        pt(16.0, gy),
+        pt(W - 16.0, gy),
+        with_alpha(t.muted, 0.8),
+        1.0,
+        Stroke::Dashed,
+    );
 
     let fy = bottom + 20.0 + 14.0;
-    draw_icon(g, dc, Icon::Clock, 24.0, fy + 9.0, 14.0, &muted);
-    text(dc, &v.next, &f.small, 38.0, fy, W - 54.0, 18.0, &muted);
+    paint_icon(cv, Icon::Clock, 24.0, fy + 9.0, 14.0, muted);
+    cv.text(&v.next, &f.small, 38.0, fy, W - 54.0, 18.0, muted);
 }
 
 #[cfg(test)]

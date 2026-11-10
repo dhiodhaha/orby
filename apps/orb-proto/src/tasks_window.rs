@@ -3,30 +3,27 @@
 //! `tasks::commit`, so a change in one shows in the other. Like the Disk window it is not
 //! topmost, a click elsewhere leaves it open, and Esc, its close button, Alt+F4 or the taskbar
 //! close it. tasks_model.rs decides (groups, reorder, edits); tasks_window_panel.rs draws.
+//!
+//! What it shows and does is shared by both systems; the window itself is the Win32 part at the
+//! end of this file on Windows and `mac/tasks_win.rs` on macOS (`show_window`, `close_window`,
+//! `render`, the Undo timer, maximize), over the same state in `Win`.
 
 use std::time::Instant;
 
-use windows::core::w;
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
-
 use app_store::{EntityRef, Task, TaskEdit, TaskId};
 
-use crate::gfx::Surface;
-use crate::hook::unpack;
+use crate::sys::{self, vk};
 use crate::tasks::{self, clock};
 use crate::tasks_model::{self as m, Clock, Group, Selection, WinItem, DUE_PICKS};
 use crate::tasks_window_panel::{self as twp, Hit, ItemV, RowV};
 use crate::textfield::{Key, TextField};
 use crate::ui::{self, Icon};
-use crate::{dial, frame, log_line, orb, panels, px, with_app, App, MSG_MOUSELEAVE};
+use crate::{dial, log_line, panels, App};
 
-/// About 60 frames a second, only while a ripple or a rolling number moves.
-const TIMER_FRAME: usize = 1;
+#[cfg(target_os = "macos")]
+use crate::mac::tasks_win::{arm_undo, close_window, disarm_undo, render, show_window, toggle_max};
+
 /// The Undo bar after a delete goes after this long.
-const TIMER_UNDO: usize = 2;
 const UNDO_MS: u32 = 8000;
 
 /// Where the keyboard is: the add field, a task, or the Done heading.
@@ -40,24 +37,31 @@ enum Focus {
 
 #[derive(Default)]
 pub struct Win {
-    pub hwnd: HWND,
-    surface: Option<Surface>,
+    #[cfg(windows)]
+    pub hwnd: windows::Win32::Foundation::HWND,
+    #[cfg(windows)]
+    surface: Option<crate::gfx::Surface>,
+    #[cfg(windows)]
+    tracking: bool,
+    /// The window itself on the Mac (mac/tasks_win.rs).
+    #[cfg(target_os = "macos")]
+    pub(crate) mac: crate::mac::tasks_win::MacWin,
     pub open: bool,
     /// The window's size (logical px): `twp::W` by the screen's room when it opens, then whatever
     /// it is resized, snapped or maximized to.
-    w: f32,
-    h: f32,
-    max: bool,
-    hover: Option<Hit>,
-    mouse: Option<(f32, f32)>,
-    tracking: bool,
-    ticking: bool,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+    pub(crate) max: bool,
+    pub(crate) hover: Option<Hit>,
+    pub(crate) mouse: Option<(f32, f32)>,
+    /// A ripple or a rolling number moves: frames keep coming.
+    pub(crate) ticking: bool,
     /// The window is the active one (the caret shows only then).
-    active: bool,
+    pub(crate) active: bool,
     field: TextField,
     focus: Focus,
     /// The ring shows after a key, not after a click.
-    kb: bool,
+    pub(crate) kb: bool,
     editing: Option<(TaskId, TextField)>,
     /// The due menu: the task it is for and the keyboard's row.
     menu: Option<(TaskId, usize)>,
@@ -139,7 +143,7 @@ fn field_view(f: &TextField, focused: bool) -> twp::FieldV {
     }
 }
 
-fn view(app: &App) -> twp::View {
+pub(crate) fn view(app: &App) -> twp::View {
     let c = clock();
     let w = &app.tasks.win;
     let its = items(app);
@@ -231,6 +235,12 @@ fn view(app: &App) -> twp::View {
     v
 }
 
+/// What is under a point of the window (logical px from its top-left).
+#[cfg_attr(windows, allow(dead_code))] // Windows' proc calls twp::hit with its view in hand
+pub(crate) fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
+    twp::hit(&app.fonts, &view(app), x, y)
+}
+
 pub fn dial_child(app: &App) -> ui::DialChild {
     let n = app.tasks.snap.tasks.values().filter(|t| !t.done).count();
     ui::DialChild {
@@ -247,30 +257,24 @@ pub fn dial_child(app: &App) -> ui::DialChild {
 
 // ---- the window ----
 
-/// `H` tall when the screen has room, less on a short one.
-fn room(app: &App) -> f32 {
-    let wa = orb::work_area(app.hwnd);
-    let tall = (wa.bottom - wa.top) as f32 / app.scale - 32.0;
-    tall.clamp(twp::MIN_H, twp::H)
-}
-
 /// Opens the window centred on the orb's screen, or brings it to the front if it is open.
 pub fn show(app: &mut App) {
     dial::close_dial(app);
     if app.panel_open {
         // The panel would hand the keyboard back to the app it took it from; this window takes it.
-        app.panel_prev_fg = HWND::default();
+        #[cfg(windows)]
+        {
+            app.panel_prev_fg = windows::Win32::Foundation::HWND::default();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            app.panel_prev_app = None;
+        }
         panels::close_panel(app);
     }
-    let hwnd = app.tasks.win.hwnd;
     if app.tasks.win.open {
         refresh(app);
-        unsafe {
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-            }
-        }
-        take_foreground(app);
+        show_window(app, true);
         return;
     }
     let w = &mut app.tasks.win;
@@ -284,22 +288,9 @@ pub fn show(app: &mut App) {
     w.menu = None;
     w.editing = None;
     w.notice = None;
-    // A window closed while maximized opens maximized again; otherwise it opens at its own size,
-    // centred on the orb's screen.
-    if frame::is_max(hwnd) {
-        sync_size(app);
-    } else {
-        app.tasks.win.w = twp::W;
-        app.tasks.win.h = room(app);
-        app.tasks.win.max = false;
-        place(app, true);
-    }
     crate::motion::ripple_reset("tasks.win");
-    render(app);
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
-    }
-    take_foreground(app);
+    // Sizes it, draws it, shows it and gives it the keyboard.
+    show_window(app, false);
     let n = app.tasks.snap.tasks.len();
     log_line(app, &format!("tasks: window open, {n} tasks"));
 }
@@ -316,109 +307,21 @@ pub fn close(app: &mut App) {
     w.ticking = false;
     w.menu = None;
     w.undo = None;
-    unsafe {
-        let _ = KillTimer(Some(w.hwnd), TIMER_FRAME);
-        let _ = KillTimer(Some(w.hwnd), TIMER_UNDO);
-        let _ = ShowWindow(w.hwnd, SW_HIDE);
-    }
-    // The swap chain is let go while the window is hidden.
-    w.surface = None;
+    close_window(app);
     log_line(app, "tasks: window closed");
 }
 
-/// Sizes the window to `w` × `h` and centres it on the orb's screen (on open).
-fn place(app: &App, center: bool) {
-    let (w, h) = (
-        px(app, app.tasks.win.w).ceil() as i32,
-        px(app, app.tasks.win.h).ceil() as i32,
-    );
-    let hwnd = app.tasks.win.hwnd;
-    let (x, y) = if center {
-        let wa = orb::work_area(app.hwnd);
-        ((wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2)
-    } else {
-        let mut r = RECT::default();
-        unsafe {
-            let _ = GetWindowRect(hwnd, &mut r);
-        }
-        (r.left, r.top)
-    };
-    unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
-    }
-    frame::shape(hwnd, app.scale);
-}
-
-/// The panel's size from the window's.
-fn sync_size(app: &mut App) {
-    let hwnd = app.tasks.win.hwnd;
-    let (cw, ch) = frame::client_size(hwnd);
-    let w = &mut app.tasks.win;
-    w.w = cw as f32 / app.scale;
-    w.h = ch as f32 / app.scale;
-    w.max = frame::is_max(hwnd);
-}
-
-/// The window changed size from outside (a drag on an edge, a snap, maximize or restore): the
-/// panel takes the new size.
-fn on_size(app: &mut App) {
-    sync_size(app);
-    frame::shape(app.tasks.win.hwnd, app.scale);
+/// The window took a new size from outside (an edge, a snap, maximize or restore; `w`, `h` and
+/// `max` are already set): the scroll and the hover follow, and it draws.
+pub(crate) fn after_resize(app: &mut App) {
     let v = view(app);
     app.tasks.win.scroll = v.scroll;
     app.tasks.win.hover = app
         .tasks
         .win
         .mouse
-        .and_then(|(x, y)| twp::hit(&app.g, &app.fonts, &v, x, y));
+        .and_then(|(x, y)| twp::hit(&app.fonts, &v, x, y));
     render(app);
-}
-
-fn take_foreground(app: &mut App) {
-    let hwnd = app.tasks.win.hwnd;
-    unsafe {
-        let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(Some(hwnd));
-        // WM_ACTIVATE arrives inside those calls, while the App is borrowed, so read the result.
-        app.tasks.win.active = GetForegroundWindow() == hwnd;
-    }
-    render(app);
-}
-
-fn render(app: &mut App) {
-    if !app.tasks.win.open {
-        return;
-    }
-    // The surface covers the client area, whatever set its size (open, a drag, a snap, maximize).
-    let hwnd = app.tasks.win.hwnd;
-    let (cw, ch) = frame::client_size(hwnd);
-    let (w, h) = (cw.max(1) as u32, ch.max(1) as u32);
-    match app.tasks.win.surface.as_mut() {
-        None => app.tasks.win.surface = Surface::new(&app.g, hwnd, w, h, app.scale).ok(),
-        Some(s) if s.w != w || s.h != h => {
-            let _ = s.resize(&app.g, w, h);
-        }
-        _ => {}
-    }
-    let v = view(app);
-    let Some(s) = app.tasks.win.surface.as_ref() else {
-        return;
-    };
-    let dc = s.begin(&app.g);
-    twp::draw(&app.g, dc, &app.theme, &app.fonts, &v, app.tasks.win.hover);
-    s.end(&app.g);
-    // Frames only while a ripple or a rolling number moves.
-    let moving = crate::motion::active();
-    if moving != app.tasks.win.ticking {
-        app.tasks.win.ticking = moving;
-        unsafe {
-            if moving {
-                SetTimer(Some(hwnd), TIMER_FRAME, 16, None);
-            } else {
-                let _ = KillTimer(Some(hwnd), TIMER_FRAME);
-            }
-        }
-    }
 }
 
 /// Redraw after the tasks changed (here, in the panel, Today or a due pill). A focused task that
@@ -449,13 +352,20 @@ pub fn refresh(app: &mut App) {
         .tasks
         .win
         .mouse
-        .and_then(|(x, y)| twp::hit(&app.g, &app.fonts, &v, x, y));
+        .and_then(|(x, y)| twp::hit(&app.fonts, &v, x, y));
     render(app);
 }
 
 /// Redraw as it is (the theme changed).
 pub fn redraw(app: &mut App) {
     render(app);
+}
+
+/// The Undo bar's time is up.
+pub(crate) fn on_undo_timer(app: &mut App) {
+    if app.tasks.win.undo.take().is_some() {
+        refresh(app);
+    }
 }
 
 // ---- what it does ----
@@ -467,7 +377,7 @@ fn report(app: &mut App, what: &str, r: app_store::Result<()>) {
     }
 }
 
-fn task_at(app: &App, i: usize) -> Option<Task> {
+pub(crate) fn task_at(app: &App, i: usize) -> Option<Task> {
     match items(app).into_iter().nth(i)? {
         WinItem::Task(_, t) => Some(*t),
         WinItem::Header(..) => None,
@@ -552,21 +462,18 @@ fn delete(app: &mut App, t: Task) {
                 .unwrap_or_default();
         }
         app.tasks.win.undo = Some(t);
-        unsafe {
-            SetTimer(Some(app.tasks.win.hwnd), TIMER_UNDO, UNDO_MS, None);
-        }
+        arm_undo(app, UNDO_MS);
     }
     report(app, "delete the task", r);
     tasks::commit(app);
 }
 
-fn undo(app: &mut App) {
+/// Puts the last deleted task back (Undo, Ctrl+Z).
+pub(crate) fn undo(app: &mut App) {
     let Some(t) = app.tasks.win.undo.take() else {
         return;
     };
-    unsafe {
-        let _ = KillTimer(Some(app.tasks.win.hwnd), TIMER_UNDO);
-    }
+    disarm_undo(app);
     let c = clock();
     let r = app
         .tasks
@@ -634,7 +541,7 @@ fn set_due(app: &mut App, id: &TaskId, k: usize) {
 }
 
 /// Alt+Up or Alt+Down on the focused task.
-fn move_task(app: &mut App, up: bool) {
+pub(crate) fn move_task(app: &mut App, up: bool) {
     let Focus::Task(id) = app.tasks.win.focus.clone() else {
         return;
     };
@@ -725,59 +632,65 @@ fn step_focus(app: &mut App, down: bool) {
 }
 
 fn ctrl() -> bool {
-    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
+    sys::ctrl_down()
 }
 
 fn shift() -> bool {
-    unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
+    sys::shift_down()
 }
 
-fn edit_key(f: &mut TextField, vk: VIRTUAL_KEY, hwnd: HWND) -> bool {
-    let k = match vk {
-        VK_LEFT => Key::Left,
-        VK_RIGHT => Key::Right,
-        VK_HOME => Key::Home,
-        VK_END => Key::End,
-        VK_BACK => Key::Backspace,
-        VK_DELETE => Key::Delete,
-        VIRTUAL_KEY(0x41) if ctrl() => {
+/// An editing key in a field; `clip` is the clipboard's text, read for Ctrl+V.
+fn edit_key(f: &mut TextField, k: u16, clip: Option<String>) -> bool {
+    let key = match k {
+        vk::VK_LEFT => Key::Left,
+        vk::VK_RIGHT => Key::Right,
+        vk::VK_HOME => Key::Home,
+        vk::VK_END => Key::End,
+        vk::VK_BACK => Key::Backspace,
+        vk::VK_DELETE => Key::Delete,
+        0x41 if ctrl() => {
             f.select_all();
             return true;
         }
-        VIRTUAL_KEY(0x56) if ctrl() => {
-            if let Some(s) = tasks::read_clipboard(hwnd) {
+        0x56 if ctrl() => {
+            if let Some(s) = clip {
                 f.insert(&s);
             }
             return true;
         }
         _ => return false,
     };
-    f.key(k, ctrl(), shift());
+    f.key(key, ctrl(), shift());
     true
 }
 
-fn on_keydown(app: &mut App, vk: u16) -> bool {
-    let vk = VIRTUAL_KEY(vk);
-    let hwnd = app.tasks.win.hwnd;
+/// A key in the window (WM_KEYDOWN on Windows, the input view on the Mac).
+pub(crate) fn on_keydown(app: &mut App, k: u16) -> bool {
+    // Ctrl+V pastes the clipboard's text into whichever field has the keyboard.
+    let clip = if k == 0x56 && ctrl() {
+        sys::read_clipboard(app)
+    } else {
+        None
+    };
     app.tasks.win.notice = None;
     // The due menu first: it holds the keys while it is open.
     if let Some((id, sel)) = app.tasks.win.menu.clone() {
-        match vk {
-            VK_UP | VK_DOWN => {
+        match k {
+            vk::VK_UP | vk::VK_DOWN => {
                 let n = DUE_PICKS.len();
-                let sel = if vk == VK_UP {
+                let sel = if k == vk::VK_UP {
                     (sel + n - 1) % n
                 } else {
                     (sel + 1) % n
                 };
                 app.tasks.win.menu = Some((id, sel));
             }
-            VK_RETURN | VK_SPACE => {
-                app.tasks.win.eat_char = vk == VK_SPACE;
+            vk::VK_RETURN | vk::VK_SPACE => {
+                app.tasks.win.eat_char = k == vk::VK_SPACE;
                 set_due(app, &id, sel);
                 return true;
             }
-            VK_ESCAPE => app.tasks.win.menu = None,
+            vk::VK_ESCAPE => app.tasks.win.menu = None,
             _ => return true,
         }
         render(app);
@@ -785,15 +698,15 @@ fn on_keydown(app: &mut App, vk: u16) -> bool {
     }
     // Then an inline edit: Enter saves, Esc puts the title back.
     if app.tasks.win.editing.is_some() {
-        match vk {
-            VK_RETURN | VK_TAB => save_edit(app),
-            VK_ESCAPE => {
+        match k {
+            vk::VK_RETURN | vk::VK_TAB => save_edit(app),
+            vk::VK_ESCAPE => {
                 app.tasks.win.editing = None;
                 render(app);
             }
             _ => {
                 if let Some((_, f)) = app.tasks.win.editing.as_mut() {
-                    if !edit_key(f, vk, hwnd) {
+                    if !edit_key(f, k, clip) {
                         return false;
                     }
                 }
@@ -802,37 +715,37 @@ fn on_keydown(app: &mut App, vk: u16) -> bool {
         }
         return true;
     }
-    if vk == VIRTUAL_KEY(0x5A) && ctrl() && app.tasks.win.undo.is_some() {
+    if k == 0x5A && ctrl() && app.tasks.win.undo.is_some() {
         undo(app);
         return true;
     }
-    match (app.tasks.win.focus.clone(), vk) {
-        (_, VK_UP) => step_focus(app, false),
-        (_, VK_DOWN) => step_focus(app, true),
-        (Focus::Field, VK_TAB) => step_focus(app, true),
-        (_, VK_TAB) => app.tasks.win.focus = Focus::Field,
-        (Focus::Field, VK_ESCAPE) => {
+    match (app.tasks.win.focus.clone(), k) {
+        (_, vk::VK_UP) => step_focus(app, false),
+        (_, vk::VK_DOWN) => step_focus(app, true),
+        (Focus::Field, vk::VK_TAB) => step_focus(app, true),
+        (_, vk::VK_TAB) => app.tasks.win.focus = Focus::Field,
+        (Focus::Field, vk::VK_ESCAPE) => {
             if app.tasks.win.field.is_empty() {
                 close(app);
                 return true;
             }
             app.tasks.win.field.clear();
         }
-        (_, VK_ESCAPE) => {
+        (_, vk::VK_ESCAPE) => {
             close(app);
             return true;
         }
-        (Focus::Field, VK_RETURN) => {
+        (Focus::Field, vk::VK_RETURN) => {
             add(app);
             return true;
         }
         (Focus::Field, _) => {
-            if !edit_key(&mut app.tasks.win.field, vk, hwnd) {
+            if !edit_key(&mut app.tasks.win.field, k, clip) {
                 return false;
             }
         }
-        (Focus::DoneHeader, VK_RETURN | VK_SPACE) => {
-            app.tasks.win.eat_char = vk == VK_SPACE;
+        (Focus::DoneHeader, vk::VK_RETURN | vk::VK_SPACE) => {
+            app.tasks.win.eat_char = k == vk::VK_SPACE;
             toggle_done_group(app);
             return true;
         }
@@ -841,19 +754,19 @@ fn on_keydown(app: &mut App, vk: u16) -> bool {
                 return false;
             };
             app.tasks.win.kb = true;
-            match vk {
-                VK_RETURN | VK_F2 => start_edit(app, &t),
-                VK_SPACE => {
+            match k {
+                vk::VK_RETURN | vk::VK_F2 => start_edit(app, &t),
+                vk::VK_SPACE => {
                     app.tasks.win.eat_char = true;
                     toggle(app, &t);
                     return true;
                 }
-                VK_DELETE => {
+                vk::VK_DELETE => {
                     delete(app, t);
                     return true;
                 }
                 // D opens the due menu.
-                VIRTUAL_KEY(0x44) if !t.done && !ctrl() => {
+                0x44 if !t.done && !ctrl() => {
                     app.tasks.win.eat_char = true;
                     app.tasks.win.menu = Some((id, 0));
                 }
@@ -867,7 +780,7 @@ fn on_keydown(app: &mut App, vk: u16) -> bool {
 }
 
 /// Typing: into the inline edit, else the add field (a letter typed on a task moves there).
-fn on_char(app: &mut App, unit: u16) {
+pub(crate) fn on_char(app: &mut App, unit: u16) {
     let w = &mut app.tasks.win;
     if std::mem::take(&mut w.eat_char) || w.menu.is_some() {
         return;
@@ -888,15 +801,39 @@ fn on_char(app: &mut App, unit: u16) {
     }
 }
 
+/// The field that has the keyboard (the inline edit, else the add field, while no menu is
+/// open): the Mac's composition, Cmd+C and Cmd+X work on it.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn field_mut(app: &mut App) -> Option<&mut TextField> {
+    let w = &mut app.tasks.win;
+    if w.menu.is_some() {
+        return None;
+    }
+    match w.editing.as_mut() {
+        Some((_, f)) => Some(f),
+        None if w.focus == Focus::Field => Some(&mut w.field),
+        None => None,
+    }
+}
+
+/// A composition starts in the add field even when a task had the keyboard (as typing does).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn focus_field_for_typing(app: &mut App) {
+    let w = &mut app.tasks.win;
+    if w.editing.is_none() && w.menu.is_none() {
+        w.focus = Focus::Field;
+    }
+}
+
 // ---- the mouse ----
 
-fn press(app: &mut App, x: f32, y: f32) {
+pub(crate) fn press(app: &mut App, x: f32, y: f32) {
     let v = view(app);
-    match twp::hit(&app.g, &app.fonts, &v, x, y) {
+    match twp::hit(&app.fonts, &v, x, y) {
         Some(Hit::Field) => {
             save_edit(app);
             let v = view(app);
-            let b = twp::field_byte_at(&app.g, &app.fonts, &v, x);
+            let b = twp::field_byte_at(&app.fonts, &v, x);
             let w = &mut app.tasks.win;
             w.menu = None;
             w.focus = Focus::Field;
@@ -904,7 +841,7 @@ fn press(app: &mut App, x: f32, y: f32) {
             render(app);
         }
         Some(Hit::Edit(_)) => {
-            let b = twp::edit_byte_at(&app.g, &app.fonts, &v, x);
+            let b = twp::edit_byte_at(&app.fonts, &v, x);
             if let Some((_, f)) = app.tasks.win.editing.as_mut() {
                 f.place(b, shift());
             }
@@ -914,7 +851,7 @@ fn press(app: &mut App, x: f32, y: f32) {
     }
 }
 
-fn click(app: &mut App, h: Option<Hit>) {
+pub(crate) fn click(app: &mut App, h: Option<Hit>) {
     app.tasks.win.notice = None;
     app.tasks.win.kb = false;
     if let Some((id, _)) = app.tasks.win.menu.clone() {
@@ -932,7 +869,7 @@ fn click(app: &mut App, h: Option<Hit>) {
     let Some(h) = h else { return render(app) };
     match h {
         Hit::Close => return close(app),
-        Hit::Max => frame::toggle(app.tasks.win.hwnd),
+        Hit::Max => toggle_max(app),
         Hit::Field | Hit::Edit(_) | Hit::Menu(_) => {}
         Hit::Add => return add(app),
         Hit::Undo => return undo(app),
@@ -956,7 +893,7 @@ fn click(app: &mut App, h: Option<Hit>) {
         }
         Hit::Title(i) => {
             if let Some(t) = task_at(app, i) {
-                let twice = unsafe { GetDoubleClickTime() } as u128;
+                let twice = sys::double_click_ms();
                 let double = app
                     .tasks
                     .win
@@ -976,7 +913,8 @@ fn click(app: &mut App, h: Option<Hit>) {
     render(app);
 }
 
-fn on_wheel(app: &mut App, delta: i16) {
+/// The wheel, in Windows' units (120 a notch, 48 px of list).
+pub(crate) fn on_wheel(app: &mut App, delta: i16) {
     let v = view(app);
     let s = (v.scroll - delta as f32 / 120.0 * 48.0).clamp(0.0, twp::max_scroll(&v));
     if s != v.scroll {
@@ -986,175 +924,387 @@ fn on_wheel(app: &mut App, delta: i16) {
     }
 }
 
-/// The wheel's point comes in screen pixels.
-fn client_point(hwnd: HWND, lparam: LPARAM) -> POINT {
-    let (sx, sy) = unpack(lparam);
-    let mut p = POINT {
-        x: sx as i32,
-        y: sy as i32,
-    };
-    unsafe {
-        let _ = ScreenToClient(hwnd, &mut p);
-    }
-    p
+/// One line for a test drive: open, size, focus, the field, the menu, Undo and the first items.
+#[cfg_attr(windows, allow(dead_code))] // the Mac's test channel (`tasks-state`)
+pub(crate) fn state_line(app: &App) -> String {
+    let w = &app.tasks.win;
+    let its = items(app);
+    let first: Vec<String> = its
+        .iter()
+        .take(8)
+        .map(|it| match it {
+            WinItem::Header(g, n) => format!("[{} {n}]", g.name()),
+            WinItem::Task(_, t) => format!("{}{}", t.title, if t.done { " (done)" } else { "" }),
+        })
+        .collect();
+    format!(
+        "window open {} {:.0}x{:.0}{} active {}, focus {:?}, field \"{}\", editing {}, menu {}, undo {}: {}",
+        w.open,
+        w.w,
+        w.h,
+        if w.max { " max" } else { "" },
+        w.active,
+        w.focus,
+        w.field.text(),
+        w.editing.as_ref().map_or("none".into(), |(_, f)| format!("\"{}\"", f.text())),
+        w.menu.as_ref().map_or("none".into(), |(_, k)| k.to_string()),
+        w.undo.as_ref().map_or("none".into(), |t| format!("\"{}\"", t.title)),
+        first.join(" | ")
+    )
 }
 
-pub unsafe extern "system" fn tasks_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if let Some(r) = frame::nc_message(hwnd, msg, wparam, lparam, twp::W, twp::MIN_H) {
-        return r;
+// ---- the Win32 window ----
+
+#[cfg(windows)]
+use win32::{arm_undo, close_window, disarm_undo, render, show_window, toggle_max};
+#[cfg(windows)]
+pub use win32::{make_window, tasks_proc};
+
+#[cfg(windows)]
+mod win32 {
+    use windows::core::w;
+    use windows::Win32::Foundation::*;
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    use super::{after_resize, click, close, move_task, on_char, on_keydown, on_undo_timer};
+    use super::{on_wheel, press, view};
+    use crate::gfx::Surface;
+    use crate::hook::unpack;
+    use crate::tasks_window_panel as twp;
+    use crate::{frame, orb, px, with_app, App, MSG_MOUSELEAVE};
+
+    /// About 60 frames a second, only while a ripple or a rolling number moves.
+    const TIMER_FRAME: usize = 1;
+    /// The Undo bar after a delete goes after `UNDO_MS`.
+    const TIMER_UNDO: usize = 2;
+
+    /// `H` tall when the screen has room, less on a short one.
+    fn room(app: &App) -> f32 {
+        let wa = orb::work_area(app.hwnd);
+        let tall = (wa.bottom - wa.top) as f32 / app.scale - 32.0;
+        tall.clamp(twp::MIN_H, twp::H)
     }
-    match msg {
-        WM_NCHITTEST => {
-            // The edges resize; the title band's empty part drags the window (a double click on
-            // it maximizes or restores).
-            let p = client_point(hwnd, lparam);
-            let ht = with_app(|app| {
-                if let Some(e) = frame::edge_hit(hwnd, p, app.scale) {
-                    return e;
+
+    /// Shows the window: `again` brings an open one to the front; otherwise it opens maximized
+    /// if it was closed so, else at its own size, centred on the orb's screen.
+    pub(super) fn show_window(app: &mut App, again: bool) {
+        let hwnd = app.tasks.win.hwnd;
+        if again {
+            unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
-                let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
-                if y < twp::TOP && twp::hit(&app.g, &app.fonts, &view(app), x, y).is_none() {
-                    HTCAPTION
+            }
+            take_foreground(app);
+            return;
+        }
+        if frame::is_max(hwnd) {
+            sync_size(app);
+        } else {
+            app.tasks.win.w = twp::W;
+            app.tasks.win.h = room(app);
+            app.tasks.win.max = false;
+            place(app, true);
+        }
+        render(app);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        take_foreground(app);
+    }
+
+    pub(super) fn close_window(app: &mut App) {
+        let w = &mut app.tasks.win;
+        unsafe {
+            let _ = KillTimer(Some(w.hwnd), TIMER_FRAME);
+            let _ = KillTimer(Some(w.hwnd), TIMER_UNDO);
+            let _ = ShowWindow(w.hwnd, SW_HIDE);
+        }
+        // The swap chain is let go while the window is hidden.
+        w.surface = None;
+    }
+
+    pub(super) fn arm_undo(app: &mut App, ms: u32) {
+        unsafe {
+            SetTimer(Some(app.tasks.win.hwnd), TIMER_UNDO, ms, None);
+        }
+    }
+
+    pub(super) fn disarm_undo(app: &mut App) {
+        unsafe {
+            let _ = KillTimer(Some(app.tasks.win.hwnd), TIMER_UNDO);
+        }
+    }
+
+    pub(super) fn toggle_max(app: &mut App) {
+        frame::toggle(app.tasks.win.hwnd);
+    }
+
+    /// Sizes the window to `w` × `h` and centres it on the orb's screen (on open).
+    fn place(app: &App, center: bool) {
+        let (w, h) = (
+            px(app, app.tasks.win.w).ceil() as i32,
+            px(app, app.tasks.win.h).ceil() as i32,
+        );
+        let hwnd = app.tasks.win.hwnd;
+        let (x, y) = if center {
+            let wa = orb::work_area(app.hwnd);
+            ((wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2)
+        } else {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(hwnd, &mut r);
+            }
+            (r.left, r.top)
+        };
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+        frame::shape(hwnd, app.scale);
+    }
+
+    /// The panel's size from the window's.
+    fn sync_size(app: &mut App) {
+        let hwnd = app.tasks.win.hwnd;
+        let (cw, ch) = frame::client_size(hwnd);
+        let w = &mut app.tasks.win;
+        w.w = cw as f32 / app.scale;
+        w.h = ch as f32 / app.scale;
+        w.max = frame::is_max(hwnd);
+    }
+
+    /// The window changed size from outside (a drag on an edge, a snap, maximize or restore): the
+    /// panel takes the new size.
+    fn on_size(app: &mut App) {
+        sync_size(app);
+        frame::shape(app.tasks.win.hwnd, app.scale);
+        after_resize(app);
+    }
+
+    fn take_foreground(app: &mut App) {
+        let hwnd = app.tasks.win.hwnd;
+        unsafe {
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+            // WM_ACTIVATE arrives inside those calls, while the App is borrowed, so read the result.
+            app.tasks.win.active = GetForegroundWindow() == hwnd;
+        }
+        render(app);
+    }
+
+    pub(super) fn render(app: &mut App) {
+        if !app.tasks.win.open {
+            return;
+        }
+        // The surface covers the client area, whatever set its size (open, a drag, a snap, maximize).
+        let hwnd = app.tasks.win.hwnd;
+        let (cw, ch) = frame::client_size(hwnd);
+        let (w, h) = (cw.max(1) as u32, ch.max(1) as u32);
+        match app.tasks.win.surface.as_mut() {
+            None => app.tasks.win.surface = Surface::new(&app.g, hwnd, w, h, app.scale).ok(),
+            Some(s) if s.w != w || s.h != h => {
+                let _ = s.resize(&app.g, w, h);
+            }
+            _ => {}
+        }
+        let v = view(app);
+        let Some(s) = app.tasks.win.surface.as_ref() else {
+            return;
+        };
+        let dc = s.begin(&app.g);
+        twp::draw(
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+            &app.theme,
+            &app.fonts,
+            &v,
+            app.tasks.win.hover,
+        );
+        s.end(&app.g);
+        // Frames only while a ripple or a rolling number moves.
+        let moving = crate::motion::active();
+        if moving != app.tasks.win.ticking {
+            app.tasks.win.ticking = moving;
+            unsafe {
+                if moving {
+                    SetTimer(Some(hwnd), TIMER_FRAME, 16, None);
                 } else {
-                    HTCLIENT
+                    let _ = KillTimer(Some(hwnd), TIMER_FRAME);
                 }
-            })
-            .unwrap_or(HTCLIENT);
-            return LRESULT(ht as isize);
-        }
-        WM_SIZE if wparam.0 as u32 != SIZE_MINIMIZED => {
-            with_app(|app| {
-                if app.tasks.win.open {
-                    on_size(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        WM_ACTIVATE => {
-            let on = (wparam.0 & 0xffff) != 0;
-            with_app(|app| {
-                if app.tasks.win.active != on {
-                    app.tasks.win.active = on;
-                    render(app);
-                }
-            });
-        }
-        WM_MOUSEMOVE => {
-            with_app(|app| {
-                let (x, y) = unpack(lparam);
-                let (x, y) = (x / app.scale, y / app.scale);
-                if !app.tasks.win.tracking {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut tme);
-                    app.tasks.win.tracking = true;
-                }
-                app.tasks.win.mouse = Some((x, y));
-                let h = twp::hit(&app.g, &app.fonts, &view(app), x, y);
-                if h != app.tasks.win.hover {
-                    app.tasks.win.hover = h;
-                    render(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        MSG_MOUSELEAVE => {
-            with_app(|app| {
-                app.tasks.win.tracking = false;
-                app.tasks.win.mouse = None;
-                if app.tasks.win.hover.take().is_some() {
-                    render(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        WM_TIMER if wparam.0 == TIMER_FRAME => {
-            with_app(render);
-            return LRESULT(0);
-        }
-        WM_TIMER if wparam.0 == TIMER_UNDO => {
-            with_app(|app| {
-                let _ = KillTimer(Some(hwnd), TIMER_UNDO);
-                if app.tasks.win.undo.take().is_some() {
-                    refresh(app);
-                }
-            });
-            return LRESULT(0);
-        }
-        WM_LBUTTONDOWN => {
-            with_app(|app| {
-                let (x, y) = unpack(lparam);
-                press(app, x / app.scale, y / app.scale);
-            });
-            return LRESULT(0);
-        }
-        WM_LBUTTONUP => {
-            with_app(|app| {
-                let (x, y) = unpack(lparam);
-                let h = twp::hit(&app.g, &app.fonts, &view(app), x / app.scale, y / app.scale);
-                click(app, h);
-            });
-            return LRESULT(0);
-        }
-        WM_MOUSEWHEEL => {
-            let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16;
-            with_app(|app| on_wheel(app, delta));
-            return LRESULT(0);
-        }
-        WM_KEYDOWN => {
-            if with_app(|app| on_keydown(app, wparam.0 as u16)).unwrap_or(false) {
-                return LRESULT(0);
             }
         }
-        // Alt+Up and Alt+Down move the focused task; other Alt keys (Alt+F4) go on as usual.
-        WM_SYSKEYDOWN
-            if VIRTUAL_KEY(wparam.0 as u16) == VK_UP || VIRTUAL_KEY(wparam.0 as u16) == VK_DOWN =>
-        {
-            let up = VIRTUAL_KEY(wparam.0 as u16) == VK_UP;
-            with_app(|app| {
-                app.tasks.win.kb = true;
-                move_task(app, up);
-            });
-            return LRESULT(0);
-        }
-        WM_CHAR => {
-            with_app(|app| on_char(app, wparam.0 as u16));
-            return LRESULT(0);
-        }
-        WM_CLOSE => {
-            with_app(close);
-            return LRESULT(0);
-        }
-        _ => {}
     }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
 
-/// An ordinary top-level window (taskbar, Alt+Tab), drawn by DirectComposition.
-pub fn make_window(hinst: HINSTANCE) -> windows::core::Result<HWND> {
-    unsafe {
-        CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
-            w!("OrbTasks"),
-            w!("Orby tasks"),
-            frame::STYLE,
-            0,
-            0,
-            twp::W as i32,
-            twp::H as i32,
-            None,
-            None,
-            Some(hinst),
-            None,
-        )
+    /// The wheel's point comes in screen pixels.
+    fn client_point(hwnd: HWND, lparam: LPARAM) -> POINT {
+        let (sx, sy) = unpack(lparam);
+        let mut p = POINT {
+            x: sx as i32,
+            y: sy as i32,
+        };
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut p);
+        }
+        p
+    }
+
+    pub unsafe extern "system" fn tasks_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if let Some(r) = frame::nc_message(hwnd, msg, wparam, lparam, twp::W, twp::MIN_H) {
+            return r;
+        }
+        match msg {
+            WM_NCHITTEST => {
+                // The edges resize; the title band's empty part drags the window (a double click on
+                // it maximizes or restores).
+                let p = client_point(hwnd, lparam);
+                let ht = with_app(|app| {
+                    if let Some(e) = frame::edge_hit(hwnd, p, app.scale) {
+                        return e;
+                    }
+                    let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
+                    if y < twp::TOP && twp::hit(&app.fonts, &view(app), x, y).is_none() {
+                        HTCAPTION
+                    } else {
+                        HTCLIENT
+                    }
+                })
+                .unwrap_or(HTCLIENT);
+                return LRESULT(ht as isize);
+            }
+            WM_SIZE if wparam.0 as u32 != SIZE_MINIMIZED => {
+                with_app(|app| {
+                    if app.tasks.win.open {
+                        on_size(app);
+                    }
+                });
+                return LRESULT(0);
+            }
+            WM_ACTIVATE => {
+                let on = (wparam.0 & 0xffff) != 0;
+                with_app(|app| {
+                    if app.tasks.win.active != on {
+                        app.tasks.win.active = on;
+                        render(app);
+                    }
+                });
+            }
+            WM_MOUSEMOVE => {
+                with_app(|app| {
+                    let (x, y) = unpack(lparam);
+                    let (x, y) = (x / app.scale, y / app.scale);
+                    if !app.tasks.win.tracking {
+                        let mut tme = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        };
+                        let _ = TrackMouseEvent(&mut tme);
+                        app.tasks.win.tracking = true;
+                    }
+                    app.tasks.win.mouse = Some((x, y));
+                    let h = twp::hit(&app.fonts, &view(app), x, y);
+                    if h != app.tasks.win.hover {
+                        app.tasks.win.hover = h;
+                        render(app);
+                    }
+                });
+                return LRESULT(0);
+            }
+            MSG_MOUSELEAVE => {
+                with_app(|app| {
+                    app.tasks.win.tracking = false;
+                    app.tasks.win.mouse = None;
+                    if app.tasks.win.hover.take().is_some() {
+                        render(app);
+                    }
+                });
+                return LRESULT(0);
+            }
+            WM_TIMER if wparam.0 == TIMER_FRAME => {
+                with_app(render);
+                return LRESULT(0);
+            }
+            WM_TIMER if wparam.0 == TIMER_UNDO => {
+                with_app(|app| {
+                    let _ = KillTimer(Some(hwnd), TIMER_UNDO);
+                    on_undo_timer(app);
+                });
+                return LRESULT(0);
+            }
+            WM_LBUTTONDOWN => {
+                with_app(|app| {
+                    let (x, y) = unpack(lparam);
+                    press(app, x / app.scale, y / app.scale);
+                });
+                return LRESULT(0);
+            }
+            WM_LBUTTONUP => {
+                with_app(|app| {
+                    let (x, y) = unpack(lparam);
+                    let h = twp::hit(&app.fonts, &view(app), x / app.scale, y / app.scale);
+                    click(app, h);
+                });
+                return LRESULT(0);
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16;
+                with_app(|app| on_wheel(app, delta));
+                return LRESULT(0);
+            }
+            WM_KEYDOWN => {
+                if with_app(|app| on_keydown(app, wparam.0 as u16)).unwrap_or(false) {
+                    return LRESULT(0);
+                }
+            }
+            // Alt+Up and Alt+Down move the focused task; other Alt keys (Alt+F4) go on as usual.
+            WM_SYSKEYDOWN
+                if VIRTUAL_KEY(wparam.0 as u16) == VK_UP
+                    || VIRTUAL_KEY(wparam.0 as u16) == VK_DOWN =>
+            {
+                let up = VIRTUAL_KEY(wparam.0 as u16) == VK_UP;
+                with_app(|app| {
+                    app.tasks.win.kb = true;
+                    move_task(app, up);
+                });
+                return LRESULT(0);
+            }
+            WM_CHAR => {
+                with_app(|app| on_char(app, wparam.0 as u16));
+                return LRESULT(0);
+            }
+            WM_CLOSE => {
+                with_app(close);
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    /// An ordinary top-level window (taskbar, Alt+Tab), drawn by DirectComposition.
+    pub fn make_window(hinst: HINSTANCE) -> windows::core::Result<HWND> {
+        unsafe {
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
+                w!("OrbTasks"),
+                w!("Orby tasks"),
+                frame::STYLE,
+                0,
+                0,
+                twp::W as i32,
+                twp::H as i32,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+        }
     }
 }

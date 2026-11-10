@@ -5,29 +5,20 @@
 //! ("Earlier today", notices_panel.rs draws it).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
-use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_PRESENTATION_MODE};
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 use app_habits::Moment;
 
+use crate::canvas::Canvas;
 use crate::notices_model::{self as m, Keep, Merge, Mute, MuteFor, Next, Now, Offered, Quiet};
 pub use crate::notices_model::{Notice, Priority, Source};
 use crate::notices_panel::{self as np, Hit, MenuItem, Row, View};
 use crate::panels::{self, Kind};
+use crate::sys::{self, vk::*, Timer};
 use crate::ui::{DialChild, Icon, Pill, PillAction};
-use crate::{habits, log_line, orb, pill, settings, App, TIMER_NOTICES, WM_APP_FOREGROUND};
+use crate::{habits, log_line, orb, pill, settings, App};
 
 pub struct Notices {
     pub q: m::Queue,
@@ -130,7 +121,7 @@ fn unix_now() -> i64 {
 fn clock() -> Now {
     Now {
         at: habits::now(),
-        ms: unsafe { GetTickCount64() },
+        ms: sys::tick_ms(),
     }
 }
 
@@ -341,27 +332,14 @@ fn arm(app: &mut App) {
     if let Some(t) = app.notices.paused_until.filter(|t| *t > now.at) {
         take(t.since(now.at).as_millis() as u64 + 50);
     }
-    unsafe {
-        match ms {
-            Some(ms) => {
-                SetTimer(
-                    Some(app.hwnd),
-                    TIMER_NOTICES,
-                    ms.clamp(50, u32::MAX as u64) as u32,
-                    None,
-                );
-            }
-            None => {
-                let _ = KillTimer(Some(app.hwnd), TIMER_NOTICES);
-            }
-        }
+    match ms {
+        Some(ms) => sys::arm(app, Timer::Notices, ms.clamp(50, u32::MAX as u64) as u32),
+        None => sys::disarm(app, Timer::Notices),
     }
 }
 
 pub fn on_timer(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_NOTICES);
-    }
+    sys::disarm(app, Timer::Notices);
     if app.notices.paused_until.is_some_and(|t| habits::now() >= t) {
         app.notices.paused_until = None;
         log_line(app, "notices: pause ended");
@@ -397,119 +375,31 @@ pub fn sync_quiet(app: &mut App) -> Option<m::Release> {
     r
 }
 
-static FG_PENDING: AtomicBool = AtomicBool::new(false);
-static mut FG_HWND: HWND = HWND(std::ptr::null_mut());
-
-unsafe extern "system" fn win_event(
-    _: HWINEVENTHOOK,
-    event: u32,
-    hwnd: HWND,
-    id_object: i32,
-    id_child: i32,
-    _: u32,
-    _: u32,
-) {
-    let relevant = event == EVENT_SYSTEM_FOREGROUND
-        || (id_object == OBJID_WINDOW.0 && id_child == 0 && hwnd == GetForegroundWindow());
-    // Many location changes in a row become one message.
-    if relevant && !FG_PENDING.swap(true, Ordering::AcqRel) {
-        let _ = PostMessageW(Some(FG_HWND), WM_APP_FOREGROUND, WPARAM(0), LPARAM(0));
-    }
-}
-
-/// Watches foreground changes, and the foreground window's size (a video going full screen
-/// without a change of window). Both arrive as one coalesced WM_APP_FOREGROUND.
+/// Watches the foreground for full screen (`sys::watch_foreground`; Windows: foreground and
+/// size changes arrive as one coalesced WM_APP_FOREGROUND, which calls `on_foreground`).
 pub fn start(app: &mut App) {
-    unsafe {
-        FG_HWND = app.hwnd;
-        let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-        let a = SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
-            None,
-            Some(win_event),
-            0,
-            0,
-            flags,
-        );
-        let b = SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE,
-            EVENT_OBJECT_LOCATIONCHANGE,
-            None,
-            Some(win_event),
-            0,
-            0,
-            flags,
-        );
-        let ok = !a.is_invalid() && !b.is_invalid();
-        log_line(
-            app,
-            &format!(
-                "notices: watching the foreground ({ok}); {} mute(s) saved",
-                app.notices.q.mutes.len()
-            ),
-        );
-    }
+    let ok = sys::watch_foreground(app);
+    log_line(
+        app,
+        &format!(
+            "notices: watching the foreground ({ok}); {} mute(s) saved",
+            app.notices.q.mutes.len()
+        ),
+    );
     on_foreground(app);
 }
 
-fn class_of(h: HWND) -> String {
-    let mut buf = [0u16; 64];
-    let n = unsafe { GetClassNameW(h, &mut buf) };
-    String::from_utf16_lossy(&buf[..n.max(0) as usize])
-}
-
-/// Windows presentation mode (PowerPoint's slide show, "presentation settings").
-fn presenting_now() -> bool {
-    unsafe { matches!(SHQueryUserNotificationState(), Ok(s) if s == QUNS_PRESENTATION_MODE) }
-}
-
-/// Presentation mode, or a full-screen foreground window on the orb's own monitor. A maximized
-/// window with a title bar is not full screen.
+/// Presentation mode or a full-screen app on the orb's monitor (`sys::full_screen`), or the
+/// tray's test.
 fn full_screen_now(app: &App) -> bool {
-    if app.notices.test_full_screen {
-        return true;
-    }
-    unsafe {
-        if presenting_now() {
-            return true;
-        }
-        let fg = GetForegroundWindow();
-        if fg.is_invalid() || [app.hwnd, app.pill_hwnd, app.dial_hwnd, app.panel_hwnd].contains(&fg)
-        {
-            return false;
-        }
-        if matches!(
-            class_of(fg).as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-        ) {
-            return false;
-        }
-        let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-        if mon != MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTONEAREST) {
-            return false;
-        }
-        let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        let _ = GetMonitorInfoW(mon, &mut mi);
-        let mut r = RECT::default();
-        let _ = GetWindowRect(fg, &mut r);
-        let m = mi.rcMonitor;
-        let covers =
-            r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
-        let style = GetWindowLongW(fg, GWL_STYLE) as u32;
-        let titled = IsZoomed(fg).as_bool() && style & WS_CAPTION.0 == WS_CAPTION.0;
-        covers && !titled
-    }
+    app.notices.test_full_screen || sys::full_screen(app)
 }
 
 /// WM_APP_FOREGROUND: the orb hides itself for a full-screen app and comes back after it.
 pub fn on_foreground(app: &mut App) {
-    FG_PENDING.store(false, Ordering::Release);
+    sys::foreground_seen();
     let fs = full_screen_now(app);
-    let presenting = presenting_now();
+    let presenting = sys::presenting();
     if presenting != app.notices.presenting {
         app.notices.presenting = presenting;
         log_line(
@@ -755,9 +645,7 @@ pub fn on_panel_closed(app: &mut App) {
     app.notices.note = None;
     app.notices.focus_row = None;
     // What waited its turn comes once the panel has gone (or another panel took its place).
-    unsafe {
-        SetTimer(Some(app.hwnd), TIMER_NOTICES, 50, None);
-    }
+    sys::arm(app, Timer::Notices, 50);
 }
 
 fn row(e: &m::Entry, unseen: bool) -> Row {
@@ -838,11 +726,11 @@ pub fn size(app: &App) -> (f32, f32) {
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    np::hit(&app.g, &app.fonts, &view(app), x, y)
+    np::hit(&app.fonts, &view(app), x, y)
 }
 
-pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
-    np::draw(&app.g, dc, &app.theme, &app.fonts, &view(app), hover);
+pub fn draw_panel(app: &App, cv: &mut dyn Canvas, hover: Option<Hit>) {
+    np::draw(cv, &app.theme, &app.fonts, &view(app), hover);
 }
 
 /// The panel's timer: Undo after Clear all goes after 6 s.
@@ -958,8 +846,8 @@ pub fn right_click(app: &mut App, h: Option<Hit>) {
 /// Shift+F10 or the menu key opens the row menu, Esc closes the menu, then the panel.
 pub fn on_keydown(app: &mut App, vk: u16) -> bool {
     let v = view(app);
-    let k = VIRTUAL_KEY(vk);
-    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+    let k = vk;
+    let shift = sys::shift_down();
     if app.notices.menu.is_some() {
         let n = np::MENU.len();
         match k {
