@@ -48,12 +48,18 @@ mod disk_model;
 mod disk_panel;
 mod disk_scenes;
 mod disk_sys;
+mod downloads_model;
+mod downloads_panel;
 mod motion;
 mod notices_model;
+mod notices_panel;
 mod panel;
 mod png;
 mod settings_model;
 mod snapshot;
+mod today_model;
+mod today_panel;
+mod today_scenes;
 mod ui;
 
 // Windows: Direct2D, DirectComposition and Win32 windows.
@@ -69,10 +75,6 @@ mod disk_restore;
 mod disk_window;
 #[cfg(windows)]
 mod downloads;
-#[cfg(windows)]
-mod downloads_model;
-#[cfg(windows)]
-mod downloads_panel;
 #[cfg(windows)]
 mod drink_panel;
 #[cfg(windows)]
@@ -97,8 +99,6 @@ mod khgt;
 mod morph;
 #[cfg(windows)]
 mod notices;
-#[cfg(windows)]
-mod notices_panel;
 #[cfg(windows)]
 mod orb;
 #[cfg(windows)]
@@ -125,10 +125,6 @@ mod tasks_window;
 mod tasks_window_panel;
 #[cfg(windows)]
 mod textfield;
-#[cfg(windows)]
-mod today_model;
-#[cfg(windows)]
-mod today_panel;
 #[cfg(windows)]
 mod tray;
 

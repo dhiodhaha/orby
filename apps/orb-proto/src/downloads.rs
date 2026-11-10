@@ -1112,11 +1112,17 @@ pub fn height(app: &App) -> f32 {
 }
 
 pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
-    dp::draw(&app.g, dc, &app.theme, &app.fonts, &view(app), hover);
+    dp::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &view(app),
+        hover,
+    );
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    dp::hit(&app.g, &app.fonts, &view(app), x, y)
+    dp::hit(&app.fonts, &view(app), x, y)
 }
 
 pub fn click(app: &mut App, h: Hit) {
@@ -1271,7 +1277,13 @@ fn render_menu(app: &mut App) {
         return;
     };
     let dc = s.begin(&app.g);
-    dp::draw_menu(&app.g, dc, &app.theme, &app.fonts, chosen, hover);
+    dp::draw_menu(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        chosen,
+        hover,
+    );
     s.end(&app.g);
 }
 
@@ -1347,7 +1359,7 @@ pub fn open_offer_menu(app: &mut App) {
 fn open_job_menu(app: &mut App, row: usize, id: JobId) {
     let v = view(app);
     let (Some(chip), Some(job)) = (
-        dp::btn_rect(&app.g, &app.fonts, &v, row, Btn::Format),
+        dp::btn_rect(&app.fonts, &v, row, Btn::Format),
         app.dl.queue.get(id),
     ) else {
         return;

@@ -838,11 +838,17 @@ pub fn size(app: &App) -> (f32, f32) {
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    np::hit(&app.g, &app.fonts, &view(app), x, y)
+    np::hit(&app.fonts, &view(app), x, y)
 }
 
 pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
-    np::draw(&app.g, dc, &app.theme, &app.fonts, &view(app), hover);
+    np::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &view(app),
+        hover,
+    );
 }
 
 /// The panel's timer: Undo after Clear all goes after 6 s.

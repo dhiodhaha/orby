@@ -731,11 +731,17 @@ pub fn height(app: &App) -> f32 {
 }
 
 pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
-    tp::draw(&app.g, dc, &app.theme, &app.fonts, &view(app), hover);
+    tp::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &view(app),
+        hover,
+    );
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    tp::hit(&app.g, &app.fonts, &view(app), x, y)
+    tp::hit(&app.fonts, &view(app), x, y)
 }
 
 fn act(app: &mut App, target: Target, join_only: bool) {
