@@ -320,6 +320,24 @@ impl Win {
         }
     }
 
+    /// Draws into a subview's layer (`w` x `h`), in this window's colour space.
+    fn paint_sub(
+        &self,
+        sub: &NSView,
+        w: f32,
+        h: f32,
+        scale: f32,
+        draw: impl FnOnce(&mut dyn Canvas),
+    ) {
+        let space = self.panel.colorSpace().and_then(|s| s.CGColorSpace());
+        let b = match &space {
+            Some(sp) => Bitmap::with_space(w, h, scale, sp),
+            None => Bitmap::new(w, h, scale),
+        };
+        draw(&mut b.canvas());
+        set_contents(sub, &b, scale);
+    }
+
     /// Draws with the shared Canvas into a bitmap that becomes the view's layer contents.
     fn paint(&self, scale: f32, draw: impl FnOnce(&mut dyn Canvas)) {
         let space = self.panel.colorSpace().and_then(|s| s.CGColorSpace());
@@ -328,19 +346,24 @@ impl Win {
             None => Bitmap::new(self.w, self.h, scale),
         };
         draw(&mut b.canvas());
-        let Some(img) = b.image() else { return };
-        let Some(layer) = self.view.layer() else {
-            return;
-        };
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        // A CGImage is a CFType, toll-free bridged to an object.
-        let obj: &AnyObject =
-            unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
-        unsafe { layer.setContents(Some(obj)) };
-        layer.setContentsScale(scale as f64);
-        CATransaction::commit();
+        set_contents(&self.view, &b, scale);
     }
+}
+
+/// Makes a bitmap a view's layer contents, without an implicit animation.
+pub(crate) fn set_contents(view: &NSView, b: &Bitmap, scale: f32) {
+    let Some(img) = b.image() else { return };
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    // A CGImage is a CFType, toll-free bridged to an object.
+    let obj: &AnyObject =
+        unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
+    unsafe { layer.setContents(Some(obj)) };
+    layer.setContentsScale(scale as f64);
+    CATransaction::commit();
 }
 
 // ---- the menu bar item's target ----
@@ -482,6 +505,13 @@ pub(crate) struct App {
     // The Prayer panel.
     panel_open: bool,
     panel_hover: Option<panel::Hit>,
+    /// The countdown's own layer: a second turning redraws only it, not the whole panel.
+    countdown_view: Retained<NSView>,
+    countdown_shown: String,
+    countdown_rolling: bool,
+    /// The panel needs a full redraw at the next tick (and the minute it last drew).
+    panel_dirty: bool,
+    panel_min: i64,
     // Prayer.
     prefs: Prefs,
     times: Times,
@@ -1411,7 +1441,35 @@ impl App {
         )
     }
 
+    /// The whole panel: on open, hover, a click, and once a minute (the sun's place on the
+    /// arc). The countdown is drawn apart, on its own layer.
     fn render_panel(&mut self) {
+        let now_min = clock::now_minutes();
+        let (next, mins_left, place, qibla) = self.panel_view_data();
+        let view = panel::View {
+            times: &self.times,
+            now_min,
+            next,
+            mins_left,
+            place: &place,
+            method: self.prefs.prayer_method.short(),
+            qibla,
+            reminders: self.prefs.prayer_reminders,
+            hover: self.panel_hover,
+            countdown_apart: true,
+        };
+        let (t, f) = (self.theme, &self.fonts);
+        self.panel_win
+            .paint(self.scale, |cv| panel::draw(cv, &t, f, &view));
+        self.panel_dirty = false;
+        self.panel_min = now_min.floor() as i64;
+        self.countdown_shown.clear();
+        self.render_countdown();
+    }
+
+    /// Only the countdown's small layer: when its digits change and while they roll. An idle
+    /// open panel draws a few hundred pixels a second instead of the whole panel each frame.
+    fn render_countdown(&mut self) {
         let (next, mins_left, place, qibla) = self.panel_view_data();
         let view = panel::View {
             times: &self.times,
@@ -1423,10 +1481,22 @@ impl App {
             qibla,
             reminders: self.prefs.prayer_reminders,
             hover: self.panel_hover,
+            countdown_apart: true,
         };
-        let (t, f) = (self.theme, &self.fonts);
+        let shown = panel::countdown(&view);
+        // While a roll moves, every frame; once it settles, one more frame at rest.
+        let rolling = crate::motion::active();
+        if shown == self.countdown_shown && !rolling && !self.countdown_rolling {
+            return;
+        }
+        self.countdown_rolling = rolling;
+        let (l, t, r, b) = panel::countdown_rect(&self.fonts);
+        let (th, f) = (self.theme, &self.fonts);
         self.panel_win
-            .paint(self.scale, |cv| panel::draw(cv, &t, f, &view));
+            .paint_sub(&self.countdown_view, r - l, b - t, self.scale, |cv| {
+                panel::draw_countdown(cv, &th, f, &view)
+            });
+        self.countdown_shown = shown;
     }
 
     fn place_panel(&mut self) {
@@ -1878,7 +1948,12 @@ impl App {
             }
         }
         if self.panel_open {
-            self.render_panel();
+            let m = clock::now_minutes().floor() as i64;
+            if self.panel_dirty || m != self.panel_min {
+                self.render_panel();
+            } else {
+                self.render_countdown();
+            }
         }
         if self.dial_branch.is_some() && !self.branch_reveal.settled(0.002) {
             self.branch_reveal.step(dt);
@@ -2030,6 +2105,17 @@ pub fn run() {
         false,
     );
     let panel_win = Win::new(mtm, Kind::Panel, panel::W, panel::H, LEVEL_PANEL, true);
+    let countdown_view = {
+        let (l, t, r, b) = panel::countdown_rect(&Fonts::new());
+        let frame = NSRect::new(
+            NSPoint::new(l as f64, t as f64),
+            NSSize::new((r - l) as f64, (b - t) as f64),
+        );
+        let v = NSView::initWithFrame(NSView::alloc(mtm), frame);
+        v.setWantsLayer(true);
+        panel_win.view.addSubview(&v);
+        v
+    };
 
     // The menu bar item.
     let target = MenuTarget::new(mtm);
@@ -2097,6 +2183,11 @@ pub fn run() {
         pill_queued: false,
         panel_open: false,
         panel_hover: None,
+        countdown_view,
+        countdown_shown: String::new(),
+        countdown_rolling: false,
+        panel_dirty: true,
+        panel_min: -1,
         prefs,
         times,
         tomorrow_subuh,

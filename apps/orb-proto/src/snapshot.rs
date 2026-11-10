@@ -128,6 +128,7 @@ pub fn panel_view(d: &PanelData) -> crate::panel::View<'_> {
         qibla: "295° WNW".into(),
         reminders: [true, true, false],
         hover: None,
+        countdown_apart: false,
     }
 }
 

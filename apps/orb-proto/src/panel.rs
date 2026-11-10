@@ -20,6 +20,9 @@ pub struct View<'a> {
     pub qibla: String,
     pub reminders: [bool; 3],
     pub hover: Option<Hit>,
+    /// The countdown digits are drawn on their own layer (`draw_countdown`), so a second turning
+    /// redraws only them (macOS); Windows draws them with the panel.
+    pub countdown_apart: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -75,6 +78,51 @@ fn chip_rects(f: &Fonts) -> Vec<(f32, f32)> {
             r
         })
         .collect()
+}
+
+/// The countdown, "mm:ss" or "h:mm:ss".
+pub fn countdown(v: &View) -> String {
+    // The clock reads whole seconds and prayer times are whole minutes, so the gap is a whole
+    // number of seconds: round away the float error that would show a second twice or skip it.
+    let secs = (v.mins_left * 60.0).round().max(0.0) as u64;
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+fn roll_countdown(cv: &mut dyn Canvas, f: &Fonts, v: &View, c: Color) {
+    crate::motion::roll_text(
+        cv,
+        "prayer.countdown",
+        &countdown(v),
+        crate::motion::Roll::Quick,
+        &f.big,
+        30.0,
+        240.0,
+        32.0,
+        c,
+    );
+}
+
+#[cfg_attr(windows, allow(dead_code))] // the macOS panel draws the countdown apart
+/// Where the countdown's own layer sits (l, t, r, b): inside the card, left of the chips.
+pub fn countdown_rect(f: &Fonts) -> (f32, f32, f32, f32) {
+    let chips = chip_rects(f).first().map(|c| c.0).unwrap_or(W - 120.0);
+    (24.0, 236.0, chips - 6.0, 276.0)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+/// The countdown alone, for its layer: the card's colour under it, then the rolling digits.
+/// `cv` is the layer's canvas, its origin at `countdown_rect`'s corner.
+pub fn draw_countdown(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View) {
+    let (l, top, r, b) = countdown_rect(f);
+    cv.fill_rect(0.0, 0.0, r - l, b - top, t.panel);
+    cv.fill_rect(0.0, 0.0, r - l, b - top, t.raised);
+    cv.push_translate(-l, -top);
+    roll_countdown(cv, f, v, t.text);
+    cv.pop_translate();
 }
 
 fn button_rects(f: &Fonts) -> Vec<(f32, f32)> {
@@ -244,25 +292,9 @@ pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View) {
         16.0,
         muted,
     );
-    // The clock reads whole seconds and prayer times are whole minutes, so the gap is a whole
-    // number of seconds: round away the float error that would show a second twice or skip it.
-    let secs = (v.mins_left * 60.0).round().max(0.0) as u64;
-    let countdown = if secs >= 3600 {
-        format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
-    } else {
-        format!("{:02}:{:02}", secs / 60, secs % 60)
-    };
-    crate::motion::roll_text(
-        cv,
-        "prayer.countdown",
-        &countdown,
-        crate::motion::Roll::Quick,
-        &f.big,
-        30.0,
-        240.0,
-        32.0,
-        text_b,
-    );
+    if !v.countdown_apart {
+        roll_countdown(cv, f, v, text_b);
+    }
     cv.right_text("Reminders", &f.small, W - 30.0, 224.0, 16.0, muted);
     for (i, (x, w)) in chip_rects(f).into_iter().enumerate() {
         let on = v.reminders[i];
