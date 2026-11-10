@@ -14,6 +14,8 @@
 //! and its `InputView` first responder), and `on_input` feeds what the input view delivers to
 //! tasks.rs as Windows' WM_KEYDOWN and WM_CHAR would.
 
+use objc2_foundation::{NSPoint, NSRect, NSSize};
+
 use crate::canvas::Canvas;
 use crate::mac::app::Ev;
 use crate::mac::cg::Bitmap;
@@ -371,6 +373,8 @@ pub(crate) fn render(app: &mut App) {
         app.panel_win.resize(w, h);
     }
     app.place_panel();
+    crate::motion::track_rolls(true);
+    let _ = crate::motion::take_roll_rects();
     {
         let a: &App = app;
         let hover = a.panel_hover;
@@ -378,6 +382,8 @@ pub(crate) fn render(app: &mut App) {
             .paint(a.scale, |cv| draw_kind(a, cv, kind, hover, true));
     }
     app.panel_dirty = false;
+    app.roll_rect = union(crate::motion::take_roll_rects());
+    app.roll_view.setHidden(true);
     app.panel_min = clock::now_minutes().floor() as i64;
     if kind == Kind::Prayer {
         app.countdown_shown.clear();
@@ -404,6 +410,44 @@ fn render_countdown(app: &mut App) {
     app.countdown_shown = shown;
 }
 
+fn union(rects: Vec<(f32, f32, f32, f32)>) -> Option<(f32, f32, f32, f32)> {
+    rects
+        .into_iter()
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+}
+
+/// A frame of a rolling number: the panel drawn again only inside the roll's rect, onto the
+/// small roll layer over it (Focus's time each second, Drink's total after a glass).
+fn render_rolls(app: &mut App, (l, t, r, b): (f32, f32, f32, f32)) {
+    let (l, t) = (l.floor().max(0.0), t.floor().max(0.0));
+    let (r, b) = (r.ceil().min(app.panel_win.w), b.ceil().min(app.panel_win.h));
+    if r - l < 1.0 || b - t < 1.0 {
+        return;
+    }
+    let kind = app.panel_kind;
+    {
+        let a: &App = app;
+        let hover = a.panel_hover;
+        a.panel_win
+            .paint_sub(&a.roll_view, r - l, b - t, a.scale, |cv| {
+                cv.push_translate(-l, -t);
+                draw_kind(a, cv, kind, hover, true);
+                cv.pop_translate();
+            });
+    }
+    app.roll_view.setFrame(NSRect::new(
+        NSPoint::new(l as f64, t as f64),
+        NSSize::new((r - l) as f64, (b - t) as f64),
+    ));
+    app.roll_view.setHidden(false);
+    // A roll that now reaches further (a wider number) gets a full draw next.
+    if let Some(n) = union(crate::motion::take_roll_rects()) {
+        if n.0 < l || n.1 < t || n.2 > r || n.3 > b {
+            app.panel_dirty = true;
+        }
+    }
+}
+
 /// One run-loop wake: draw what changed, or the frames of a roll or ripple.
 pub(crate) fn tick(app: &mut App) {
     if !app.panel_open {
@@ -416,7 +460,11 @@ pub(crate) fn tick(app: &mut App) {
         render_countdown(app);
     } else if moving || app.panel_moving {
         // Every frame while it moves, and one more once it has settled.
-        render(app);
+        // A roll redraws only its own part, on the roll layer; anything else, the whole panel.
+        match app.roll_rect {
+            Some(r) => render_rolls(app, r),
+            None => render(app),
+        }
     }
     app.panel_moving = moving && app.panel_kind != Kind::Prayer;
 }

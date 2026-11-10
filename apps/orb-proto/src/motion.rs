@@ -51,6 +51,27 @@ pub fn active() -> bool {
 thread_local! {
     /// Snapshot mode: every number shows its value and every list rests, so scenes are exact.
     static STILL: Cell<bool> = const { Cell::new(false) };
+    static TRACK: Cell<bool> = const { Cell::new(false) };
+    static RECTS: RefCell<Vec<(f32, f32, f32, f32)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg_attr(windows, allow(dead_code))] // the macOS panel host
+/// Remembers where rolls draw while they move, for a host that redraws only that part
+/// (`track_rolls(true)` turns it on; macOS). Rects are in the canvas's untranslated space.
+pub fn track_rolls(on: bool) {
+    TRACK.with(|t| t.set(on));
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+/// The rects (l, t, r, b) of the rolls drawn since the last call, cleared.
+pub fn take_roll_rects() -> Vec<(f32, f32, f32, f32)> {
+    RECTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+fn note_roll(l: f32, t: f32, r: f32, b: f32) {
+    if TRACK.with(|t| t.get()) {
+        RECTS.with(|v| v.borrow_mut().push((l - 2.0, t, r + 2.0, b)));
+    }
 }
 
 /// Makes all motion still (snapshot mode).
@@ -199,6 +220,12 @@ pub fn roll_text(
         cv.text(value, fmt, x, y, text_width(value, fmt) + 2.0, h, c);
         return;
     }
+    note_roll(
+        x,
+        y,
+        x + text_width(value, fmt).max(text_width(&from, fmt)),
+        y + h,
+    );
     let up = digits_value(value) >= digits_value(&from);
     let cols = columns(&from, value, up);
     // One line's height: digits travel a full line per step.

@@ -617,6 +617,9 @@ pub(crate) struct App {
     pub(crate) knob_drag: bool,
     /// The Prayer countdown's own layer: a second turning redraws only it, not the whole panel.
     pub(crate) countdown_view: Retained<NSView>,
+    pub(crate) roll_view: Retained<NSView>,
+    /// Where the open panel's rolls draw (l, t, r, b), from its last full draw.
+    pub(crate) roll_rect: Option<(f32, f32, f32, f32)>,
     pub(crate) countdown_shown: String,
     pub(crate) countdown_rolling: bool,
     /// The panel needs a full redraw at the next tick (and the minute it last drew).
@@ -2571,6 +2574,18 @@ pub fn run() {
         panel_win.view.addSubview(&v);
         v
     };
+    // The rolling numbers of the other panels (Focus's time, Drink's total): while one rolls,
+    // only its part of the panel is drawn, onto this view (mac/panels.rs).
+    let roll_view = {
+        let v = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+        );
+        v.setWantsLayer(true);
+        v.setHidden(true);
+        panel_win.view.addSubview(&v);
+        v
+    };
     // Typing in the panel (the Tasks quick add) goes through this view (mac/input.rs).
     let panel_input = super::input::InputView::new(mtm);
     panel_win.add_subview(&panel_input);
@@ -2652,6 +2667,8 @@ pub fn run() {
         knob_drag: false,
         panel_moving: false,
         countdown_view,
+        roll_view,
+        roll_rect: None,
         countdown_shown: String::new(),
         countdown_rolling: false,
         panel_dirty: true,
