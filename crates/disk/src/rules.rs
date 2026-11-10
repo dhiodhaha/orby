@@ -52,9 +52,9 @@ impl Group {
     }
 }
 
-/// One cleaning rule. Paths start with `%LOCALAPPDATA%`, `%APPDATA%` or `%USERPROFILE%`,
-/// use `\` between parts, and may have a `*` part that matches any one real folder (never a
-/// junction).
+/// One cleaning rule. Paths start with `%LOCALAPPDATA%`, `%APPDATA%` or `%USERPROFILE%`
+/// (on macOS `%CACHES%`, `%APPSUPPORT%` or `%HOME%`), use `\` or `/` between parts, and may
+/// have a `*` part that matches any one real folder (never a junction or link).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Rule {
     /// Stable id, for selection and logs.
@@ -67,12 +67,15 @@ pub struct Rule {
     pub explanation: &'static str,
 }
 
+#[cfg(not(target_os = "macos"))]
 use Group::*;
+#[cfg(not(target_os = "macos"))]
 use Tag::{CheckFirst, SafeToRemove};
 
 // Rule structure and safety lessons adapted from Purge (MIT, (c) 2026 Jithin Sabu,
 // https://github.com/jithin-sabu/purge-app). The rows are Orby's own Windows rules.
 /// Every cleaning rule, in panel order within each group.
+#[cfg(not(target_os = "macos"))]
 pub static RULES: &[Rule] = &[
     // ---- Developer caches ----
     Rule {
@@ -265,6 +268,7 @@ pub static RULES: &[Rule] = &[
 
 /// Never removed, nor anything inside them, nor any folder that holds them: tools you
 /// installed, keys, tokens and passwords.
+#[cfg(not(target_os = "macos"))]
 pub static NEVER_TOUCH: &[&str] = &[
     r"%USERPROFILE%\.cargo\bin",
     r"%USERPROFILE%\.cargo\credentials",
@@ -294,6 +298,7 @@ pub static NEVER_TOUCH: &[&str] = &[
 /// Folders that are never removed themselves, although a rule may offer something inside
 /// them: the profile and AppData roots, and each tool's home folder (`.gradle` also holds
 /// installed JDKs and settings, `.cache` holds models and runtimes).
+#[cfg(not(target_os = "macos"))]
 pub static NEVER_REMOVE_ROOTS: &[&str] = &[
     r"%USERPROFILE%",
     r"%APPDATA%",
@@ -327,7 +332,14 @@ pub static NEVER_REMOVE_ROOTS: &[&str] = &[
 pub static NEVER_NAMES: &[&str] = &["Service Worker", "IndexedDB", "Local Storage", "Session Storage"];
 
 /// Names of credential stores, refused anywhere in a path that would be removed.
+#[cfg(not(target_os = "macos"))]
 const SECRET_NAMES: &[&str] = &["Cookies", "Login Data", "Web Data", "Local State", "Credentials", "Protect", "Vault", ".ssh", ".gnupg"];
+#[cfg(target_os = "macos")]
+const SECRET_NAMES: &[&str] =
+    &["Cookies", "Login Data", "Web Data", "Local State", "Credentials", "Keychains", ".ssh", ".gnupg", "MobileSync"];
+
+#[cfg(target_os = "macos")]
+pub use crate::mac::{NEVER_REMOVE_ROOTS, NEVER_TOUCH, RULES};
 
 /// Why a path was not offered or not moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,13 +372,36 @@ pub struct RuleEnv {
 }
 
 impl RuleEnv {
+    #[cfg(not(target_os = "macos"))]
     pub fn from_process() -> Self {
         let var = |n: &str| std::env::var_os(n).filter(|v| !v.is_empty()).map(PathBuf::from).filter(|p| p.is_absolute());
         RuleEnv { local_app_data: var("LOCALAPPDATA"), app_data: var("APPDATA"), user_profile: var("USERPROFILE") }
     }
 
+    /// On macOS the three folders are `~/Library/Caches` (local, rebuilt), `~/Library/Application
+    /// Support` (the app's own data) and the home folder, all from `$HOME`.
+    #[cfg(target_os = "macos")]
+    pub fn from_process() -> Self {
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from).filter(|p| p.is_absolute());
+        match home {
+            Some(h) => Self::mac(h),
+            None => RuleEnv::default(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mac(home: PathBuf) -> Self {
+        let library = home.join("Library");
+        RuleEnv {
+            local_app_data: Some(library.join("Caches")),
+            app_data: Some(library.join("Application Support")),
+            user_profile: Some(home),
+        }
+    }
+
     /// A fake profile at `root\Home`, laid out as Windows does (`Home\AppData\Local` and
     /// `Home\AppData\Roaming`), for tests and test drives. Nothing real is touched.
+    #[cfg(not(target_os = "macos"))]
     pub fn under(root: &Path) -> Self {
         let home = root.join("Home");
         RuleEnv {
@@ -376,11 +411,19 @@ impl RuleEnv {
         }
     }
 
+    /// A fake home at `root/Home`, laid out as macOS does (`Home/Library/Caches` and
+    /// `Home/Library/Application Support`), for tests. Nothing real is touched.
+    #[cfg(target_os = "macos")]
+    pub fn under(root: &Path) -> Self {
+        Self::mac(root.join("Home"))
+    }
+
+    /// `HOME`, `CACHES` and `APPSUPPORT` are the macOS names for the same three folders.
     fn var(&self, name: &str) -> Option<&Path> {
         match name.to_ascii_uppercase().as_str() {
-            "LOCALAPPDATA" => self.local_app_data.as_deref(),
-            "APPDATA" => self.app_data.as_deref(),
-            "USERPROFILE" => self.user_profile.as_deref(),
+            "LOCALAPPDATA" | "CACHES" => self.local_app_data.as_deref(),
+            "APPDATA" | "APPSUPPORT" => self.app_data.as_deref(),
+            "USERPROFILE" | "HOME" => self.user_profile.as_deref(),
             _ => None,
         }
     }
@@ -683,10 +726,13 @@ pub(crate) fn holds_system_folder(p: &Path) -> bool {
     let env = RuleEnv::from_process();
     let extra = system_dirs();
     let held = env.bases().chain(extra.iter().map(PathBuf::as_path)).any(|b| is_within(b, p));
+    #[cfg(target_os = "macos")]
+    let held = held || crate::mac::refused_on_mac(p);
     held
 }
 
 /// The Windows, Program Files and ProgramData folders, read from the process environment.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn system_dirs() -> Vec<PathBuf> {
     ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
         .into_iter()
@@ -694,6 +740,13 @@ pub(crate) fn system_dirs() -> Vec<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .collect()
+}
+
+/// macOS: the system folders ([`crate::MAC_SYSTEM_DIRS`]) and `~/Library`, which is treated
+/// like AppData.
+#[cfg(target_os = "macos")]
+pub(crate) fn system_dirs() -> Vec<PathBuf> {
+    crate::mac::system_dirs(&RuleEnv::from_process())
 }
 
 /// Moves rule items to the Recycle Bin. Each path is checked again with [`check_removal`]
@@ -727,7 +780,7 @@ pub const UNFINISHED_DOWNLOAD: &str = "Unfinished download";
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn env() -> RuleEnv {
         RuleEnv::under(&std::env::temp_dir().join("orby-rules-fake"))
     }
@@ -744,13 +797,16 @@ mod tests {
             assert!(r.explanation.len() <= 140, "{} explanation is one line", r.id);
             assert!(!r.explanation.to_lowercase().contains("junk"));
             for p in r.paths {
+                #[cfg(not(target_os = "macos"))]
                 assert!(p.starts_with("%LOCALAPPDATA%\\") || p.starts_with("%APPDATA%\\") || p.starts_with("%USERPROFILE%\\"), "{p}");
+                #[cfg(target_os = "macos")]
+                assert!(p.starts_with("%CACHES%/") || p.starts_with("%APPSUPPORT%/") || p.starts_with("%HOME%/"), "{p}");
             }
         }
     }
 
     #[test]
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn no_rule_path_is_on_the_never_touch_list() {
         let e = env();
         for r in RULES {
@@ -763,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn rule_paths_never_overlap() {
         let e = &env();
         let all: Vec<(&str, PathBuf)> =
@@ -842,6 +898,53 @@ mod tests {
         }
         for n in ["movie.mkv", "partial.zip", "tmp", "notes.txt"] {
             assert!(!is_unfinished_download(OsStr::new(n)), "{n}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_mac_never_list_is_refused() {
+        let e = env();
+        let h = e.user_profile.clone().unwrap();
+        let c = e.local_app_data.clone().unwrap();
+        let a = e.app_data.clone().unwrap();
+        assert_eq!(c, h.join("Library/Caches"));
+        assert_eq!(a, h.join("Library/Application Support"));
+        for p in [
+            h.clone(),
+            c.clone(),
+            a.clone(),
+            h.join("Library"),
+            h.join("Desktop"),
+            h.join("Documents"),
+            h.join(".Trash"),
+            h.join(".Trash/old.zip"),
+            h.join("Library/Keychains/login.keychain-db"),
+            h.join("Library/Mobile Documents/com~apple~CloudDocs/a.pdf"),
+            h.join("Library/CloudStorage/Dropbox/x"),
+            a.join("MobileSync/Backup/1234"),
+            h.join(".ssh"),
+            h.join(".cargo/bin/cargo"),
+            h.join("Library/Developer/Xcode"),
+            a.join("Google/Chrome/Default"),
+            a.join("Google/Chrome/Default/Cookies"),
+            a.join("Google/Chrome/Default/IndexedDB"),
+            c.join("Firefox/Profiles/abcd.default-release"),
+            h.parent().unwrap().to_path_buf(),
+        ] {
+            assert!(never_touch(&e, &p), "{} should be refused", p.display());
+        }
+        assert!(!never_touch(&e, &h.join("Library/Developer/Xcode/DerivedData")));
+        assert!(!never_touch(&e, &c.join("Homebrew")));
+        assert!(!never_touch(&e, &c.join("Firefox/Profiles/abcd.default-release/cache2")));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn mac_system_dirs_hold_library_and_applications() {
+        let d = system_dirs();
+        for p in ["/System", "/Library", "/usr", "/private", "/Applications"] {
+            assert!(d.iter().any(|x| x == Path::new(p)), "{p}");
         }
     }
 }

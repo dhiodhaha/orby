@@ -77,3 +77,25 @@ Final run: 26 tests passed (9 unit, 9 scan, 4 clean, 4 recycle), and clippy repo
 After the recycle tests, the items were confirmed in the Recycle Bin with their original locations, so they can be restored.
 
 Benchmark (read-only, release build, warm cache, 40 threads): `cargo run --release --example bench -- C:\Users\dopamine\dev\clippy` scanned 11,277 files and 1,472 folders (1.47 GB) in 0.017 s, which is about 660,000 files/s. The file count and byte total matched `Get-ChildItem -Recurse -Force -File` exactly.
+
+## macOS
+
+Everything above builds for `aarch64-apple-darwin` behind `#[cfg(target_os = "macos")]`, with the same public API, so callers do not change. Windows behaviour is unchanged. Policy lives in `src/mac.rs`, OS calls in the macOS half of `src/sys.rs`.
+
+- **Trash:** `move_to_recycle_bin` calls `NSFileManager trashItemAtURL:resultingItemURL:error:` (objc2 0.6.5, objc2-foundation 0.3.2, pinned) inside an autorelease pool. It only ever moves to the user's Trash and fails where there is none (`NSFeatureUnsupportedError` and read-only volumes map to `NoRecycleBin`); there is no delete path. `has_recycle_bin` is true for local, writable volumes (`statfs`: `MNT_LOCAL`, not `MNT_RDONLY`). `recycle_bin_size` sums `~/.Trash` (or `<volume>/.Trashes/<uid>`); without Full Disk Access it is an error, not zero. `move_to_recycle_bin` also refuses anything inside a package, inside a Trash, or under `/System`, `/bin`, `/sbin` or `/usr` (not `/usr/local`), and anything holding home, `~/Library`, its two bases or a system folder.
+- **Scan:** facts come from `lstat` (`st_flags`): `UF_HIDDEN` or a leading dot is hidden, `SF_RESTRICTED` (SIP) is system, `SF_DATALESS` is a cloud placeholder (not local, 0 allocated). Allocated size is `st_blocks × 512`, which already covers compressed files. Workers run with `setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF)`, so a dataless folder is skipped instead of downloaded. A folder on another device than its parent is a mount point and becomes `NodeKind::Link`, except firmlinks (`/usr/share/firmlinks`, with a built-in fallback), so `/` does not count `/System/Volumes/Data` twice.
+- **Duplicates:** stage 1 also skips packages (`MAC_PACKAGE_EXTENSIONS`, by extension: `.app`, `.photoslibrary`, `.fcpbundle`, `.logicx`, ...), the Trash and volume system folders (`DUPE_SKIPPED_NAMES`), and `MAC_SYSTEM_DIRS` plus `~/Library` (`system_dirs`). The probe is `lstat` only; placeholders, SIP files, non-files and hard links (`st_nlink > 1`) are dropped before any read. Reads open with `O_NOFOLLOW` on threads that cannot download placeholders. `check_duplicate_removal` also refuses a path inside a package and a hard-linked file. `drive_kind` says `Ssd` for the boot volume (`/` or `/System/Volumes/*`, APFS, local) on Apple Silicon and `Unknown` for anything else (one thread).
+- **Keeper:** `default_keeper(&[DupeFile], &RuleEnv)` and `passing_through` (all platforms): the oldest copy that is not in Downloads, Desktop, Temp or tmp, and not in the folder holding `app_data` (`~/Library` on macOS, `AppData` on Windows), when another copy exists; then the oldest; then by path.
+- **Rules and Safe to clean:** `RuleEnv::from_process()` reads `$HOME`: `local_app_data` is `~/Library/Caches`, `app_data` is `~/Library/Application Support`, `user_profile` is home. Rule paths use `%CACHES%`, `%APPSUPPORT%` and `%HOME%` (aliases accepted on every platform). `RULES`, `NEVER_TOUCH` and `NEVER_REMOVE_ROOTS` are macOS tables (see `docs/design/disk.md`). `CleanPlaces::for_current_user()` uses `~/Downloads`, `~/Library/Caches` (top-level app caches, leaving out `com.apple.*`, a few Apple names and caches a rule offers) and the Chrome and Edge caches in `~/Library/Caches`; `$TMPDIR` is not offered.
+- **Cache:** `default_dupes_cache()` is `~/Library/Application Support/orb-proto/dupes-cache.json` (on Windows `%APPDATA%\orb-proto\dupes-cache.json`).
+- **BLAKE3:** on macOS the crate builds blake3 with `pure` (portable Rust). The default build compiles a NEON C file, which needs a C compiler and the macOS SDK, so the crate could not be checked from Windows. On a Mac with Xcode's tools, dropping `pure` in `Cargo.toml` gives NEON hashing back.
+
+Checked from Windows (`cargo check` and `cargo clippy` do not link, so no SDK is needed):
+
+```powershell
+rustup target add aarch64-apple-darwin
+cargo check -p app-disk --target aarch64-apple-darwin --all-targets
+cargo clippy -p app-disk --target aarch64-apple-darwin --all-targets -- -D warnings
+```
+
+To run on a Mac: `cargo test -p app-disk`. The macOS tests are the unit tests in `src/mac.rs`, `src/sys.rs` (`mac_tests`) and `src/rules.rs`, and `tests/macos.rs` (packages, the Trash folder, hard links, refused paths, `~/Library/Caches`, Xcode DerivedData, drive type, the keeper, the cache path). The one test that moves files into the real Trash is `#[ignore]`d. A dataless file cannot be made by a test, so that path is covered by the flag logic in `mac_tests` only.

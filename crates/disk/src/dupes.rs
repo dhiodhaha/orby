@@ -31,7 +31,13 @@ pub const DUPE_MIN_SIZE: u64 = 1 << 20;
 /// Stage 2 reads this much from each end of a file.
 pub const DUPE_EDGE: u64 = 64 * 1024;
 /// Folders with these names are never looked into (case does not matter).
+#[cfg(not(target_os = "macos"))]
 pub const DUPE_SKIPPED_NAMES: &[&str] = &[".git", "node_modules"];
+/// Folders with these names are never looked into (case does not matter). On macOS also the
+/// Trash and the folders the system keeps at the top of every volume.
+#[cfg(target_os = "macos")]
+pub const DUPE_SKIPPED_NAMES: &[&str] =
+    &[".git", "node_modules", ".Trash", ".Trashes", ".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems"];
 /// One read, for both stages and both kinds of drive.
 const BUF: usize = 1 << 20;
 /// The cache keeps at most this many files, the most recently seen first...
@@ -55,7 +61,8 @@ pub struct DupeOptions {
     pub min_size: u64,
     /// For the never-touch list ([`never_touch`]).
     pub env: RuleEnv,
-    /// Windows, Program Files, ProgramData: skipped with everything inside them.
+    /// Windows, Program Files, ProgramData (on macOS the system folders and `~/Library`):
+    /// skipped with everything inside them.
     pub system_dirs: Vec<PathBuf>,
     /// The hash cache (JSON). None: no cache.
     pub cache: Option<PathBuf>,
@@ -154,8 +161,51 @@ impl DupeReport {
     }
 }
 
+/// Where the app keeps the hash cache: `%APPDATA%\orb-proto\dupes-cache.json` on Windows,
+/// `~/Library/Application Support/orb-proto/dupes-cache.json` on macOS. None when the folder is
+/// not known.
+pub fn default_dupes_cache() -> Option<PathBuf> {
+    RuleEnv::from_process().app_data.map(|d| d.join("orb-proto").join("dupes-cache.json"))
+}
+
+/// Folders whose copy is never preferred as the keeper while another copy lives elsewhere.
+const PASSING_THROUGH: &[&str] = &["Downloads", "Desktop", "Temp", "tmp"];
+
+/// Whether a copy at `p` is only passing through: in a Downloads, Desktop, Temp or tmp folder
+/// (any folder of that name on the way), or in the app data folder (`AppData` on Windows,
+/// `~/Library` on macOS, which is the folder holding `env.app_data`).
+pub fn passing_through(env: &RuleEnv, p: &Path) -> bool {
+    let named = p.parent().is_some_and(|d| {
+        d.components().any(|c| {
+            let n = c.as_os_str().to_string_lossy();
+            PASSING_THROUGH.iter().any(|t| t.eq_ignore_ascii_case(&n))
+        })
+    });
+    named || env.app_data.as_deref().and_then(Path::parent).is_some_and(|a| rules::is_within(p, a))
+}
+
+/// The copy to keep in a group: not one that is passing through ([`passing_through`]) when
+/// another copy lives elsewhere, then the oldest, then the first by path.
+pub fn default_keeper(files: &[DupeFile], env: &RuleEnv) -> usize {
+    (0..files.len())
+        .min_by(|&a, &b| {
+            let (x, y) = (&files[a], &files[b]);
+            passing_through(env, &x.path)
+                .cmp(&passing_through(env, &y.path))
+                .then_with(|| match (x.modified, y.modified) {
+                    (Some(p), Some(q)) => p.cmp(&q),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| x.path.cmp(&y.path))
+        })
+        .unwrap_or(0)
+}
+
 /// IOCTL_STORAGE_QUERY_PROPERTY, StorageDeviceSeekPenaltyProperty: a seek penalty is a hard
-/// drive, none is an SSD, no answer is [`DriveKind::Unknown`].
+/// drive, none is an SSD, no answer is [`DriveKind::Unknown`]. On macOS the boot volume of an
+/// Apple Silicon Mac is its internal SSD; any other volume is [`DriveKind::Unknown`].
 pub fn drive_kind(path: &Path) -> DriveKind {
     match sys::seek_penalty(path) {
         Some(false) => DriveKind::Ssd,
@@ -176,6 +226,23 @@ fn skipped_name(name: &std::ffi::OsStr) -> bool {
     DUPE_SKIPPED_NAMES.iter().any(|s| s.eq_ignore_ascii_case(&n))
 }
 
+/// A folder the duplicate finder treats as one opaque item: a macOS package (`.app`,
+/// `.photoslibrary`, ...). Nothing on other systems.
+fn opaque_dir(_name: &std::ffi::OsStr) -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::mac::is_package_name(_name);
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// Whether a folder on the way to `p` is such an item.
+fn inside_opaque(_p: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::mac::inside_package(_p);
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 /// Stage 1 over a scan's tree. Leaves out `.git` and `node_modules`, the system folders, links
 /// and other reparse points, system files, cloud placeholders, files under `min_size`, and
 /// anything on the never-touch list. Opens no file.
@@ -193,7 +260,7 @@ pub fn candidates(tree: &Tree, opts: &DupeOptions) -> Candidates {
                 let n = tree.node(c);
                 match n.kind() {
                     NodeKind::Dir => {
-                        if n.reparse() || skipped_name(n.name()) {
+                        if n.reparse() || skipped_name(n.name()) || opaque_dir(n.name()) {
                             continue;
                         }
                         let p = path.join(n.name());
@@ -464,14 +531,18 @@ fn pool<T: Sync, R: Send>(
         let (tx, rx) = mpsc::channel();
         for _ in 0..threads.clamp(1, items.len()) {
             let (tx, next, work) = (tx.clone(), &next, &work);
-            s.spawn(move || loop {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(item) = items.get(i) else { return };
-                if tx.send((i, work(item))).is_err() {
-                    return;
+            s.spawn(move || {
+                // These threads are ours: no read on them may download a cloud placeholder.
+                let _local_only = sys::NoMaterialize::new();
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { return };
+                    if tx.send((i, work(item))).is_err() {
+                        return;
+                    }
                 }
             });
         }
@@ -493,6 +564,11 @@ fn open_read(p: &Path) -> io::Result<File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         o.custom_flags(sys::READ_FLAGS);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(sys::READ_FLAGS as i32);
     }
     o.open(p)
 }
@@ -660,7 +736,7 @@ pub struct DupeRemoval {
 fn plain_file(p: &Path, size: u64) -> bool {
     p.symlink_metadata().is_ok_and(|m| {
         let f = sys::facts(&m);
-        m.is_file() && m.len() == size && !f.reparse && !f.system && !f.not_local
+        m.is_file() && m.len() == size && !f.reparse && !f.system && !f.not_local && !sys::hard_linked(&m)
     })
 }
 
@@ -695,6 +771,7 @@ pub fn check_duplicate_removal(env: &RuleEnv, item: &DupeRemoval, batch: &[DupeR
     if never_touch(env, p)
         || rules::system_dirs().iter().any(|d| rules::is_within(p, d))
         || p.components().any(|c| skipped_name(c.as_os_str()))
+        || inside_opaque(p)
     {
         return Err(Refusal::NeverTouch);
     }
@@ -757,6 +834,33 @@ mod tests {
         assert_eq!(c.get(p, 10, 78), (None, None), "written again");
         assert_eq!(c.get(p, 11, 77), (None, None), "another size");
         assert_eq!(unhex(&hex(&[9; 32])), Some([9; 32]));
+    }
+
+    fn aged(path: &Path, days_ago: u64) -> DupeFile {
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000 - days_ago * 86_400);
+        DupeFile { path: path.to_path_buf(), size: 1, modified: Some(t) }
+    }
+
+    #[test]
+    fn the_keeper_is_the_oldest_copy_that_is_not_passing_through() {
+        // Pure: nothing on disk is read. Not under the temp folder, which is itself "Temp".
+        let root = PathBuf::from(if cfg!(windows) { r"C:\fake" } else { "/fake" });
+        let env = RuleEnv::under(&root);
+        let home = env.user_profile.clone().unwrap();
+        let downloads = aged(&home.join("Downloads").join("a.zip"), 900);
+        let desktop = aged(&home.join("Desktop").join("a.zip"), 800);
+        let tmp = aged(&root.join("tmp").join("a.zip"), 700);
+        let app_data = aged(&env.app_data.clone().unwrap().join("Some App").join("a.zip"), 600);
+        let newer = aged(&home.join("Documents").join("a.zip"), 10);
+        let older = aged(&home.join("Archive").join("a.zip"), 20);
+
+        let files = [downloads.clone(), desktop.clone(), tmp.clone(), app_data.clone(), newer.clone(), older.clone()];
+        assert_eq!(default_keeper(&files, &env), 5, "the oldest copy outside Downloads, Desktop, tmp and app data");
+        let files = [downloads.clone(), app_data, newer];
+        assert_eq!(default_keeper(&files, &env), 2, "a newer copy elsewhere beats an older one passing through");
+        let files = [desktop, downloads, tmp];
+        assert_eq!(default_keeper(&files, &env), 1, "all passing through: the oldest");
+        assert_eq!(default_keeper(&[], &env), 0);
     }
 
     #[test]
