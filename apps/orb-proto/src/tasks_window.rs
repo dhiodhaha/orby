@@ -21,7 +21,7 @@ use crate::tasks_model::{self as m, Clock, Group, Selection, WinItem, DUE_PICKS}
 use crate::tasks_window_panel::{self as twp, Hit, ItemV, RowV};
 use crate::textfield::{Key, TextField};
 use crate::ui::{self, Icon};
-use crate::{dial, log_line, orb, panels, px, with_app, App, MSG_MOUSELEAVE};
+use crate::{dial, frame, log_line, orb, panels, px, with_app, App, MSG_MOUSELEAVE};
 
 /// About 60 frames a second, only while a ripple or a rolling number moves.
 const TIMER_FRAME: usize = 1;
@@ -43,8 +43,11 @@ pub struct Win {
     pub hwnd: HWND,
     surface: Option<Surface>,
     pub open: bool,
-    /// The window's height (logical px), set from the screen when it opens.
+    /// The window's size (logical px): `twp::W` by the screen's room when it opens, then whatever
+    /// it is resized, snapped or maximized to.
+    w: f32,
     h: f32,
+    max: bool,
     hover: Option<Hit>,
     mouse: Option<(f32, f32)>,
     tracking: bool,
@@ -207,7 +210,9 @@ fn view(app: &App) -> twp::View {
         })
         .collect();
     let mut v = twp::View {
+        w: w.w,
         h: w.h,
+        max: w.max,
         open_n,
         field: field_view(
             &w.field,
@@ -279,9 +284,17 @@ pub fn show(app: &mut App) {
     w.menu = None;
     w.editing = None;
     w.notice = None;
-    app.tasks.win.h = room(app);
+    // A window closed while maximized opens maximized again; otherwise it opens at its own size,
+    // centred on the orb's screen.
+    if frame::is_max(hwnd) {
+        sync_size(app);
+    } else {
+        app.tasks.win.w = twp::W;
+        app.tasks.win.h = room(app);
+        app.tasks.win.max = false;
+        place(app, true);
+    }
     crate::motion::ripple_reset("tasks.win");
-    place(app, true);
     render(app);
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -313,9 +326,10 @@ pub fn close(app: &mut App) {
     log_line(app, "tasks: window closed");
 }
 
+/// Sizes the window to `w` × `h` and centres it on the orb's screen (on open).
 fn place(app: &App, center: bool) {
     let (w, h) = (
-        px(app, twp::W).ceil() as i32,
+        px(app, app.tasks.win.w).ceil() as i32,
         px(app, app.tasks.win.h).ceil() as i32,
     );
     let hwnd = app.tasks.win.hwnd;
@@ -331,10 +345,33 @@ fn place(app: &App, center: bool) {
     };
     unsafe {
         let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
-        let d = px(app, 32.0).round() as i32;
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
-        let _ = SetWindowRgn(hwnd, Some(rgn), true);
     }
+    frame::shape(hwnd, app.scale);
+}
+
+/// The panel's size from the window's.
+fn sync_size(app: &mut App) {
+    let hwnd = app.tasks.win.hwnd;
+    let (cw, ch) = frame::client_size(hwnd);
+    let w = &mut app.tasks.win;
+    w.w = cw as f32 / app.scale;
+    w.h = ch as f32 / app.scale;
+    w.max = frame::is_max(hwnd);
+}
+
+/// The window changed size from outside (a drag on an edge, a snap, maximize or restore): the
+/// panel takes the new size.
+fn on_size(app: &mut App) {
+    sync_size(app);
+    frame::shape(app.tasks.win.hwnd, app.scale);
+    let v = view(app);
+    app.tasks.win.scroll = v.scroll;
+    app.tasks.win.hover = app
+        .tasks
+        .win
+        .mouse
+        .and_then(|(x, y)| twp::hit(&app.g, &app.fonts, &v, x, y));
+    render(app);
 }
 
 fn take_foreground(app: &mut App) {
@@ -352,16 +389,14 @@ fn render(app: &mut App) {
     if !app.tasks.win.open {
         return;
     }
-    let (w, h) = (
-        px(app, twp::W).ceil() as u32,
-        px(app, app.tasks.win.h).ceil() as u32,
-    );
+    // The surface covers the client area, whatever set its size (open, a drag, a snap, maximize).
     let hwnd = app.tasks.win.hwnd;
+    let (cw, ch) = frame::client_size(hwnd);
+    let (w, h) = (cw.max(1) as u32, ch.max(1) as u32);
     match app.tasks.win.surface.as_mut() {
         None => app.tasks.win.surface = Surface::new(&app.g, hwnd, w, h, app.scale).ok(),
         Some(s) if s.w != w || s.h != h => {
             let _ = s.resize(&app.g, w, h);
-            place(app, false);
         }
         _ => {}
     }
@@ -897,6 +932,7 @@ fn click(app: &mut App, h: Option<Hit>) {
     let Some(h) = h else { return render(app) };
     match h {
         Hit::Close => return close(app),
+        Hit::Max => frame::toggle(app.tasks.win.hwnd),
         Hit::Field | Hit::Edit(_) | Hit::Menu(_) => {}
         Hit::Add => return add(app),
         Hit::Undo => return undo(app),
@@ -969,16 +1005,35 @@ pub unsafe extern "system" fn tasks_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if let Some(r) = frame::nc_message(hwnd, msg, wparam, lparam, twp::W, twp::MIN_H) {
+        return r;
+    }
     match msg {
         WM_NCHITTEST => {
-            // The title band's empty part drags the window.
+            // The edges resize; the title band's empty part drags the window (a double click on
+            // it maximizes or restores).
             let p = client_point(hwnd, lparam);
-            let caption = with_app(|app| {
+            let ht = with_app(|app| {
+                if let Some(e) = frame::edge_hit(hwnd, p, app.scale) {
+                    return e;
+                }
                 let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
-                y < twp::TOP && twp::hit(&app.g, &app.fonts, &view(app), x, y).is_none()
+                if y < twp::TOP && twp::hit(&app.g, &app.fonts, &view(app), x, y).is_none() {
+                    HTCAPTION
+                } else {
+                    HTCLIENT
+                }
             })
-            .unwrap_or(false);
-            return LRESULT(if caption { HTCAPTION } else { HTCLIENT } as isize);
+            .unwrap_or(HTCLIENT);
+            return LRESULT(ht as isize);
+        }
+        WM_SIZE if wparam.0 as u32 != SIZE_MINIMIZED => {
+            with_app(|app| {
+                if app.tasks.win.open {
+                    on_size(app);
+                }
+            });
+            return LRESULT(0);
         }
         WM_ACTIVATE => {
             let on = (wparam.0 & 0xffff) != 0;
@@ -1091,7 +1146,7 @@ pub fn make_window(hinst: HINSTANCE) -> windows::core::Result<HWND> {
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
             w!("OrbTasks"),
             w!("Orby tasks"),
-            WS_POPUP,
+            frame::STYLE,
             0,
             0,
             twp::W as i32,

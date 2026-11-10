@@ -199,6 +199,10 @@ pub enum Icon {
     Bell,
     Info,
     Close,
+    /// The title band's maximize button: one rounded square.
+    Maximize,
+    /// The same button on a maximized window: two squares, one behind the other.
+    Restore,
     Pause,
     Play,
     Skip,
@@ -262,6 +266,24 @@ impl Icon {
     pub fn is_ember(self) -> bool {
         matches!(self, Icon::Alert | Icon::Private | Icon::Drive)
     }
+}
+
+/// A 28 px title-band button (close, maximize): no fill until hovered, a 14 px muted icon.
+pub fn title_button(
+    g: &Shared,
+    dc: &ID2D1DeviceContext,
+    t: &Theme,
+    r: (f32, f32, f32, f32),
+    icon: Icon,
+    hover: bool,
+) {
+    if hover {
+        unsafe {
+            dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, t.button_hover))
+        };
+    }
+    let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
+    draw_icon(g, dc, icon, cx, cy, 14.0, &brush(dc, t.muted));
 }
 
 pub fn draw_icon(
@@ -363,6 +385,21 @@ pub fn draw_icon(
             Icon::Close => {
                 line((7.0, 7.0), (17.0, 17.0));
                 line((17.0, 7.0), (7.0, 17.0));
+            }
+            Icon::Maximize => {
+                let (a, z) = (p(6.5, 6.5), p(17.5, 17.5));
+                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, z.X, z.Y, 2.5 * s), b, sw, &st);
+            }
+            Icon::Restore => {
+                // The front window, and the edge of the one behind it.
+                let (a, z) = (p(5.5, 9.0), p(15.0, 18.5));
+                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, z.X, z.Y, 2.2 * s), b, sw, &st);
+                let geo = path(g, p(9.0, 5.5), false, |k| {
+                    line_to(k, p(16.3, 5.5));
+                    arc_to(k, p(18.5, 7.7), 2.2 * s, false, true);
+                    line_to(k, p(18.5, 15.0));
+                });
+                dc.DrawGeometry(&geo, b, sw, &st);
             }
             Icon::Pause => {
                 line((9.0, 6.5), (9.0, 17.5));
