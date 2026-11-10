@@ -18,16 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct2D::Common::*;
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct2D::*;
-#[cfg(windows)]
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-
 use crate::canvas::{line_height, text_width, Canvas, Color, Font};
-#[cfg(windows)]
-use crate::gfx::{D2dCanvas, Shared};
 
 thread_local! {
     /// The last moment any motion still moves.
@@ -172,38 +163,6 @@ fn digits_value(s: &str) -> u64 {
         .fold(0u64, |v, d| v.saturating_mul(10).saturating_add(d as u64))
 }
 
-/// Draws `value` as a rolling number with its left edge at `x`, vertically centred in `h` like
-/// `gfx::text`. `key` names this number (one per place on screen, e.g. "drink.total"); when
-/// `value` differs from what that key showed last, its changed digits roll to the new ones.
-/// Non-digits (units, separators) never roll. Tabular figures keep every digit the same width.
-/// `roll_text` on a Direct2D context, for the panels that still draw with Direct2D.
-#[cfg(windows)]
-pub fn rolling_text(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    key: &'static str,
-    value: &str,
-    kind: Roll,
-    fmt: &IDWriteTextFormat,
-    x: f32,
-    y: f32,
-    h: f32,
-    b: &ID2D1SolidColorBrush,
-) {
-    let c = unsafe { b.GetColor() };
-    roll_text(
-        &mut D2dCanvas::new(g, dc),
-        key,
-        value,
-        kind,
-        fmt,
-        x,
-        y,
-        h,
-        c,
-    );
-}
-
 pub fn roll_text(
     cv: &mut dyn Canvas,
     key: &'static str,
@@ -278,25 +237,6 @@ pub fn roll_text(
         }
         cx += cw;
     }
-}
-
-/// `rolling_text` with its right edge at `right`: the column helper for sizes, amounts and
-/// percents. The width snaps to the new value at once, so the column never slides.
-#[cfg(windows)]
-pub fn rolling_text_right(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    key: &'static str,
-    value: &str,
-    kind: Roll,
-    fmt: &IDWriteTextFormat,
-    right: f32,
-    y: f32,
-    h: f32,
-    b: &ID2D1SolidColorBrush,
-) {
-    let w = text_width(value, fmt);
-    rolling_text(g, dc, key, value, kind, fmt, right - w, y, h, b);
 }
 
 /// `roll_text` with its right edge at `right` (the portable `rolling_text_right`).
@@ -420,45 +360,6 @@ pub fn ripple_reset(key: &'static str) {
 /// Every list ripples in again on its next draw: called when a panel opens.
 pub fn ripple_reset_all() {
     RIPPLES.with(|r| r.borrow_mut().clear());
-}
-
-/// Draws one row with its ripple entry applied: moved `fx.dy` lower and faded to `fx.alpha` in a
-/// layer. At rest it just calls `draw`, so a settled list costs nothing extra.
-///
-/// `motion::with_row(dc, motion::ripple_row("disk.rows", i), || draw_row(..))`
-#[cfg(windows)]
-pub fn with_row(dc: &ID2D1DeviceContext, fx: RowFx, draw: impl FnOnce()) {
-    if fx == RowFx::REST {
-        draw();
-        return;
-    }
-    if fx.alpha <= 0.003 {
-        return;
-    }
-    unsafe {
-        let mut before = windows_numerics::Matrix3x2::default();
-        dc.GetTransform(&mut before);
-        let mut moved = before;
-        // A translation after the current transform: y moves in the row's own space.
-        moved.M32 += before.M22 * fx.dy;
-        moved.M31 += before.M21 * fx.dy;
-        dc.SetTransform(&moved);
-        let layer = D2D1_LAYER_PARAMETERS1 {
-            contentBounds: D2D_RECT_F {
-                left: -1e6,
-                top: -1e6,
-                right: 1e6,
-                bottom: 1e6,
-            },
-            maskTransform: windows_numerics::Matrix3x2::identity(),
-            opacity: fx.alpha,
-            ..Default::default()
-        };
-        dc.PushLayer(&layer, None);
-        draw();
-        dc.PopLayer();
-        dc.SetTransform(&before);
-    }
 }
 
 /// `with_row` on the portable `Canvas`: the same translation and layer, so a row drawn through

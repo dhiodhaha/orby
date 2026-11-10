@@ -64,6 +64,10 @@ mod settings_model;
 mod settings_panel;
 mod settings_scenes;
 mod snapshot;
+mod tasks_model;
+mod tasks_panel;
+mod tasks_scenes;
+mod tasks_window_panel;
 mod textfield;
 mod today_model;
 mod today_panel;
@@ -114,13 +118,7 @@ mod store;
 #[cfg(windows)]
 mod tasks;
 #[cfg(windows)]
-mod tasks_model;
-#[cfg(windows)]
-mod tasks_panel;
-#[cfg(windows)]
 mod tasks_window;
-#[cfg(windows)]
-mod tasks_window_panel;
 #[cfg(windows)]
 mod tray;
 

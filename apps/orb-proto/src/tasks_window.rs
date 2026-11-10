@@ -370,7 +370,7 @@ fn on_size(app: &mut App) {
         .tasks
         .win
         .mouse
-        .and_then(|(x, y)| twp::hit(&app.g, &app.fonts, &v, x, y));
+        .and_then(|(x, y)| twp::hit(&app.fonts, &v, x, y));
     render(app);
 }
 
@@ -405,7 +405,13 @@ fn render(app: &mut App) {
         return;
     };
     let dc = s.begin(&app.g);
-    twp::draw(&app.g, dc, &app.theme, &app.fonts, &v, app.tasks.win.hover);
+    twp::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &v,
+        app.tasks.win.hover,
+    );
     s.end(&app.g);
     // Frames only while a ripple or a rolling number moves.
     let moving = crate::motion::active();
@@ -449,7 +455,7 @@ pub fn refresh(app: &mut App) {
         .tasks
         .win
         .mouse
-        .and_then(|(x, y)| twp::hit(&app.g, &app.fonts, &v, x, y));
+        .and_then(|(x, y)| twp::hit(&app.fonts, &v, x, y));
     render(app);
 }
 
@@ -892,11 +898,11 @@ fn on_char(app: &mut App, unit: u16) {
 
 fn press(app: &mut App, x: f32, y: f32) {
     let v = view(app);
-    match twp::hit(&app.g, &app.fonts, &v, x, y) {
+    match twp::hit(&app.fonts, &v, x, y) {
         Some(Hit::Field) => {
             save_edit(app);
             let v = view(app);
-            let b = twp::field_byte_at(&app.g, &app.fonts, &v, x);
+            let b = twp::field_byte_at(&app.fonts, &v, x);
             let w = &mut app.tasks.win;
             w.menu = None;
             w.focus = Focus::Field;
@@ -904,7 +910,7 @@ fn press(app: &mut App, x: f32, y: f32) {
             render(app);
         }
         Some(Hit::Edit(_)) => {
-            let b = twp::edit_byte_at(&app.g, &app.fonts, &v, x);
+            let b = twp::edit_byte_at(&app.fonts, &v, x);
             if let Some((_, f)) = app.tasks.win.editing.as_mut() {
                 f.place(b, shift());
             }
@@ -1018,7 +1024,7 @@ pub unsafe extern "system" fn tasks_proc(
                     return e;
                 }
                 let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
-                if y < twp::TOP && twp::hit(&app.g, &app.fonts, &view(app), x, y).is_none() {
+                if y < twp::TOP && twp::hit(&app.fonts, &view(app), x, y).is_none() {
                     HTCAPTION
                 } else {
                     HTCLIENT
@@ -1059,7 +1065,7 @@ pub unsafe extern "system" fn tasks_proc(
                     app.tasks.win.tracking = true;
                 }
                 app.tasks.win.mouse = Some((x, y));
-                let h = twp::hit(&app.g, &app.fonts, &view(app), x, y);
+                let h = twp::hit(&app.fonts, &view(app), x, y);
                 if h != app.tasks.win.hover {
                     app.tasks.win.hover = h;
                     render(app);
@@ -1100,7 +1106,7 @@ pub unsafe extern "system" fn tasks_proc(
         WM_LBUTTONUP => {
             with_app(|app| {
                 let (x, y) = unpack(lparam);
-                let h = twp::hit(&app.g, &app.fonts, &view(app), x / app.scale, y / app.scale);
+                let h = twp::hit(&app.fonts, &view(app), x / app.scale, y / app.scale);
                 click(app, h);
             });
             return LRESULT(0);

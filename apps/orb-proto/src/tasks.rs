@@ -685,11 +685,17 @@ pub fn view(app: &App) -> View {
 
 pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<tp::Hit>) {
     let v = view(app);
-    tp::draw(&app.g, dc, &app.theme, &app.fonts, &v, hover);
+    tp::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &v,
+        hover,
+    );
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<tp::Hit> {
-    tp::hit(&app.g, &app.fonts, &view(app), x, y)
+    tp::hit(&app.fonts, &view(app), x, y)
 }
 
 fn toggle_collapsed(app: &mut App, id: &str) {
@@ -782,7 +788,7 @@ pub fn click(app: &mut App, h: tp::Hit) {
 /// A press in the field puts the caret there (Shift extends the selection).
 pub fn press_field(app: &mut App, x: f32) {
     let v = view(app);
-    let b = tp::field_byte_at(&app.g, &app.fonts, &v, x);
+    let b = tp::field_byte_at(&app.fonts, &v, x);
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
     app.tasks.field.place(b, shift);
     panels::refresh(app);

@@ -278,6 +278,7 @@ fn panel_scenes(_f: &Fonts) -> Vec<Scene> {
     out.extend(crate::settings_scenes::scenes(_f));
     out.extend(crate::today_scenes::scenes(_f));
     out.extend(crate::habits_scenes::scenes(_f));
+    out.extend(crate::tasks_scenes::scenes(_f));
     out
 }
 

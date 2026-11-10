@@ -476,7 +476,7 @@ pub fn render_offscreen(
 
 // ---- small drawing helpers ----
 
-pub use crate::canvas::{on_circle, pt, rgba};
+pub use crate::canvas::{pt, rgba};
 
 pub fn brush(dc: &ID2D1DeviceContext, c: D2D1_COLOR_F) -> ID2D1SolidColorBrush {
     unsafe { dc.CreateSolidColorBrush(&c, None).unwrap() }
@@ -492,14 +492,6 @@ pub fn rrect(l: f32, t: f32, r: f32, b: f32, rad: f32) -> D2D1_ROUNDED_RECT {
         },
         radiusX: rad,
         radiusY: rad,
-    }
-}
-
-pub fn ellipse(cx: f32, cy: f32, r: f32) -> D2D1_ELLIPSE {
-    D2D1_ELLIPSE {
-        point: Vector2 { X: cx, Y: cy },
-        radiusX: r,
-        radiusY: r,
     }
 }
 
@@ -557,20 +549,6 @@ pub fn center_text(
     text(dc, s, fmt, cx - w / 2.0, y, w + 2.0, h, b);
 }
 
-pub fn right_text(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    s: &str,
-    fmt: &IDWriteTextFormat,
-    right: f32,
-    y: f32,
-    h: f32,
-    b: &ID2D1SolidColorBrush,
-) {
-    let w = g.text_width(s, fmt);
-    text(dc, s, fmt, right - w, y, w + 2.0, h, b);
-}
-
 pub fn round_stroke(g: &Shared) -> ID2D1StrokeStyle {
     unsafe {
         let p = D2D1_STROKE_STYLE_PROPERTIES1 {
@@ -611,35 +589,6 @@ pub fn dotted_stroke(g: &Shared) -> ID2D1StrokeStyle {
 /// A flat dashed rule (the drink goal line): 3 px on, 3 px off at 1 px.
 pub fn dashed_stroke(g: &Shared) -> ID2D1StrokeStyle {
     stroke_with(g, &[3.0, 3.0], D2D1_CAP_STYLE_FLAT)
-}
-
-/// A circular arc clockwise from `from` to `to` degrees (from 12 o'clock); a full turn is a circle.
-pub fn draw_arc(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    cx: f32,
-    cy: f32,
-    r: f32,
-    from: f32,
-    to: f32,
-    b: &ID2D1SolidColorBrush,
-    w: f32,
-    st: &ID2D1StrokeStyle,
-) {
-    let sweep = to - from;
-    if sweep <= 0.01 {
-        return;
-    }
-    unsafe {
-        if sweep >= 359.9 {
-            dc.DrawEllipse(&ellipse(cx, cy, r), b, w, st);
-            return;
-        }
-        let geo = path(g, on_circle(cx, cy, r, from), false, |k| {
-            arc_to(k, on_circle(cx, cy, r, to), r, sweep > 180.0, true)
-        });
-        dc.DrawGeometry(&geo, b, w, st);
-    }
 }
 
 /// A path made of line segments and circular arcs, built with a small closure.
