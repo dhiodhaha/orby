@@ -1,5 +1,6 @@
-//! Moving items to the Recycle Bin. The only remove action this crate has: there is no
-//! permanent delete, and nothing here empties the bin.
+//! Moving items to the Recycle Bin (on macOS, the user's Trash). The only remove action this
+//! crate has: there is no permanent delete, and nothing here empties the bin. The names stay
+//! Windows-flavoured on every platform so callers do not change.
 
 use crate::sys;
 use std::io;
@@ -74,6 +75,18 @@ fn recycle_one(p: &Path) -> Result<(), RecycleError> {
     if !sys::has_recycle_bin(p) {
         return Err(RecycleError::NoRecycleBin);
     }
+    os_recycle(p)?;
+    // The shell can report success while leaving the item in place (for example a file
+    // locked by another process); trust only what the disk says.
+    if p.symlink_metadata().is_ok() {
+        return Err(RecycleError::InUse);
+    }
+    Ok(())
+}
+
+/// The Recycle Bin through `SHFileOperationW` with `FOF_ALLOWUNDO`.
+#[cfg(windows)]
+fn os_recycle(p: &Path) -> Result<(), RecycleError> {
     let (code, aborted) = sys::shell_recycle(p);
     if aborted {
         return Err(RecycleError::Aborted);
@@ -86,10 +99,11 @@ fn recycle_one(p: &Path) -> Result<(), RecycleError> {
             c => RecycleError::Shell(c),
         });
     }
-    // The shell can report success while leaving the item in place (for example a file
-    // locked by another process); trust only what the disk says.
-    if p.symlink_metadata().is_ok() {
-        return Err(RecycleError::InUse);
-    }
     Ok(())
+}
+
+/// The user's Trash through NSFileManager (macOS). Never a permanent delete.
+#[cfg(not(windows))]
+fn os_recycle(p: &Path) -> Result<(), RecycleError> {
+    sys::trash(p)
 }

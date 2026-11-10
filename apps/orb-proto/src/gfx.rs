@@ -18,6 +18,8 @@ pub use windows_numerics::Vector2;
 
 use std::cell::RefCell;
 
+use crate::canvas::{Canvas, Color, Ellipse, RRect, Seg, Stroke};
+
 /// Inter Variable 4.1 (SIL OFL 1.1, assets/fonts/OFL.txt), bundled so every machine draws the
 /// same type. Loaded from memory by `load_inter`; nothing is installed on the system.
 static INTER_TTF: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
@@ -416,16 +418,65 @@ impl Surface {
     }
 }
 
-// ---- small drawing helpers ----
-
-pub fn rgba(hex: u32, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F {
-        r: ((hex >> 16) & 0xff) as f32 / 255.0,
-        g: ((hex >> 8) & 0xff) as f32 / 255.0,
-        b: (hex & 0xff) as f32 / 255.0,
-        a,
+/// Draws into an offscreen bitmap (`w` x `h` logical pixels at `scale`) and returns its pixels as
+/// premultiplied RGBA rows: the snapshot mode's renderer, on the same device context as the
+/// windows, so a snapshot is exactly what a window would show.
+pub fn render_offscreen(
+    g: &Shared,
+    w: f32,
+    h: f32,
+    scale: f32,
+    draw: impl FnOnce(&ID2D1DeviceContext),
+) -> Result<(u32, u32, Vec<u8>)> {
+    let (pw, ph) = ((w * scale).ceil() as u32, (h * scale).ceil() as u32);
+    unsafe {
+        let props = |opts| D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0 * scale,
+            dpiY: 96.0 * scale,
+            bitmapOptions: opts,
+            ..Default::default()
+        };
+        let size = D2D_SIZE_U {
+            width: pw,
+            height: ph,
+        };
+        let target =
+            g.dc.CreateBitmap(size, None, 0, &props(D2D1_BITMAP_OPTIONS_TARGET))?;
+        let cpu = g.dc.CreateBitmap(
+            size,
+            None,
+            0,
+            &props(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW),
+        )?;
+        g.dc.SetTarget(&target);
+        g.dc.SetDpi(96.0 * scale, 96.0 * scale);
+        g.dc.BeginDraw();
+        g.dc.Clear(Some(&D2D1_COLOR_F::default()));
+        draw(&g.dc);
+        g.dc.EndDraw(None, None)?;
+        g.dc.SetTarget(None);
+        cpu.CopyFromBitmap(None, &target, None)?;
+        let m = cpu.Map(D2D1_MAP_OPTIONS_READ)?;
+        let mut out = Vec::with_capacity((pw * ph * 4) as usize);
+        for y in 0..ph {
+            let row =
+                std::slice::from_raw_parts(m.bits.add((y * m.pitch) as usize), pw as usize * 4);
+            for px in row.chunks(4) {
+                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        cpu.Unmap()?;
+        Ok((pw, ph, out))
     }
 }
+
+// ---- small drawing helpers ----
+
+pub use crate::canvas::{on_circle, pt, rgba};
 
 pub fn brush(dc: &ID2D1DeviceContext, c: D2D1_COLOR_F) -> ID2D1SolidColorBrush {
     unsafe { dc.CreateSolidColorBrush(&c, None).unwrap() }
@@ -450,10 +501,6 @@ pub fn ellipse(cx: f32, cy: f32, r: f32) -> D2D1_ELLIPSE {
         radiusX: r,
         radiusY: r,
     }
-}
-
-pub fn pt(x: f32, y: f32) -> Vector2 {
-    Vector2 { X: x, Y: y }
 }
 
 pub fn text(
@@ -566,12 +613,6 @@ pub fn dashed_stroke(g: &Shared) -> ID2D1StrokeStyle {
     stroke_with(g, &[3.0, 3.0], D2D1_CAP_STYLE_FLAT)
 }
 
-/// A point on a circle, `deg` clockwise from 12 o'clock.
-pub fn on_circle(cx: f32, cy: f32, r: f32, deg: f32) -> Vector2 {
-    let a = deg.to_radians();
-    pt(cx + r * a.sin(), cy - r * a.cos())
-}
-
 /// A circular arc clockwise from `from` to `to` degrees (from 12 o'clock); a full turn is a circle.
 pub fn draw_arc(
     g: &Shared,
@@ -663,6 +704,195 @@ pub fn quad_to(sink: &ID2D1GeometrySink, ctrl: Vector2, to: Vector2) {
             point1: ctrl,
             point2: to,
         })
+    }
+}
+
+/// Width (including trailing spaces) and line height of `s` in `fmt`, measured through the same
+/// layout `text` draws with: what `Shared::text_width` returns, without needing a `Shared`.
+pub fn measure(s: &str, fmt: &IDWriteTextFormat) -> (f32, f32) {
+    let layout = TEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|(dw, ty)| new_layout(dw, ty.as_ref(), s, fmt, 2000.0, 100.0))
+    });
+    match layout {
+        Some(l) => unsafe {
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = l.GetMetrics(&mut m);
+            (m.widthIncludingTrailingWhitespace, m.height)
+        },
+        None => (0.0, 0.0),
+    }
+}
+
+/// The portable `Canvas` on a Direct2D device context. Every call is the Direct2D call the
+/// drawing code made before it was portable (a brush per call, path geometries through `path`,
+/// the shared stroke styles), so what it draws is pixel for pixel the same.
+pub struct D2dCanvas<'a> {
+    g: &'a Shared,
+    dc: &'a ID2D1DeviceContext,
+    styles: [Option<ID2D1StrokeStyle>; 3],
+    transforms: Vec<windows_numerics::Matrix3x2>,
+}
+
+impl<'a> D2dCanvas<'a> {
+    pub fn new(g: &'a Shared, dc: &'a ID2D1DeviceContext) -> Self {
+        Self {
+            g,
+            dc,
+            styles: [None, None, None],
+            transforms: Vec::new(),
+        }
+    }
+
+    fn style(&mut self, s: Stroke) -> Option<ID2D1StrokeStyle> {
+        let i = match s {
+            Stroke::Plain => return None,
+            Stroke::Round => 0,
+            Stroke::Dotted => 1,
+            Stroke::Dashed => 2,
+        };
+        if self.styles[i].is_none() {
+            self.styles[i] = Some(match s {
+                Stroke::Round => round_stroke(self.g),
+                Stroke::Dotted => dotted_stroke(self.g),
+                _ => dashed_stroke(self.g),
+            });
+        }
+        self.styles[i].clone()
+    }
+
+    fn geometry(&self, p: &crate::canvas::Path) -> ID2D1PathGeometry {
+        path(self.g, p.start, p.filled, |k| {
+            for seg in &p.segs {
+                match *seg {
+                    Seg::Line(to) => line_to(k, to),
+                    Seg::Quad(c, to) => quad_to(k, c, to),
+                    Seg::Arc { to, r, large, cw } => arc_to(k, to, r, large, cw),
+                }
+            }
+        })
+    }
+}
+
+fn d2_rrect(r: &RRect) -> D2D1_ROUNDED_RECT {
+    rrect(r.l, r.t, r.r, r.b, r.rad)
+}
+
+fn d2_ellipse(e: &Ellipse) -> D2D1_ELLIPSE {
+    D2D1_ELLIPSE {
+        point: e.point,
+        radiusX: e.rx,
+        radiusY: e.ry,
+    }
+}
+
+impl Canvas for D2dCanvas<'_> {
+    fn fill_rrect(&mut self, r: &RRect, c: Color) {
+        unsafe {
+            self.dc
+                .FillRoundedRectangle(&d2_rrect(r), &brush(self.dc, c))
+        }
+    }
+
+    fn stroke_rrect(&mut self, r: &RRect, c: Color, w: f32, s: Stroke) {
+        let st = self.style(s);
+        unsafe {
+            self.dc
+                .DrawRoundedRectangle(&d2_rrect(r), &brush(self.dc, c), w, st.as_ref())
+        }
+    }
+
+    fn fill_ellipse(&mut self, e: &Ellipse, c: Color) {
+        unsafe { self.dc.FillEllipse(&d2_ellipse(e), &brush(self.dc, c)) }
+    }
+
+    fn stroke_ellipse(&mut self, e: &Ellipse, c: Color, w: f32, s: Stroke) {
+        let st = self.style(s);
+        unsafe {
+            self.dc
+                .DrawEllipse(&d2_ellipse(e), &brush(self.dc, c), w, st.as_ref())
+        }
+    }
+
+    fn line(&mut self, a: Vector2, b: Vector2, c: Color, w: f32, s: Stroke) {
+        let st = self.style(s);
+        unsafe { self.dc.DrawLine(a, b, &brush(self.dc, c), w, st.as_ref()) }
+    }
+
+    fn fill_path(&mut self, p: &crate::canvas::Path, c: Color) {
+        let geo = self.geometry(p);
+        unsafe { self.dc.FillGeometry(&geo, &brush(self.dc, c), None) }
+    }
+
+    fn stroke_path(&mut self, p: &crate::canvas::Path, c: Color, w: f32, s: Stroke) {
+        let st = self.style(s);
+        let geo = self.geometry(p);
+        unsafe {
+            self.dc
+                .DrawGeometry(&geo, &brush(self.dc, c), w, st.as_ref())
+        }
+    }
+
+    fn text(&mut self, s: &str, f: &IDWriteTextFormat, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        text(self.dc, s, f, x, y, w, h, &brush(self.dc, c));
+    }
+
+    fn lip(&mut self, c: Color, dy: f32, l: f32, t: f32, r: f32, b: f32, radius: f32) {
+        crate::depth::lip_raw(self.g, self.dc, c, dy, l, t, r, b, radius);
+    }
+
+    fn push_clip(&mut self, l: f32, t: f32, r: f32, b: f32) {
+        unsafe {
+            self.dc.PushAxisAlignedClip(
+                &D2D_RECT_F {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            )
+        }
+    }
+
+    fn pop_clip(&mut self) {
+        unsafe { self.dc.PopAxisAlignedClip() }
+    }
+
+    fn push_layer(&mut self, opacity: f32) {
+        let p = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: D2D_RECT_F {
+                left: -1e6,
+                top: -1e6,
+                right: 1e6,
+                bottom: 1e6,
+            },
+            maskTransform: windows_numerics::Matrix3x2::identity(),
+            opacity,
+            ..Default::default()
+        };
+        unsafe { self.dc.PushLayer(&p, None) }
+    }
+
+    fn pop_layer(&mut self) {
+        unsafe { self.dc.PopLayer() }
+    }
+
+    fn push_translate(&mut self, dx: f32, dy: f32) {
+        unsafe {
+            let mut m = windows_numerics::Matrix3x2::default();
+            self.dc.GetTransform(&mut m);
+            self.transforms.push(m);
+            let t = windows_numerics::Matrix3x2::translation(dx, dy) * m;
+            self.dc.SetTransform(&t);
+        }
+    }
+
+    fn pop_translate(&mut self) {
+        if let Some(m) = self.transforms.pop() {
+            unsafe { self.dc.SetTransform(&m) }
+        }
     }
 }
 

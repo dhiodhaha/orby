@@ -1104,6 +1104,10 @@ mod tests {
         assert_eq!(undo_rect(&col).2, COL - X0, "the Undo bar spans the column");
         assert_eq!(undo_button(&col).2, COL - X0 - 10.0, "Undo stays right");
         let at_default = View { w: W, ..v.clone() };
-        assert_eq!(column(&at_default), (0.0, at_default.clone()), "no change at 600");
+        assert_eq!(
+            column(&at_default),
+            (0.0, at_default.clone()),
+            "no change at 600"
+        );
     }
 }

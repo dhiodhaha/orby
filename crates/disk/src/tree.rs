@@ -120,6 +120,10 @@ pub enum SkipReason {
     AccessDenied,
     /// Deleted between being listed and being read.
     Vanished,
+    /// macOS: a cloud placeholder folder (iCloud Drive or another File Provider) whose contents
+    /// are not on this Mac. Listing it would download it, so the scan does not; macOS answers
+    /// `EDEADLK` on the scan's threads instead.
+    InCloud,
     Other(std::io::ErrorKind),
 }
 
@@ -128,6 +132,8 @@ impl SkipReason {
         match e.kind() {
             std::io::ErrorKind::PermissionDenied => Self::AccessDenied,
             std::io::ErrorKind::NotFound => Self::Vanished,
+            #[cfg(target_os = "macos")]
+            std::io::ErrorKind::Deadlock => Self::InCloud,
             k => Self::Other(k),
         }
     }
@@ -412,5 +418,17 @@ mod tests {
         assert_eq!(t.children(t.root()).len(), 1);
         assert_eq!(t.node(t.root()).size(), 0);
         assert_eq!(t.node(t.root()).files(), 0);
+    }
+
+    #[test]
+    fn skip_reasons_from_errors() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(SkipReason::of(&Error::from(ErrorKind::PermissionDenied)), SkipReason::AccessDenied);
+        assert_eq!(SkipReason::of(&Error::from(ErrorKind::NotFound)), SkipReason::Vanished);
+        // What a dataless folder answers on a thread that may not download it.
+        #[cfg(target_os = "macos")]
+        assert_eq!(SkipReason::of(&Error::from_raw_os_error(libc::EDEADLK)), SkipReason::InCloud);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(SkipReason::of(&Error::from(ErrorKind::Deadlock)), SkipReason::Other(ErrorKind::Deadlock));
     }
 }

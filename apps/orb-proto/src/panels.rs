@@ -71,7 +71,7 @@ fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
     let (ox, oy) = content_origin(app);
     let (x, y) = (x - ox, y - oy);
     match app.panel_kind {
-        Kind::Prayer => panel::hit(&app.g, &app.fonts, x, y).map(Hit::Prayer),
+        Kind::Prayer => panel::hit(&app.fonts, x, y).map(Hit::Prayer),
         Kind::Focus => {
             focus_panel::hit(&app.g, &app.fonts, &habits::focus_view(app), x, y).map(Hit::Focus)
         }
@@ -499,7 +499,12 @@ fn sync_timer(app: &App) {
             // Wake just after each wall-clock second turns, which is when the countdown
             // changes. A free-running 1000 ms timer drifts against it: two ticks land in one
             // second and the next one skips a second, so the digits stutter.
-            let ms = 1000 - u32::from(windows::Win32::System::SystemInformation::GetLocalTime().wMilliseconds).min(999) + 15;
+            let ms = 1000
+                - u32::from(
+                    windows::Win32::System::SystemInformation::GetLocalTime().wMilliseconds,
+                )
+                .min(999)
+                + 15;
             SetTimer(Some(app.panel_hwnd), TIMER_PANEL, ms, None);
         } else if live {
             SetTimer(Some(app.panel_hwnd), TIMER_PANEL, 1000, None);

@@ -78,14 +78,7 @@ pub fn reach(dark: bool) -> f32 {
         .ceil()
 }
 
-/// The lip's colour: white, black 4% at the bottom; dark, white 6% at the top.
-pub fn lip_color(t: &Theme) -> D2D1_COLOR_F {
-    if t.dark {
-        rgba(0xFFFFFF, 0.06)
-    } else {
-        rgba(0x000000, 0.04)
-    }
-}
+pub use crate::ui::lip_color;
 
 /// The T3 lip on a rounded rect: a one-pixel crescent along the inside of the bottom edge
 /// (white) or the top edge (dark), following the corners, like CSS `inset 0 -1px 0` /
@@ -104,7 +97,33 @@ pub fn lip(
     if a <= 0.01 || r - l < 2.0 || b - top < 2.0 {
         return;
     }
+    let c = lip_color(t);
     let dy = if t.dark { 1.0 } else { -1.0 };
+    lip_raw(
+        g,
+        dc,
+        D2D1_COLOR_F { a: c.a * a, ..c },
+        dy,
+        l,
+        top,
+        r,
+        b,
+        radius,
+    );
+}
+
+/// The lip's crescent in `c`: the rounded rect minus itself moved down by `dy`.
+pub fn lip_raw(
+    g: &Shared,
+    dc: &ID2D1DeviceContext,
+    c: D2D1_COLOR_F,
+    dy: f32,
+    l: f32,
+    top: f32,
+    r: f32,
+    b: f32,
+    radius: f32,
+) {
     unsafe {
         let shape = rrect(l, top, r, b, radius);
         let moved = rrect(l, top + dy, r, b + dy, radius);
@@ -123,8 +142,7 @@ pub fn lip(
             .is_ok();
         let _ = sink.Close();
         if ok {
-            let c = lip_color(t);
-            dc.FillGeometry(&path, &brush(dc, D2D1_COLOR_F { a: c.a * a, ..c }), None);
+            dc.FillGeometry(&path, &brush(dc, c), None);
         }
     }
 }

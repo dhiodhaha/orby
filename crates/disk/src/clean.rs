@@ -10,9 +10,11 @@ use std::time::{Duration, SystemTime};
 pub enum SuggestionKind {
     /// Top-level items in Downloads whose newest created or modified date is older than the cutoff.
     OldDownloads,
-    /// Top-level items in the user and Windows temp folders.
+    /// Top-level items in the user and Windows temp folders (on macOS, app caches in
+    /// `~/Library/Caches`).
     TempFiles,
-    /// Edge and Chrome cache folders, never cookies, history or passwords.
+    /// Edge and Chrome cache folders, never cookies, history or passwords (on macOS, the ones in
+    /// `~/Library/Caches`).
     BrowserCaches,
 }
 
@@ -80,6 +82,21 @@ pub struct CleanPlaces {
 const CACHE_FOLDERS: [&str; 3] = ["Cache", "Code Cache", "GPUCache"];
 
 impl CleanPlaces {
+    /// macOS: Downloads, `~/Library/Caches` (its top-level app caches stand in for temp files;
+    /// Apple's own and ones a cleaning rule offers are left out) and the Chrome and Edge cache
+    /// folders in `~/Library/Caches`. `$TMPDIR` is not offered: it holds live state of running
+    /// apps.
+    #[cfg(target_os = "macos")]
+    pub fn for_current_user() -> Self {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()) else {
+            return CleanPlaces::default();
+        };
+        let caches = home.join("Library").join("Caches");
+        let browser_user_data = vec![caches.join("Google").join("Chrome"), caches.join("Microsoft Edge")];
+        CleanPlaces { downloads: sys::downloads_dir(), temp: vec![caches], browser_user_data }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn for_current_user() -> Self {
         let mut temp = vec![std::env::temp_dir()];
         if let Some(root) = std::env::var_os("SystemRoot") {
@@ -98,6 +115,7 @@ impl CleanPlaces {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn same_path(a: &Path, b: &Path) -> bool {
     let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
     norm(a) == norm(b)
@@ -106,6 +124,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// The three suggestions, in panel order. Folders that do not exist or cannot be read
 /// just contribute nothing.
 pub fn safe_to_clean(places: &CleanPlaces, now: SystemTime, older_than_days: u32) -> Vec<Suggestion> {
+    let _local_only = sys::NoMaterialize::new();
     let cutoff = now.checked_sub(Duration::from_secs(u64::from(older_than_days) * 86_400));
     let downloads = places
         .downloads
@@ -113,7 +132,7 @@ pub fn safe_to_clean(places: &CleanPlaces, now: SystemTime, older_than_days: u32
         .flat_map(|d| top_level(d))
         .filter(|c| matches!((c.newest, cutoff), (Some(n), Some(cut)) if n < cut))
         .collect();
-    let temp = places.temp.iter().flat_map(|d| top_level(d)).collect();
+    let temp = places.temp.iter().flat_map(|d| top_level(d)).filter(|c| temp_item_offered(places, &c.path)).collect();
     let caches = places
         .browser_user_data
         .iter()
@@ -126,6 +145,17 @@ pub fn safe_to_clean(places: &CleanPlaces, now: SystemTime, older_than_days: u32
         .into_iter()
         .map(|(kind, items)| Suggestion { kind, items: tidy(items) })
         .collect()
+}
+
+/// Every temp item on Windows. On macOS, where the temp place is `~/Library/Caches`, not Apple's
+/// own caches, not ones a cleaning rule offers, and not a folder holding the browser caches
+/// (those are offered on their own row).
+fn temp_item_offered(_places: &CleanPlaces, _path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    return _path.file_name().is_some_and(crate::mac::cache_item_offered)
+        && !_places.browser_user_data.iter().any(|b| crate::rules::is_within(b, _path));
+    #[cfg(not(target_os = "macos"))]
+    true
 }
 
 fn tidy(mut items: Vec<Candidate>) -> Vec<Candidate> {
