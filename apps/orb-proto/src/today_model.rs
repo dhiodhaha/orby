@@ -42,7 +42,13 @@ impl Source {
             }
         }
         if lower.starts_with("file:///") {
-            let path = percent_decode(&s["file:///".len()..]).replace('/', "\\");
+            let rest = percent_decode(&s["file:///".len()..]);
+            // file:///C:/x on Windows, file:///Users/x on macOS.
+            let path = if cfg!(windows) {
+                rest.replace('/', "\\")
+            } else {
+                format!("/{rest}")
+            };
             return looks_like_path(&path).then(|| Source::File(PathBuf::from(path)));
         }
         if looks_like_path(s) && lower.ends_with(".ics") {
@@ -79,6 +85,8 @@ fn looks_like_path(s: &str) -> bool {
     let b = s.as_bytes();
     (b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
         || s.starts_with("\\\\")
+        // An absolute path on macOS.
+        || (!cfg!(windows) && s.len() > 1 && s.starts_with('/'))
 }
 
 fn percent_decode(s: &str) -> String {
