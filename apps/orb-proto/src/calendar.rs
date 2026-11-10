@@ -506,7 +506,10 @@ fn card(sync: &Sync, reading: bool, offset: i32) -> Option<Card> {
             icon: Icon::Clock,
             title: "Loading your day…".into(),
             body: vec![
-                "Prayer times are worked out on this PC.".into(),
+                format!(
+                    "Prayer times are worked out on this {}.",
+                    crate::settings_model::os::W.device
+                ),
                 "Events fill in when the calendar answers.".into(),
             ],
             buttons: Vec::new(),

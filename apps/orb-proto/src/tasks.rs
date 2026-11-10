@@ -650,7 +650,10 @@ pub fn view(app: &App) -> View {
     };
     let sync = match &t.store_error {
         Some(_) => "Couldn't open app.db, changes aren't saved".to_string(),
-        None => "On this PC only · sync is off".to_string(),
+        None => format!(
+            "On this {} only · sync is off",
+            crate::settings_model::os::W.device
+        ),
     };
     let understood = t.notice.clone().unwrap_or(understood);
     let side_scroll = t.side_scroll.clamp(0.0, tp::side_max_scroll(side.len()));
@@ -724,10 +727,10 @@ pub fn click(app: &mut App, h: tp::Hit) {
             app.tasks.field.clear();
         }
         tp::Hit::Share => {
-            app.tasks.notice = Some(
-                "Sharing a space comes with sync, in a later update. Everything stays on this PC."
-                    .into(),
-            )
+            app.tasks.notice = Some(format!(
+                "Sharing a space comes with sync, in a later update. Everything stays on this {}.",
+                crate::settings_model::os::W.device
+            ))
         }
         tp::Hit::Add => return submit(app),
         tp::Hit::AllTasks => return crate::tasks_window::show(app),
