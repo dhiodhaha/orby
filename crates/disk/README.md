@@ -90,6 +90,10 @@ Everything above builds for `aarch64-apple-darwin` behind `#[cfg(target_os = "ma
 - **Cache:** `default_dupes_cache()` is `~/Library/Application Support/orb-proto/dupes-cache.json` (on Windows `%APPDATA%\orb-proto\dupes-cache.json`).
 - **BLAKE3:** the default build on every platform, so macOS hashes with NEON. blake3's build script compiles its NEON C file with the Mac's C compiler (Xcode's command line tools).
 
+- **Clones and allocated size:** after the whole-file check, each copy in a group asks `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` what moving it would free: blocks no APFS clone and no snapshot shares. `DupeFile::frees` carries it (None on Windows); `DupeGroup::reclaimable()` keeps the copy that frees the most and counts what the rest free, and `shares_space()` says when a copy frees less than half its size. Test: `an_apfs_clone_is_found_identical_but_frees_almost_nothing` makes a real `clonefile(2)` clone. On the home folder of the survey Mac: 1.80 GB by size, 1.64 GB really reclaimable; 34 groups share blocks (0.17 GB by size, 0.01 GB freed).
+- **Put Back:** `move_to_recycle_bin` remembers where each item landed in the Trash (`resultingItemURL`); `put_back(original)` renames it back, never over something new and never making folders (`PutBackError::{NotInBin, Occupied, Failed}`). Windows answers `NotInBin` (the app restores from the Recycle Bin's records).
+- **Consent prompts:** `full_disk_access()` and `protected_folders()` (macOS): without Full Disk Access the folders a scan would stop at a prompt for (Desktop, Documents, Downloads, iCloud Drive, CloudStorage, other apps' containers, the Photos, Photo Booth, Music and TV libraries). `ScanOptions::protected` leaves them out as `SkipReason::Protected` (empty by default). The walk's workers are detached, and a watchdog leaves out any folder held for 4 s (`scan_waiting` lists folders being read longer than a given time).
+
 Built, tested and linted on a Mac (Apple Silicon, Xcode command line tools):
 
 ```sh
