@@ -318,6 +318,14 @@ pub fn run_mac(dir: &Path) {
                 );
             });
         }
+        let map =
+            crate::disk_panel::map_rect(&fonts, crate::disk_panel::W, crate::disk_panel::H, &[]);
+        for (name, v, hover) in crate::disk_scenes::scenes(map) {
+            let (w, h) = crate::disk_panel::size(&fonts, &v);
+            shot(&format!("{name}-{tag}"), w, h.max(v.room), &|cv| {
+                crate::disk_panel::draw(cv, &th, &fonts, &v, hover);
+            });
+        }
         let view = panel_view(&pd);
         shot(
             &format!("prayer-{tag}"),

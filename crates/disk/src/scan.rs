@@ -9,7 +9,8 @@ use std::fs::{self, DirEntry};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
@@ -17,12 +18,16 @@ pub struct ScanOptions {
     pub threads: usize,
     /// Call the progress callback after this many folders have been added.
     pub progress_every: usize,
+    /// Folders not entered, listed in [`Tree::skipped`] as [`SkipReason::Protected`]. On macOS
+    /// an app without Full Disk Access is stopped by a consent prompt when it opens some of its
+    /// own user's folders; the read waits until someone answers. See [`protected_folders`].
+    pub protected: Vec<PathBuf>,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        ScanOptions { threads: (cores * 2).clamp(2, 64), progress_every: 64 }
+        ScanOptions { threads: (cores * 2).clamp(2, 64), progress_every: 64, protected: Vec::new() }
     }
 }
 
@@ -109,7 +114,7 @@ pub fn scan(root: &Path, options: &ScanOptions, mut progress: impl FnMut(Progres
     if !md.is_dir() {
         return Err(ScanError::NotADirectory);
     }
-    let vol = Volume { cluster: sys::cluster_size(&root), mounts: sys::Mounts::new() };
+    let vol = Arc::new(Volume { cluster: sys::cluster_size(&root), mounts: sys::Mounts::new() });
     let mut tree = Tree::new(root.clone(), md.modified().ok());
     let threads = options.threads.max(1);
     let every = options.progress_every.max(1);
@@ -117,65 +122,96 @@ pub fn scan(root: &Path, options: &ScanOptions, mut progress: impl FnMut(Progres
     let mut root_error = None;
 
     let (job_tx, job_rx) = mpsc::channel::<Job>();
-    let job_rx = Mutex::new(job_rx);
-    std::thread::scope(|s| {
-        let (res_tx, res_rx) = mpsc::channel::<Listing>();
-        for _ in 0..threads {
-            let (res_tx, job_rx) = (res_tx.clone(), &job_rx);
-            let vol = &vol;
-            s.spawn(move || worker(job_rx, res_tx, cancel, vol));
-        }
-        drop(res_tx);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    // The workers are not scoped: one the system holds inside a folder (a consent prompt, a
+    // dead network share) must not hold up the end of the scan. They see `stop` instead of the
+    // caller's flag, which this thread passes on.
+    let stop = Arc::new(AtomicBool::new(false));
+    let (res_tx, res_rx) = mpsc::channel::<Listing>();
+    for _ in 0..threads {
+        let (res_tx, job_rx, vol, stop) = (res_tx.clone(), Arc::clone(&job_rx), Arc::clone(&vol), Arc::clone(&stop));
+        std::thread::spawn(move || worker(&job_rx, res_tx, &stop, &vol));
+    }
+    drop(res_tx);
 
-        // Every job yields exactly one listing, so `pending` reaching zero means done.
-        let _ = job_tx.send(Job { dir: tree.root(), path: root.clone() });
-        let mut pending = 1usize;
-        let mut added = 0usize;
-        while pending > 0 {
-            let Ok(listing) = res_rx.recv() else { break };
-            pending -= 1;
-            for (name, e) in listing.entry_errors {
-                // No name: reading the folder's listing failed part way, so the folder is what
-                // was skipped (joining "" would add a trailing separator).
-                let path = if name.is_empty() { listing.path.clone() } else { listing.path.join(name) };
-                tree.skip(Skipped { path, reason: SkipReason::of(&e) });
-            }
-            let entries = match listing.read {
-                Read::Done(v) => v,
-                Read::Partial(v) => {
-                    incomplete = true;
-                    v
-                }
-                Read::NotStarted => {
-                    incomplete = true;
-                    continue;
-                }
-                Read::Failed(e) => {
-                    if listing.dir == tree.root() {
-                        root_error = Some(e);
-                    } else {
-                        tree.skip(Skipped { path: listing.path, reason: SkipReason::of(&e) });
+    // Every job yields exactly one listing, so `pending` reaching zero means done.
+    let _ = job_tx.send(Job { dir: tree.root(), path: root.clone() });
+    let mut pending = 1usize;
+    let mut added = 0usize;
+    let mut last = Instant::now();
+    while pending > 0 {
+        if cancel.load(Ordering::Relaxed) {
+            stop.store(true, Ordering::Relaxed);
+        }
+        let listing = match res_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(l) => l,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Nothing for a while, and every folder still out has been held that long: the
+                // system is waiting on someone. Those folders are left out and the scan ends.
+                if last.elapsed() >= HELD {
+                    let held = in_flight_since(&root, HELD);
+                    if !held.is_empty() && held.len() >= pending.min(threads) {
+                        // Folders still queued behind the held ones were never read.
+                        incomplete |= held.len() < pending;
+                        for p in held {
+                            tree.skip(Skipped { path: p, reason: SkipReason::Protected });
+                        }
+                        break;
                     }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        last = Instant::now();
+        pending -= 1;
+        for (name, e) in listing.entry_errors {
+            // No name: reading the folder's listing failed part way, so the folder is what
+            // was skipped (joining "" would add a trailing separator).
+            let path = if name.is_empty() { listing.path.clone() } else { listing.path.join(name) };
+            tree.skip(Skipped { path, reason: SkipReason::of(&e) });
+        }
+        let entries = match listing.read {
+            Read::Done(v) => v,
+            Read::Partial(v) => {
+                incomplete = true;
+                v
+            }
+            Read::NotStarted => {
+                incomplete = true;
+                continue;
+            }
+            Read::Failed(e) => {
+                if listing.dir == tree.root() {
+                    root_error = Some(e);
+                } else {
+                    tree.skip(Skipped { path: listing.path, reason: SkipReason::of(&e) });
+                }
+                continue;
+            }
+        };
+        let subdirs = tree.add_listing(listing.dir, entries);
+        if cancel.load(Ordering::Relaxed) {
+            incomplete |= !subdirs.is_empty();
+        } else {
+            for d in subdirs {
+                let path = listing.path.join(tree.node(d).name());
+                if options.protected.contains(&path) {
+                    tree.skip(Skipped { path, reason: SkipReason::Protected });
                     continue;
                 }
-            };
-            let subdirs = tree.add_listing(listing.dir, entries);
-            if cancel.load(Ordering::Relaxed) {
-                incomplete |= !subdirs.is_empty();
-            } else {
-                for d in subdirs {
-                    let path = listing.path.join(tree.node(d).name());
-                    let _ = job_tx.send(Job { dir: d, path });
-                    pending += 1;
-                }
-            }
-            added += 1;
-            if added.is_multiple_of(every) {
-                progress(Progress { tree: &tree, current: &listing.path });
+                let _ = job_tx.send(Job { dir: d, path });
+                pending += 1;
             }
         }
-        drop(job_tx);
-    });
+        added += 1;
+        if added.is_multiple_of(every) {
+            progress(Progress { tree: &tree, current: &listing.path });
+        }
+    }
+    // Idle workers end when the job channel closes; a held one ends when the system lets go.
+    stop.store(true, Ordering::Relaxed);
+    drop(job_tx);
 
     if let Some(e) = root_error {
         return Err(e.into());
@@ -201,7 +237,45 @@ fn worker(jobs: &Mutex<mpsc::Receiver<Job>>, results: mpsc::Sender<Listing>, can
     }
 }
 
+/// The folders being listed right now, with when each started: a folder that takes long is
+/// usually one the system is holding (a consent prompt, a slow network share).
+static IN_FLIGHT: Mutex<Vec<(PathBuf, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// How long the walk waits on folders the system holds before it leaves them out.
+const HELD: Duration = Duration::from_secs(4);
+
+/// This scan's folders (under `root`) still being listed since at least `at_least` ago.
+fn in_flight_since(root: &Path, at_least: Duration) -> Vec<PathBuf> {
+    IN_FLIGHT
+        .lock()
+        .map(|l| l.iter().filter(|(p, t)| p.starts_with(root) && t.elapsed() >= at_least).map(|(p, _)| p.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Folders any scan has been listing for longer than `at_least`, longest first.
+pub fn scan_waiting(at_least: std::time::Duration) -> Vec<(PathBuf, std::time::Duration)> {
+    let mut v: Vec<(PathBuf, std::time::Duration)> = IN_FLIGHT
+        .lock()
+        .map(|l| l.iter().map(|(p, t)| (p.clone(), t.elapsed())).filter(|(_, d)| *d >= at_least).collect())
+        .unwrap_or_default();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    v
+}
+
 fn read_dir(job: Job, cancel: &AtomicBool, vol: &Volume) -> Listing {
+    if let Ok(mut l) = IN_FLIGHT.lock() {
+        l.push((job.path.clone(), std::time::Instant::now()));
+    }
+    let listing = read_dir_inner(job, cancel, vol);
+    if let Ok(mut l) = IN_FLIGHT.lock() {
+        if let Some(i) = l.iter().position(|(p, _)| *p == listing.path) {
+            l.swap_remove(i);
+        }
+    }
+    listing
+}
+
+fn read_dir_inner(job: Job, cancel: &AtomicBool, vol: &Volume) -> Listing {
     let dev = vol.mounts.device(&job.path);
     let mut entry_errors = Vec::new();
     let read = match read_dir_retrying(&job.path) {
@@ -300,6 +374,49 @@ fn allocated_unix(md: &fs::Metadata) -> Option<u64> {
 #[cfg(not(unix))]
 fn allocated_unix(_md: &fs::Metadata) -> Option<u64> {
     None
+}
+
+/// Whether this process has Full Disk Access (macOS): it can open the user's privacy database,
+/// which only Full Disk Access allows, and which never asks. None elsewhere.
+pub fn full_disk_access() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        Some(fs::File::open(home.join("Library/Application Support/com.apple.TCC/TCC.db")).is_ok())
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// The folders an app scan should leave out so it never stops at a consent prompt: on macOS
+/// without Full Disk Access, the home folder's Desktop, Documents and Downloads, iCloud Drive
+/// and cloud storage, other apps' containers, and the Photos, Photo Booth, Music and TV
+/// libraries. Nothing elsewhere, or with Full Disk Access. A folder missing here is still left
+/// out after a few seconds of waiting (the walk's watchdog), only later.
+pub fn protected_folders() -> Vec<PathBuf> {
+    if full_disk_access() != Some(false) {
+        return Vec::new();
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute()) else {
+        return Vec::new();
+    };
+    [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library/Mobile Documents",
+        "Library/CloudStorage",
+        "Library/Containers",
+        "Library/Group Containers",
+        "Library/Photos",
+        "Pictures/Photos Library.photoslibrary",
+        "Pictures/Photo Booth Library",
+        "Music/Music",
+        "Movies/TV",
+    ]
+        .iter()
+        .map(|p| home.join(p))
+        .collect()
 }
 
 #[cfg(test)]

@@ -87,6 +87,7 @@ pub fn plural(n: u64, one: &str, many: &str) -> String {
 }
 
 /// The drive letter of an absolute Windows path.
+#[cfg(windows)]
 pub fn drive_letter(p: &Path) -> Option<char> {
     let s = p.to_string_lossy();
     let b = s.as_bytes();
@@ -94,14 +95,52 @@ pub fn drive_letter(p: &Path) -> Option<char> {
         .then(|| (b[0] as char).to_ascii_uppercase())
 }
 
+#[cfg(windows)]
 pub fn drive_label(p: &Path) -> String {
     drive_letter(p).map_or_else(|| "this drive".into(), |c| format!("{c}:"))
 }
 
 /// `C:\` or `C:`.
+#[cfg(windows)]
 pub fn is_drive_root(p: &Path) -> bool {
     let s = p.to_string_lossy();
     drive_letter(p).is_some() && s.trim_end_matches(['\\', '/']).len() == 2
+}
+
+/// The drive list's row: "C: Windows".
+#[cfg(windows)]
+pub fn drive_row_name(root: &Path, label: &str) -> String {
+    format!("{} {label}", drive_label(root))
+}
+
+/// macOS has no drive letters: the startup disk keys as '/' (the low-space watch, the pill).
+#[cfg(not(windows))]
+pub fn drive_letter(p: &Path) -> Option<char> {
+    (p == Path::new("/")).then_some('/')
+}
+
+/// "Macintosh HD" for the startup disk, a volume's own name under /Volumes.
+#[cfg(not(windows))]
+pub fn drive_label(p: &Path) -> String {
+    if p == Path::new("/") {
+        return "Macintosh HD".into();
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(v), Some(n)) if v == Path::new("/Volumes") => n.to_string_lossy().into_owned(),
+        _ => "this disk".into(),
+    }
+}
+
+/// The startup disk, or a volume mounted under /Volumes.
+#[cfg(not(windows))]
+pub fn is_drive_root(p: &Path) -> bool {
+    p == Path::new("/") || p.parent() == Some(Path::new("/Volumes"))
+}
+
+/// The drive list's row: the place's own name ("Macintosh HD", "dhafin · home folder").
+#[cfg(not(windows))]
+pub fn drive_row_name(_root: &Path, label: &str) -> String {
+    label.to_string()
 }
 
 /// "C:" for a drive, else the folder's own name.
@@ -205,7 +244,11 @@ pub mod os {
 /// The low-space pill: "C:" then "has 38 GB left".
 pub fn low_space_words(drive: char, space: DriveSpace) -> (String, String) {
     (
-        format!("{drive}:"),
+        if cfg!(windows) {
+            format!("{drive}:")
+        } else {
+            "Macintosh HD".into()
+        },
         format!("has {} left", size_round(space.free)),
     )
 }
@@ -456,7 +499,7 @@ pub fn folder_below(tree: &Tree, at: NodeId, file: NodeId) -> String {
         .iter()
         .map(|&n| tree.node(n).name().to_string_lossy().into_owned())
         .collect();
-    parts.join("\\")
+    parts.join(std::path::MAIN_SEPARATOR_STR)
 }
 
 // ---- the treemap ----
@@ -1362,7 +1405,8 @@ pub fn dupe_cost_words(kind: Option<app_disk::DriveKind>) -> &'static str {
     }
 }
 
-#[cfg(test)]
+/// The model's tests use Windows paths, rules and words; the macOS ones are below.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
@@ -2000,5 +2044,57 @@ mod tests {
         assert_eq!(line, "1,204 of 3,400 files · 1 GB of 4 GB");
         assert!((frac - 0.25).abs() < 1e-6);
         assert!(dupe_stage_words(app_disk::DupeStage::Ends).ends_with('…'));
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod mac_tests {
+    use super::*;
+
+    #[test]
+    fn the_startup_disk_is_a_drive_and_home_is_a_folder() {
+        assert!(is_drive_root(Path::new("/")));
+        assert!(is_drive_root(Path::new("/Volumes/Backup")));
+        assert!(!is_drive_root(Path::new("/Users/dhafin")));
+        assert_eq!(place_name(Path::new("/")), "Macintosh HD");
+        assert_eq!(place_name(Path::new("/Users/dhafin")), "dhafin");
+        assert_eq!(drive_letter(Path::new("/")), Some('/'));
+        let s = DriveSpace {
+            total: 228 << 30,
+            free: 14 << 30,
+        };
+        assert_eq!(
+            low_space_words('/', s),
+            ("Macintosh HD".into(), "has 14 GB left".into())
+        );
+        assert_eq!(confirm_title(2), "Move 2 items to the Trash?");
+    }
+
+    #[test]
+    fn a_clone_of_the_keeper_frees_almost_nothing() {
+        let copy = |p: &str, frees: u64| DupeCopy {
+            path: PathBuf::from(p),
+            modified: None,
+            gone: false,
+            frees: Some(frees),
+        };
+        let mut s = DupeSet::new(
+            100 << 20,
+            vec![
+                copy("/Users/me/Movies/a.mov", 100 << 20),
+                copy("/Users/me/Movies/b.mov", 0),
+            ],
+        );
+        assert_eq!(s.reclaimable(), 0, "b shares every block with a");
+        assert!(s.shares_space());
+        s.pick_extras(true);
+        let mut l = DupeList { sets: vec![s] };
+        assert_eq!(l.selection(), (1, 0));
+        l.sets[0].copies[1].frees = Some(100 << 20);
+        assert_eq!(l.selection(), (1, 100 << 20));
+        assert_eq!(
+            dupe_group_words(2, 0, true),
+            "2 copies · 0 KB to reclaim · shares space (APFS clone)"
+        );
     }
 }

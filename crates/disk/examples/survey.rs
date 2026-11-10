@@ -51,6 +51,7 @@ fn main() {
             SkipReason::AccessDenied => "access denied".to_string(),
             SkipReason::Vanished => "vanished".to_string(),
             SkipReason::InCloud => "in the cloud, not downloaded".to_string(),
+            SkipReason::Protected => "left out (the system would ask first)".to_string(),
             SkipReason::Other(k) => format!("other: {k:?}"),
         };
         reasons.entry(key).or_default().push(&s.path);

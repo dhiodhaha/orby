@@ -30,6 +30,6 @@ pub use rules::{
     check_removal, is_unfinished_download, measure_rules, never_touch, recycle_rule_items, Group, Measured, Refusal, Rule, RuleEnv,
     RuleFound, RuleMeasure, Tier, NEVER_NAMES, NEVER_REMOVE_ROOTS, NEVER_TOUCH, RULES, UNFINISHED_DOWNLOAD,
 };
-pub use scan::{scan, Progress, ScanError, ScanOptions};
+pub use scan::{full_disk_access, protected_folders, scan, scan_waiting, Progress, ScanError, ScanOptions};
 pub use space::{drive_space, DriveSpace, LowSpaceWatch, LOW_SPACE_PERCENT, LOW_SPACE_STEP};
 pub use tree::{ChildShare, Node, NodeId, NodeKind, ScanStatus, SkipReason, Skipped, Tree};

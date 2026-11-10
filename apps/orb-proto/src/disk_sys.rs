@@ -172,6 +172,11 @@ mod imp {
         PathBuf::from("C:\\")
     }
 
+    /// The low-space pill's Find big folders: the drive itself.
+    pub fn big_folders_root(drive: char) -> PathBuf {
+        PathBuf::from(format!("{drive}:\\"))
+    }
+
     /// The drive the dial's Disk child and the tray test read.
     pub fn main_drive() -> PathBuf {
         PathBuf::from("C:\\")

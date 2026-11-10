@@ -1786,7 +1786,12 @@ fn draw_start(
 ) {
     let vw = v.w;
     let (ink, muted) = (t.text, t.muted);
-    cv.text("Pick a drive", &f.panel_title, X0, 16.0, 200.0, 18.0, ink);
+    let title = if cfg!(windows) {
+        "Pick a drive"
+    } else {
+        "Pick what to scan"
+    };
+    cv.text(title, &f.panel_title, X0, 16.0, 200.0, 18.0, ink);
     cv.right_text(
         "What is taking the room",
         &f.small,

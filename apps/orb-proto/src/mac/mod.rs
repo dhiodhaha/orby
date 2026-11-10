@@ -7,11 +7,16 @@
 //! - metal.rs / metal.msl: the liquid-metal drop
 //! - hotkey.rs: the global shortcut through Carbon (no Accessibility permission)
 //! - clock.rs: local time and the settings folder
+//! - disk.rs / disk_win.rs: the Disk window and what Disk asks of the system (disk_sys)
+//! - login.rs: start at login (SMAppService)
 
 pub mod app;
 pub mod cg;
 pub mod clock;
+pub mod disk;
+pub mod disk_win;
 pub mod hotkey;
+pub mod login;
 pub mod metal;
 pub mod text;
 

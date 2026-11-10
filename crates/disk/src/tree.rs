@@ -124,6 +124,9 @@ pub enum SkipReason {
     /// are not on this Mac. Listing it would download it, so the scan does not; macOS answers
     /// `EDEADLK` on the scan's threads instead.
     InCloud,
+    /// Left out on purpose: macOS would stop to ask before this app reads it (see
+    /// [`crate::protected_folders`]). Full Disk Access lets the scan count it.
+    Protected,
     Other(std::io::ErrorKind),
 }
 

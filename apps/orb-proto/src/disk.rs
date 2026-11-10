@@ -738,7 +738,7 @@ pub fn test_low_space(app: &mut App, free_percent: f64, fresh: bool) {
 
 /// The low-space pill's action: scan the drive and show it scanning.
 pub fn find_big_folders(app: &mut App, letter: char) {
-    scan_path(app, PathBuf::from(format!("{letter}:\\")), true);
+    scan_path(app, sys::big_folders_root(letter), true);
     open(app);
 }
 
@@ -760,7 +760,12 @@ pub fn scan_path(app: &mut App, root: PathBuf, user: bool) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let mut last = Instant::now() - LIVE_EVERY;
-        let opts = ScanOptions::default();
+        // macOS without Full Disk Access: the folders it would stop to ask about are left out
+        // (and listed), so a scan never waits on a prompt. Nothing on Windows.
+        let opts = ScanOptions {
+            protected: ad::protected_folders(),
+            ..ScanOptions::default()
+        };
         let res = ad::scan(
             &r,
             &opts,
@@ -1675,9 +1680,10 @@ fn confirm_move(app: &mut App) {
     sys::log(
         app,
         &format!(
-            "disk: moving {} item(s) and {} rule folder(s) to the Recycle Bin",
+            "disk: moving {} item(s) and {} rule folder(s) to {}",
             paths.len(),
-            rules.len()
+            rules.len(),
+            m::os::THE_BIN
         ),
     );
     let (rep, source) = (reporter(app), c.source);
@@ -1712,8 +1718,9 @@ fn on_recycled(app: &mut App, report: RecycleReport, since: SystemTime, source: 
     sys::log(
         app,
         &format!(
-            "disk: moved {} to the Recycle Bin, {} stayed {failed:?}",
+            "disk: moved {} to {}, {} stayed {failed:?}",
             report.moved.len(),
+            m::os::THE_BIN,
             report.failed.len()
         ),
     );
@@ -1874,7 +1881,16 @@ fn clean_places() -> CleanPlaces {
             temp: vec![root.join("Temp")],
             browser_user_data: vec![root.join("Browser").join("User Data")],
         },
-        None => CleanPlaces::for_current_user(),
+        None => {
+            // Never a place macOS would stop to ask about (Downloads without Full Disk Access).
+            let protected = ad::protected_folders();
+            let mut p = CleanPlaces::for_current_user();
+            if p.downloads.as_ref().is_some_and(|d| protected.contains(d)) {
+                p.downloads = None;
+            }
+            p.temp.retain(|t| !protected.contains(t));
+            p
+        }
     }
 }
 
@@ -3154,7 +3170,12 @@ fn cards(app: &App) -> Vec<Card> {
                     .tree
                     .skipped()
                     .iter()
-                    .filter(|k| k.reason == ad::SkipReason::AccessDenied)
+                    .filter(|k| {
+                        matches!(
+                            k.reason,
+                            ad::SkipReason::AccessDenied | ad::SkipReason::Protected
+                        )
+                    })
                     .count() as u64;
                 if !cfg!(windows) && denied > 0 {
                     out.push(card(
@@ -3552,7 +3573,7 @@ pub fn view(app: &App) -> View {
                 .drives
                 .iter()
                 .map(|(r, label, s, kind)| dp::DriveRow {
-                    name: format!("{} {label}", m::drive_label(r)),
+                    name: m::drive_row_name(r, label),
                     free: format!(
                         "{} free of {}{}",
                         m::size_round(s.free),
@@ -4534,6 +4555,142 @@ pub fn shutdown(app: &mut App) {
     }
     if let DupeRun::Running { cancel, .. } = &app.disk.dupes.run {
         cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// One line about where the window is, for the log (the Mac's test commands).
+#[cfg_attr(windows, allow(dead_code))]
+pub fn state_line(app: &App) -> String {
+    let scan = match &app.disk.scan {
+        Scan::Idle => "idle".to_string(),
+        Scan::Running { root, live, .. } => format!(
+            "running {} ({} files so far, waiting on {:?})",
+            root.display(),
+            live.files,
+            ad::scan_waiting(Duration::from_secs(2))
+        ),
+        Scan::Done(d) => {
+            let n = d.tree.node(d.tree.root());
+            format!(
+                "done {} ({} files, {}, {} skipped)",
+                d.tree.root_path().display(),
+                n.files(),
+                m::size(n.size()),
+                d.tree.skipped().len()
+            )
+        }
+        Scan::Failed { root, error } => format!("failed {} ({error})", root.display()),
+        Scan::Released { root } => format!("released {}", root.display()),
+    };
+    let dupes = match &app.disk.dupes.run {
+        DupeRun::Idle { stopped } => format!(
+            "idle{} (up to {})",
+            if *stopped { ", stopped" } else { "" },
+            m::size(app.disk.dupes.cands.as_ref().map_or(0, |c| c.possible))
+        ),
+        DupeRun::Running { progress, .. } => format!("running {progress:?}"),
+        DupeRun::Done { list, skipped } => format!(
+            "{} groups, {} to reclaim, {} sharing space, {skipped} skipped",
+            list.shown().len(),
+            m::size(list.reclaimable()),
+            list.sets
+                .iter()
+                .filter(|s| s.shown() && s.shares_space())
+                .count()
+        ),
+    };
+    let v = view(app);
+    let screen = match &v.screen {
+        Screen::Start(d, _) => format!("start ({} places)", d.len()),
+        Screen::Results(r) => format!(
+            "results {:?}: {} rows, {} files, chip {:?} {:?}, big {:?} {:?}",
+            r.tab,
+            r.rows.len(),
+            r.files.len(),
+            r.chip,
+            r.chip_sub,
+            r.big,
+            r.of
+        ),
+        Screen::Clean(c) => format!("clean: {} groups, total {}", c.groups.len(), c.total),
+        Screen::Review(r) => format!("review {:?}: {} items", r.title, r.len),
+        Screen::Dupes(d) => format!("dupes: {} {}", d.total, d.sub),
+    };
+    format!(
+        "{screen}; scan {scan}; dupes {dupes}; selected {:?}; confirm {:?}; cards {:?}; window {:.0}x{:.0} open {}",
+        selection(app),
+        v.confirm.as_ref().map(|c| (&c.title, &c.action)),
+        v.cards.iter().map(|c| c.title.clone()).collect::<Vec<_>>(),
+        app.disk.win.w,
+        app.disk.win.room,
+        app.disk.win.open
+    )
+}
+
+/// Test commands (the Mac's `dev.dhio.orby.test` channel): `disk-scan:<path>`, `disk-tab:files`,
+/// `disk-file:<i>`, `disk-row:<i>`, `disk-dupes`, `disk-dupes-check`, `disk-dupe-pick:<g>,<r>`,
+/// `disk-clean`, `disk-back`, `disk-confirm`, `disk-cancel`, `disk-key:<vk>`,
+/// `disk-wheel:<x>,<y>,<delta>`, and `disk-move`, which only ever moves items under the
+/// temporary folder (a test's own files): anything else on the sheet is refused.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn test_command(app: &mut App, cmd: &str) {
+    let (name, arg) = cmd.split_once(':').unwrap_or((cmd, ""));
+    let nums: Vec<i64> = arg
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
+    let n = |i: usize| nums.get(i).copied().unwrap_or(0);
+    match name {
+        "disk-scan" => {
+            let p = PathBuf::from(arg);
+            if p.is_absolute() {
+                scan_path(app, p, true);
+                open(app);
+            }
+        }
+        "disk-tab" => click(
+            app,
+            Hit::Tab(match arg {
+                "files" => Tab::Files,
+                "types" => Tab::Types,
+                _ => Tab::Folders,
+            }),
+        ),
+        "disk-file" => click(app, Hit::File(n(0) as usize)),
+        "disk-row" => click(app, Hit::Row(n(0) as usize)),
+        "disk-rowcheck" => click(app, Hit::RowCheck(n(0) as usize)),
+        "disk-dupes" => click(app, Hit::OpenDupes),
+        "disk-dupes-check" => click(app, Hit::DupesCheck),
+        "disk-dupe-pick" => click(app, Hit::DupeCheck(n(0) as usize, n(1) as usize)),
+        "disk-clean" => click(app, Hit::OpenClean),
+        "disk-back" => click(app, Hit::Back),
+        "disk-drive" => click(app, Hit::ScanDrive(n(0) as usize)),
+        "disk-confirm" => click(app, Hit::SelRecycle),
+        "disk-cancel" => click(app, Hit::Cancel),
+        "disk-key" => {
+            on_keydown(app, n(0) as u16);
+        }
+        "disk-wheel" => on_wheel(app, n(0) as f32, n(1) as f32, n(2) as i16),
+        "disk-move" => {
+            let tmp = std::env::temp_dir();
+            let tmp = tmp.canonicalize().unwrap_or(tmp);
+            let ok = app.disk.confirm.as_ref().is_some_and(|c| {
+                !c.items.is_empty()
+                    && c.items.iter().all(|(p, _)| {
+                        p.canonicalize()
+                            .is_ok_and(|q| q.starts_with(&tmp) && q != tmp)
+                    })
+            });
+            if ok {
+                click(app, Hit::Move);
+            } else {
+                sys::log(
+                    app,
+                    "disk: test move refused (only items under the temporary folder)",
+                );
+            }
+        }
+        _ => sys::log(app, &format!("disk: unknown test command {cmd}")),
     }
 }
 

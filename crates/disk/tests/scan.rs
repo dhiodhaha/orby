@@ -210,12 +210,12 @@ fn wide_tree(root: &Path, dirs: usize, files_per_dir: usize) {
 fn many_threads_count_the_same_as_one_and_progress_is_live() {
     let root = fresh("threads");
     wide_tree(&root, 200, 10);
-    let one = scan(&root, &ScanOptions { threads: 1, progress_every: 1 }, |_| {}, &AtomicBool::new(false)).unwrap();
+    let one = scan(&root, &ScanOptions { threads: 1, progress_every: 1, ..ScanOptions::default() }, |_| {}, &AtomicBool::new(false)).unwrap();
 
     let mut seen = Vec::new();
     let many = scan(
         &root,
-        &ScanOptions { threads: 8, progress_every: 1 },
+        &ScanOptions { threads: 8, progress_every: 1, ..ScanOptions::default() },
         |p| {
             assert!(p.current.starts_with(&root));
             seen.push(p.tree.node(p.tree.root()).size());
@@ -242,7 +242,7 @@ fn stop_is_prompt_and_keeps_what_was_counted() {
     let mut calls = 0;
     let t = scan(
         &root,
-        &ScanOptions { threads: 4, progress_every: 1 },
+        &ScanOptions { threads: 4, progress_every: 1, ..ScanOptions::default() },
         |_| {
             calls += 1;
             if calls == 3 {
@@ -312,4 +312,16 @@ fn drive_space_of_the_target_drive() {
     assert!(s.total > 0);
     assert!(s.free <= s.total);
     assert_eq!(s.used(), s.total - s.free);
+}
+
+#[test]
+fn protected_folders_are_listed_as_skipped_and_never_entered() {
+    let root = fresh("protected");
+    write(&root.join("Documents/big.bin"), 4096);
+    write(&root.join("Movies/clip.mov"), 4096);
+    let opts = ScanOptions { protected: vec![root.join("Documents")], ..ScanOptions::default() };
+    let tree = scan(&root, &opts, |_| {}, &AtomicBool::new(false)).unwrap();
+    let skipped: Vec<_> = tree.skipped().iter().map(|k| (k.path.clone(), k.reason)).collect();
+    assert_eq!(skipped, [(root.join("Documents"), SkipReason::Protected)]);
+    assert_eq!(tree.node(tree.root()).files(), 1, "only the movie was counted");
 }

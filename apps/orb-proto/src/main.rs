@@ -43,6 +43,11 @@
 
 // Shared by both systems.
 mod canvas;
+mod disk;
+mod disk_model;
+mod disk_panel;
+mod disk_scenes;
+mod disk_sys;
 mod motion;
 mod notices_model;
 mod panel;
@@ -59,17 +64,7 @@ mod depth;
 #[cfg(windows)]
 mod dial;
 #[cfg(windows)]
-mod disk;
-#[cfg(windows)]
-mod disk_model;
-#[cfg(windows)]
-mod disk_panel;
-#[cfg(windows)]
 mod disk_restore;
-#[cfg(windows)]
-mod disk_scenes;
-#[cfg(windows)]
-mod disk_sys;
 #[cfg(windows)]
 mod disk_window;
 #[cfg(windows)]
@@ -143,6 +138,8 @@ include!("app_windows.rs");
 // macOS: AppKit panels, Core Graphics and Core Text, the orb on Metal.
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(target_os = "macos")]
+pub(crate) use mac::app::App;
 
 #[cfg(target_os = "macos")]
 fn main() {

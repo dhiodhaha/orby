@@ -292,6 +292,20 @@ impl Canvas for CgCanvas<'_> {
         super::text::draw(self.ctx, s, f, x, y, w, h);
     }
 
+    fn text_tracked(
+        &mut self,
+        s: &str,
+        f: &Font,
+        x: f32,
+        y: f32,
+        h: f32,
+        c: Color,
+        spacing: f32,
+    ) -> f32 {
+        self.fill(c);
+        super::text::draw_tracked(self.ctx, s, f, x, y, h, spacing)
+    }
+
     fn lip(&mut self, c: Color, dy: f32, l: f32, t: f32, r: f32, b: f32, radius: f32) {
         self.save();
         self.add_rrect(&RRect {
