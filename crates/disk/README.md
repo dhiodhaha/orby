@@ -20,7 +20,7 @@ The disk scanner behind the Disk panels (`docs/design/disk.md`). It scans a fold
 | `Tree::children_by_size(id) -> Vec<ChildShare>` | Biggest first, with `percent_of_parent`. |
 | `Tree::largest_files(id, n) -> Vec<NodeId>` | Top N files in the subtree. |
 | `Tree::type_breakdown(id) -> Vec<TypeShare>` | Video, Apps and games, Archives, Images, Documents by extension. The five are ordered biggest first, then Other last. |
-| `Node` | `name`, `parent`, `kind` (`File` / `Dir` / `Link`), `size`, `allocated`, `files`, `dirs`, `modified` (newest in subtree for folders), `hidden`. |
+| `Node` | `name`, `parent`, `kind` (`File` / `Dir` / `Link`), `size`, `allocated`, `files`, `dirs`, `modified` (newest in subtree for folders), `hidden`, `system`, `not_local` (cloud placeholder or offline), `reparse` (any reparse point). |
 | `drive_space(path) -> DriveSpace { total, free }` | `used`, `used_percent`, `free_percent`, `scan_percent(counted)` (bytes counted over bytes in use). |
 | `LowSpaceWatch::check(DriveSpace) -> bool` | The low-space pill rule: fires below 10% free, then again only after 5 more points, and re-arms once free space is back above 10%. |
 | `safe_to_clean(&CleanPlaces, now, older_than_days) -> Vec<Suggestion>` | Three suggestions in panel order: `OldDownloads` (Check first), `TempFiles`, `BrowserCaches` (Safe to remove). It computes the lists and removes nothing. `CleanPlaces::for_current_user()` finds Downloads (known folder), `%TEMP%`, `%SystemRoot%\Temp`, and Edge and Chrome "User Data". |
@@ -32,7 +32,30 @@ The disk scanner behind the Disk panels (`docs/design/disk.md`). It scans a fold
 | `is_unfinished_download(name)`, `UNFINISHED_DOWNLOAD` | `.crdownload`, `.part`, `.tmp` -> "Unfinished download". |
 | `has_recycle_bin(path)`, `recycle_bin_size(path)` | Recycle is offered only on fixed drives. The size feeds the "Not counted above" row. |
 
-`now` is always a parameter. The only clock read is in `examples/bench.rs`.
+`now` is always a parameter. The only clock read is in `examples/bench.rs` (the duplicate check also times its progress reports with `Instant`).
+
+## Duplicate files (`src/dupes.rs`)
+
+- **Input:** the scan's own tree. Each node now keeps three flags from the listing (`system`, `not_local`, `reparse`), so stage 1 needs no second walk.
+- **Stage 1, `candidates(&Tree, &DupeOptions)`:** files of `min_size` (1 MB) and up, grouped by size; groups of one are dropped. It skips `.git` and `node_modules`, the Windows, Program Files and ProgramData folders, links and other reparse points, system files, cloud placeholders, and the never-touch list (`NEVER_TOUCH`, `NEVER_REMOVE_ROOTS`, `NEVER_NAMES`, expanded once). No file is opened. `Candidates::possible` is the sum over same-size groups of (n − 1) × size: an upper bound.
+- **Before reading, `find_duplicates`:** each file is opened for its attributes only (`FILE_READ_ATTRIBUTES`, `FILE_FLAG_OPEN_REPARSE_POINT`, `FILE_FLAG_OPEN_NO_RECALL`), so a placeholder is never downloaded. `GetFileInformationByHandle` gives the attributes, the size, the write time and the file id. Files with `RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN`, `OFFLINE`, `SYSTEM` or `REPARSE_POINT` are dropped. Two names with the same volume serial and file index are a hard link and count once.
+- **Stage 2:** BLAKE3 of the size plus the first and last 64 KB (the whole file up to 128 KB).
+- **Stage 3:** BLAKE3 of the whole file in 1 MB reads. A full BLAKE3 match counts as identical; there is no byte compare (a collision is not a practical risk, and a compare would read every copy a second time). Data reads use `FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL`.
+- **Drive type:** `drive_kind(path)` opens the volume (`\\?\Volume{…}`, no access rights) and asks `IOCTL_STORAGE_QUERY_PROPERTY` for `StorageDeviceSeekPenaltyProperty`. No seek penalty is an SSD: one thread per core. A seek penalty is a hard drive, and no answer (a volume that cannot be opened, a driver that does not say) is `Unknown`: both get one thread with sequential 1 MB reads. `DupeOptions::threads` overrides it.
+- **Hash cache:** a JSON file (the app keeps it at `%APPDATA%\orb-proto\dupes-cache.json`, next to `disk.json`): `{"version":1,"files":{"<path>":{"size":…,"written":<FILETIME ticks>,"ends":"<hex>","full":"<hex>","seen":<unix secs>}}}`. An entry counts only while the path, size and write time all match, so a rescan reads only files that changed. After a full check it forgets files under the checked root that the check did not see, drops entries not seen for 180 days, and keeps at most 100,000 (newest first). It is written whole (write, then rename); an unreadable cache is ignored.
+- **Progress, stop, errors:** `DupeProgress { stage, files_done, files_total, bytes_done, bytes_total }` at most every 100 ms, also during one long read. Setting `cancel` stops within one 1 MB read per thread; the report then has `stopped` and no groups. A file that cannot be opened or read (in use, access denied, changed mid-read) is counted in `skipped` and left out.
+- **Output:** `DupeReport { groups, skipped, stopped, drive, threads, bytes_read, from_cache }`. Groups (`DupeGroup { size, files }`, files by path) are sorted by `reclaimable()` = (n − 1) × size, biggest first.
+- **Moving extra copies:** `recycle_duplicates(&RuleEnv, &[DupeRemoval { path, size, keep }])` checks each with `check_duplicate_removal` (a plain path; not on the never-touch list or in a system, `.git` or `node_modules` folder; no reparse point on the way; still a plain file of that size; its kept copy still there, the same size, not itself and not in the same batch), then calls `move_to_recycle_bin`. A refused copy is `RecycleError::Refused` (`Refusal::Changed` or `Refusal::NoCopyLeft` from the check) and never reaches the shell.
+
+| Item | What it does |
+|---|---|
+| `candidates(&Tree, &DupeOptions) -> Candidates { root, files, possible, groups }` | Stage 1. |
+| `find_duplicates(&Candidates, &DupeOptions, progress: FnMut(DupeProgress), cancel) -> DupeReport` | The attribute pass, stages 2 and 3, the cache. Blocks. |
+| `DupeOptions { min_size, env, system_dirs, cache, threads, now }`, `DupeOptions::for_current_user(cache, now)` | 1 MB, the user's never-touch list and system folders, threads by drive type. |
+| `drive_kind(path) -> DriveKind` | `Ssd`, `Hdd` or `Unknown`. |
+| `check_duplicate_removal`, `recycle_duplicates`, `DupeRemoval` | See above. |
+
+Tests (`tests/dupes.rs`, temp folders under the target folder only, nothing goes to the Recycle Bin): identical files across folders, same size with different bytes, same ends with a different middle, a hard link, empty files and an empty folder, a file locked by another handle and one with read denied (both skipped and counted), the cache (a second run reads 0 bytes; a new write time reads that file again), `.git`, `node_modules`, never-touch and system folders left out, stop, the removal checks, and drive type for a missing drive. Run: `cargo test -p app-disk` (21 unit and 11 duplicate tests passed on 2026-11-08, clippy clean).
 
 ## Verified
 

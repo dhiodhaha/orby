@@ -193,7 +193,9 @@ pub fn fire_reminder(app: &mut App, p: Prayer, off: i32) {
     if off < 0 {
         // Normal: a bell, the time, no action. −30 leaves after 6 s; −10 stays until you close
         // it or "Memasuki waktu" replaces it. Only presenting holds them, and a held one that
-        // could not show within 2 min is dropped (notices_model::PRAYER_GRACE).
+        // could not show within 2 min is dropped (notices_model::PRAYER_GRACE). The −10 one counts
+        // down in place, once a minute while it shows ("9 menit lagi", then "sebentar lagi";
+        // notices_model::reminder_title), and says the minutes left whenever it shows.
         let sticky = off >= -10;
         let pill = Pill {
             icon: Icon::Bell,

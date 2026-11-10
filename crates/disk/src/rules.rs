@@ -343,6 +343,11 @@ pub enum Refusal {
     ReparsePoint,
     /// Holds browser state ([`NEVER_NAMES`]).
     HoldsAppState,
+    /// A duplicate that is no longer the file that was compared: gone, a folder, a different
+    /// size, or a system file or reparse point now.
+    Changed,
+    /// A duplicate whose kept copy is missing, changed, or is being moved in the same batch.
+    NoCopyLeft,
 }
 
 /// The three folders rule paths start from. Built from the process environment, or by hand
@@ -436,16 +441,16 @@ impl RuleEnv {
 }
 
 /// Lowercased parts, so comparisons ignore case and separators as Windows does.
-fn key(p: &Path) -> Vec<String> {
+pub(crate) fn key(p: &Path) -> Vec<String> {
     p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
 }
 
-fn same(a: &Path, b: &Path) -> bool {
+pub(crate) fn same(a: &Path, b: &Path) -> bool {
     key(a) == key(b)
 }
 
 /// `p` is `ancestor` or below it.
-fn is_within(p: &Path, ancestor: &Path) -> bool {
+pub(crate) fn is_within(p: &Path, ancestor: &Path) -> bool {
     let (p, a) = (key(p), key(ancestor));
     p.len() >= a.len() && p[..a.len()] == a[..]
 }
@@ -466,7 +471,7 @@ fn is_profile_root(p: &Path) -> bool {
         || parent.as_deref() == Some("profiles")
 }
 
-fn is_normal(p: &Path) -> bool {
+pub(crate) fn is_normal(p: &Path) -> bool {
     let s = p.as_os_str().to_string_lossy();
     p.is_absolute()
         && p.parent().is_some()
@@ -479,24 +484,45 @@ fn is_normal(p: &Path) -> bool {
 /// one of the [`NEVER_REMOVE_ROOTS`], a profile root, or through a folder named in
 /// [`NEVER_NAMES`] or a credential store. Pure: reads no disk.
 pub fn never_touch(env: &RuleEnv, path: &Path) -> bool {
-    if !is_normal(path) {
-        return true;
+    NeverTouch::new(env).holds(path)
+}
+
+/// The never-touch lists expanded once, for checking many paths (the duplicate finder's stage
+/// 1). [`never_touch`] is this, built for one path.
+pub(crate) struct NeverTouch {
+    roots: Vec<Vec<String>>,
+    touch: Vec<Vec<String>>,
+    bases: Vec<Vec<String>>,
+}
+
+impl NeverTouch {
+    pub(crate) fn new(env: &RuleEnv) -> Self {
+        let expand = |list: &[&str]| list.iter().filter_map(|p| env.expand_plain(p)).map(|p| key(&p)).collect();
+        NeverTouch { roots: expand(NEVER_REMOVE_ROOTS), touch: expand(NEVER_TOUCH), bases: env.bases().map(key).collect() }
     }
-    if path.components().any(|c| name_is(c.as_os_str(), NEVER_NAMES) || name_is(c.as_os_str(), SECRET_NAMES)) {
-        return true;
+
+    pub(crate) fn holds(&self, path: &Path) -> bool {
+        if !is_normal(path) {
+            return true;
+        }
+        if path.components().any(|c| name_is(c.as_os_str(), NEVER_NAMES) || name_is(c.as_os_str(), SECRET_NAMES)) {
+            return true;
+        }
+        if is_profile_root(path) {
+            return true;
+        }
+        let k = key(path);
+        let within = |p: &[String], a: &[String]| p.len() >= a.len() && p[..a.len()] == a[..];
+        if self.roots.contains(&k) {
+            return true;
+        }
+        // Holding a never-touch entry counts too: removing `.cargo` would take `.cargo\bin`.
+        if self.touch.iter().any(|n| within(&k, n) || within(n, &k)) {
+            return true;
+        }
+        // Anything holding a base folder (C:\Users, C:\Users\you) is never removed.
+        self.bases.iter().any(|b| within(b, &k))
     }
-    if is_profile_root(path) {
-        return true;
-    }
-    if NEVER_REMOVE_ROOTS.iter().filter_map(|p| env.expand_plain(p)).any(|r| same(path, &r)) {
-        return true;
-    }
-    // Holding a never-touch entry counts too: removing `.cargo` would take `.cargo\bin`.
-    if NEVER_TOUCH.iter().filter_map(|p| env.expand_plain(p)).any(|n| is_within(path, &n) || is_within(&n, path)) {
-        return true;
-    }
-    // Anything holding a base folder (C:\Users, C:\Users\you) is never removed.
-    env.bases().any(|b| is_within(b, path))
 }
 
 /// The deepest base folder that holds `path`.
@@ -655,14 +681,19 @@ impl Drop for RuleMeasure {
 /// these for any caller, as a last line of defence.
 pub(crate) fn holds_system_folder(p: &Path) -> bool {
     let env = RuleEnv::from_process();
-    let extra = ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
+    let extra = system_dirs();
+    let held = env.bases().chain(extra.iter().map(PathBuf::as_path)).any(|b| is_within(b, p));
+    held
+}
+
+/// The Windows, Program Files and ProgramData folders, read from the process environment.
+pub(crate) fn system_dirs() -> Vec<PathBuf> {
+    ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
         .into_iter()
         .filter_map(std::env::var_os)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .collect::<Vec<_>>();
-    let held = env.bases().chain(extra.iter().map(PathBuf::as_path)).any(|b| is_within(b, p));
-    held
+        .collect()
 }
 
 /// Moves rule items to the Recycle Bin. Each path is checked again with [`check_removal`]

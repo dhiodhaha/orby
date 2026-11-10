@@ -26,6 +26,25 @@ pub const STICKY_MS: u32 = 0x7FFF_FFFF;
 /// A prayer reminder held this long past its moment says the wrong thing ("30 menit lagi" with
 /// 18 minutes left), so it is dropped instead of shown late.
 pub const PRAYER_GRACE: Duration = Duration::from_secs(120);
+/// The countdown's words change this many seconds after each whole minute before the prayer, so
+/// a reminder fired a moment late at −10 still says "10 menit lagi".
+const COUNTDOWN_SLACK_SECS: i64 = 2;
+
+/// The sticky reminder's words with `secs_left` until the prayer: "9 menit lagi Maghrib" down to
+/// "1 menit lagi Maghrib", then "Maghrib sebentar lagi" in the last minute.
+pub fn reminder_title(prayer: &str, secs_left: i64) -> String {
+    match (secs_left.max(0) + COUNTDOWN_SLACK_SECS) / 60 {
+        0 => format!("{prayer} sebentar lagi"),
+        m => format!("{m} menit lagi {prayer}"),
+    }
+}
+
+/// Seconds until `reminder_title` next says something else, or `None` once it reads "sebentar
+/// lagi" ("Memasuki waktu" replaces it at the time).
+pub fn countdown_next_secs(secs_left: i64) -> Option<i64> {
+    let s = secs_left.max(0) + COUNTDOWN_SLACK_SECS;
+    (s >= 60).then_some(s % 60 + 1)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Now {
@@ -125,6 +144,9 @@ pub struct Notice {
     /// Stays until you close it. Covered by a panel or the dial, it comes back; a normal notice
     /// arriving takes the front for its turn, then this one comes back.
     pub sticky: bool,
+    /// Its title counts the minutes to `prayer` at `stale_at` ("9 menit lagi Maghrib"), set
+    /// whenever it shows and once a minute while it is on screen.
+    pub countdown: bool,
 }
 
 impl Notice {
@@ -147,6 +169,7 @@ impl Notice {
             cooldown: None,
             through: false,
             sticky: false,
+            countdown: false,
         }
     }
 
@@ -187,6 +210,22 @@ impl Notice {
         Notice {
             sticky: true,
             ..self
+        }
+    }
+
+    /// Its title counts down the minutes to the prayer (needs `before_prayer`).
+    pub fn counting_down(self) -> Notice {
+        Notice {
+            countdown: true,
+            ..self
+        }
+    }
+
+    /// Seconds from `now` to its prayer, for a countdown notice.
+    fn countdown_left(&self, now: Moment) -> Option<i64> {
+        match (&self.prayer, self.stale_at) {
+            (Some(_), Some(at)) if self.countdown => Some(at.since(now).as_secs() as i64),
+            _ => None,
         }
     }
 
@@ -261,9 +300,25 @@ impl Entry {
         self.notice.stale_at.is_none_or(|s| now < s) && self.notice.show_by.is_none_or(|s| now < s)
     }
 
-    /// It is on screen: from now on only `stale_at` ends it.
-    fn shown(&mut self) {
+    /// It is on screen: from now on only `stale_at` ends it. A countdown says the minutes left
+    /// now, not when it fired (one held by presenting shows "8 menit lagi", never "10").
+    fn shown(&mut self, now: Moment) {
         self.notice.show_by = None;
+        self.retitle(now);
+    }
+
+    /// A countdown's words for `now`. Returns whether they changed.
+    fn retitle(&mut self, now: Moment) -> bool {
+        let n = &mut self.notice;
+        let (Some(left), Some(prayer)) = (n.countdown_left(now), n.prayer.as_deref()) else {
+            return false;
+        };
+        let title = reminder_title(prayer, left);
+        if n.pill.title == title {
+            return false;
+        }
+        n.pill.title = title;
+        true
     }
 }
 
@@ -451,6 +506,26 @@ impl Queue {
             if e.notice.priority == Priority::Urgent || e.notice.through)
     }
 
+    /// The countdown pill in front, its words for `now`: the new pill if they changed. Only the
+    /// title changes; the pill keeps its place in front.
+    pub fn countdown_tick(&mut self, now: Moment) -> Option<Pill> {
+        let e = self.front_entry()?;
+        e.retitle(now).then(|| e.pill())
+    }
+
+    /// How long until the countdown pill in front says something else (`None`: no countdown in
+    /// front, or it reads "sebentar lagi" until "Memasuki waktu" replaces it).
+    pub fn countdown_wait(&self, now: Moment) -> Option<Duration> {
+        match &self.front {
+            Some(Front::Entry(e)) => e
+                .notice
+                .countdown_left(now)
+                .and_then(countdown_next_secs)
+                .map(|s| Duration::from_secs(s as u64)),
+            _ => None,
+        }
+    }
+
     /// A sticky normal pill in front gives the slot to a new notice and comes back after it.
     fn front_yields(&self) -> bool {
         matches!(&self.front, Some(Front::Entry(e))
@@ -474,7 +549,7 @@ impl Queue {
             if let Some(e) = self.front_entry().filter(|e| e.notice.merges_with(&n)) {
                 e.count += 1;
                 e.notice = n;
-                e.shown();
+                e.shown(now.at);
                 return Offered::Update(e.pill());
             }
             // Into one waiting its turn, or one held by the quiet time that still holds. One left
@@ -566,7 +641,7 @@ impl Queue {
             count: 1,
             state: State::Seen,
         };
-        e.shown();
+        e.shown(now.at);
         let pill = e.pill();
         self.front = Some(Front::Entry(Box::new(e)));
         Offered::Show(pill)
@@ -650,7 +725,7 @@ impl Queue {
                 let p = e.notice.priority;
                 self.mark_shown(&e.notice, now, unix_now);
                 e.state = State::Seen;
-                e.shown();
+                e.shown(now.at);
                 let pill = e.pill();
                 self.front = Some(Front::Entry(Box::new(e)));
                 return Next::Show(pill, p);
@@ -772,7 +847,7 @@ impl Queue {
         self.requeue_front();
         self.last_shown_ms = Some(now.ms);
         e.state = State::Seen;
-        e.shown();
+        e.shown(now.at);
         let pill = e.pill();
         self.front = Some(Front::Entry(Box::new(e)));
         Some(pill)
@@ -1305,6 +1380,130 @@ mod tests {
         assert!(q.drop_through(), "the one on screen");
         q.close_front(false);
         assert_eq!(q.next(at(18, 42, 9_000), 0, CALM), Next::Idle);
+    }
+
+    #[test]
+    fn reminder_title_counts_whole_minutes_then_sebentar_lagi() {
+        let t = |s| reminder_title("Maghrib", s);
+        assert_eq!(t(1800), "30 menit lagi Maghrib");
+        assert_eq!(t(600), "10 menit lagi Maghrib");
+        // A reminder fired a moment late at −10 still says 10.
+        assert_eq!(t(598), "10 menit lagi Maghrib");
+        assert_eq!(t(597), "9 menit lagi Maghrib");
+        assert_eq!(t(538), "9 menit lagi Maghrib");
+        assert_eq!(t(537), "8 menit lagi Maghrib");
+        assert_eq!(t(60), "1 menit lagi Maghrib");
+        assert_eq!(t(58), "1 menit lagi Maghrib");
+        assert_eq!(t(57), "Maghrib sebentar lagi");
+        assert_eq!(t(0), "Maghrib sebentar lagi");
+        assert_eq!(t(-5), "Maghrib sebentar lagi");
+    }
+
+    #[test]
+    fn the_countdown_wakes_exactly_when_its_words_change() {
+        assert_eq!(countdown_next_secs(600), Some(3));
+        assert_eq!(countdown_next_secs(597), Some(60));
+        for s in 58..=660 {
+            let w = countdown_next_secs(s).unwrap();
+            let (now, at, before) = (
+                reminder_title("Isya", s),
+                reminder_title("Isya", s - w),
+                reminder_title("Isya", s - w + 1),
+            );
+            assert_ne!(now, at, "changed by the wake ({s} s left)");
+            assert_eq!(now, before, "not a second earlier ({s} s left)");
+        }
+        // "sebentar lagi" stays until "Memasuki waktu" replaces it: no more wakes.
+        assert_eq!(countdown_next_secs(57), None);
+        assert_eq!(countdown_next_secs(0), None);
+    }
+
+    fn counting(fired: Moment) -> Notice {
+        Notice {
+            pill: Pill {
+                value: "18:51".into(),
+                ..pill("10 menit lagi Isya")
+            },
+            ..ten_before(fired).counting_down()
+        }
+    }
+
+    fn secs(h: u32, m: u32, s: u64, ms: u64) -> Now {
+        Now {
+            at: day().at(h, m) + Duration::from_secs(s),
+            ms,
+        }
+    }
+
+    #[test]
+    fn the_ten_minute_pill_counts_down_in_place() {
+        let mut q = Queue::new();
+        match q.offer(counting(day().at(18, 41)), at(18, 41, 0), 0, CALM, false) {
+            Offered::Show(p) => assert_eq!(p.title, "10 menit lagi Isya"),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(
+            q.countdown_wait(day().at(18, 41)),
+            Some(Duration::from_secs(3))
+        );
+        let p = q.countdown_tick(secs(18, 41, 3, 0).at).expect("new words");
+        assert_eq!(
+            (p.title.as_str(), p.value.as_str()),
+            ("9 menit lagi Isya", "18:51")
+        );
+        assert_eq!(q.countdown_tick(secs(18, 41, 4, 0).at), None, "same words");
+        assert_eq!(
+            q.countdown_wait(secs(18, 41, 3, 0).at),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            q.countdown_tick(secs(18, 50, 3, 0).at).map(|p| p.title),
+            Some("Isya sebentar lagi".into())
+        );
+        assert_eq!(q.countdown_wait(secs(18, 50, 3, 0).at), None);
+        // Your X ends it, and nothing counts any more.
+        q.close_front_by_you();
+        assert_eq!(q.countdown_wait(day().at(18, 46)), None);
+        assert_eq!(q.countdown_tick(day().at(18, 46)), None);
+        assert_eq!(q.next(at(18, 46, 9_000), 0, CALM), Next::Idle);
+    }
+
+    #[test]
+    fn a_countdown_shown_late_or_again_says_the_minutes_left_then() {
+        // Presenting held it at 18:41; it shows at 18:42:30 (within the grace).
+        let mut q = Queue::new();
+        let present = Quiet {
+            presenting: true,
+            ..CALM
+        };
+        q.set_quiet(present, day().at(18, 0));
+        assert_eq!(
+            q.offer(counting(day().at(18, 41)), at(18, 41, 0), 0, present, false),
+            Offered::Held
+        );
+        q.set_quiet(CALM, secs(18, 42, 30, 0).at);
+        match q.next(secs(18, 42, 30, 60_000), 0, CALM) {
+            Next::Show(p, _) => assert_eq!(p.title, "8 menit lagi Isya"),
+            n => panic!("{n:?}"),
+        }
+        // Covered by a panel at 18:44, back at 18:47: the words are current again.
+        q.close_front(false);
+        assert_eq!(q.countdown_wait(day().at(18, 45)), None, "not on screen");
+        match q.next(at(18, 47, 90_000), 0, CALM) {
+            Next::Show(p, _) => assert_eq!(p.title, "4 menit lagi Isya"),
+            n => panic!("{n:?}"),
+        }
+        // The −30 one keeps its words.
+        let mut q = Queue::new();
+        q.offer(
+            thirty_before(day().at(18, 21)),
+            at(18, 21, 0),
+            0,
+            CALM,
+            false,
+        );
+        assert_eq!(q.countdown_tick(day().at(18, 25)), None);
+        assert_eq!(q.countdown_wait(day().at(18, 25)), None);
     }
 
     #[test]

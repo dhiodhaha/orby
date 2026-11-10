@@ -13,24 +13,50 @@ pub(crate) struct EntryFacts {
     pub not_local: bool,
     /// Compressed or sparse, where cluster rounding of the logical size would be wrong.
     pub packed: bool,
+    /// Windows marks it as a system file.
+    pub system: bool,
+    /// Any reparse point, not only junctions and links (OneDrive files carry one too).
+    pub reparse: bool,
+}
+
+/// What an open handle says about a file, read without touching its data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Probe {
+    /// Volume serial and file index: two names with the same pair are one file (a hard link).
+    pub id: (u32, u64),
+    pub size: u64,
+    /// Last write, in 100 ns ticks since 1601 (FILETIME).
+    pub written: u64,
+    /// Placeholder, offline, system, reparse point or folder: never read for its contents.
+    pub off_limits: bool,
 }
 
 #[cfg(windows)]
 mod imp {
     use super::EntryFacts;
+    use super::Probe;
     use std::ffi::OsString;
     use std::fs::Metadata;
     use std::io;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetDriveTypeW, GetVolumePathNameW, FILE_ATTRIBUTE_COMPRESSED,
-        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE, INVALID_FILE_SIZE,
+        CreateFileW, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetDriveTypeW, GetFileInformationByHandle,
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_COMPRESSED,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_SYSTEM,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_FILE_SIZE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY,
+        STORAGE_PROPERTY_QUERY,
+    };
     use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::UI::Shell::{
         FOLDERID_Downloads, SHFileOperationW, SHGetKnownFolderPath, SHQueryRecycleBinW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
         FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE, SHFILEOPSTRUCTW, SHQUERYRBINFO,
@@ -68,8 +94,107 @@ mod imp {
             hidden: a & FILE_ATTRIBUTE_HIDDEN != 0,
             not_local: a & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE) != 0,
             packed: a & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0,
+            system: a & FILE_ATTRIBUTE_SYSTEM != 0,
+            reparse: a & FILE_ATTRIBUTE_REPARSE_POINT != 0,
         }
     }
+
+    /// Opens the file for its attributes only, on the reparse point itself and with no recall, so
+    /// a cloud placeholder is never downloaded, and reads its id, size, write time and attributes.
+    pub fn probe(p: &Path) -> io::Result<Probe> {
+        let path = wide_long(p);
+        // SAFETY: `path` is NUL terminated; a null security pointer and template are allowed.
+        let h = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: all-zero is a valid BY_HANDLE_FILE_INFORMATION.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `h` is an open handle and `info` a valid out pointer.
+        let ok = unsafe { GetFileInformationByHandle(h, &mut info) };
+        let err = io::Error::last_os_error();
+        // SAFETY: `h` came from CreateFileW and is closed once.
+        unsafe { CloseHandle(h) };
+        if ok == 0 {
+            return Err(err);
+        }
+        let a = info.dwFileAttributes;
+        let off = FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_SYSTEM
+            | FILE_ATTRIBUTE_REPARSE_POINT
+            | FILE_ATTRIBUTE_DIRECTORY;
+        let ft = info.ftLastWriteTime;
+        Ok(Probe {
+            id: (info.dwVolumeSerialNumber, (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)),
+            size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+            written: (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime),
+            off_limits: a & off != 0,
+        })
+    }
+
+    /// Whether the drive holding `p` has a seek penalty (a spinning disk), from
+    /// IOCTL_STORAGE_QUERY_PROPERTY with StorageDeviceSeekPenaltyProperty. None when the volume
+    /// cannot be opened or does not answer.
+    pub fn seek_penalty(p: &Path) -> Option<bool> {
+        let root = wide(&volume_root(p).ok()?);
+        let mut name = [0u16; 64];
+        // SAFETY: `root` is NUL terminated and `name` holds `name.len()` u16s.
+        if unsafe { GetVolumeNameForVolumeMountPointW(root.as_ptr(), name.as_mut_ptr(), name.len() as u32) } == 0 {
+            return None;
+        }
+        // "\\?\Volume{...}\" opens the volume once the trailing backslash is gone.
+        let mut dev: Vec<u16> = name.iter().copied().take_while(|&c| c != 0).collect();
+        if dev.last() == Some(&u16::from(b'\\')) {
+            dev.pop();
+        }
+        dev.push(0);
+        // SAFETY: `dev` is NUL terminated. No access rights are asked for: the query needs none.
+        let h = unsafe {
+            CreateFileW(dev.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut())
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceSeekPenaltyProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        // SAFETY: all-zero is a valid descriptor.
+        let mut out: DEVICE_SEEK_PENALTY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let mut got = 0u32;
+        // SAFETY: both buffers are valid for the sizes passed; the call is synchronous.
+        let ok = unsafe {
+            DeviceIoControl(
+                h,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                &query as *const STORAGE_PROPERTY_QUERY as *const _,
+                std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+                &mut out as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR as *mut _,
+                std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+                &mut got,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: `h` came from CreateFileW and is closed once.
+        unsafe { CloseHandle(h) };
+        (ok != 0 && got as usize >= std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>()).then_some(out.IncursSeekPenalty != 0)
+    }
+
+    /// Flags for reading file data: sequential, and never recalled from remote storage.
+    pub const READ_FLAGS: u32 = FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_NO_RECALL;
 
     pub fn is_reparse(md: &Metadata) -> bool {
         md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -186,9 +311,20 @@ mod imp {
         Err(io::Error::new(io::ErrorKind::Unsupported, "not available on this platform yet"))
     }
 
-    pub fn facts(_md: &Metadata) -> EntryFacts {
-        EntryFacts { hidden: false, not_local: false, packed: false }
+    pub fn facts(md: &Metadata) -> EntryFacts {
+        EntryFacts { hidden: false, not_local: false, packed: false, system: false, reparse: md.file_type().is_symlink() }
     }
+    pub fn probe(p: &Path) -> io::Result<super::Probe> {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::symlink_metadata(p)?;
+        let written =
+            md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| (d.as_nanos() / 100) as u64);
+        Ok(super::Probe { id: (md.dev() as u32, md.ino()), size: md.len(), written, off_limits: !md.file_type().is_file() })
+    }
+    pub fn seek_penalty(_p: &Path) -> Option<bool> {
+        None
+    }
+    pub const READ_FLAGS: u32 = 0;
     pub fn is_reparse(md: &Metadata) -> bool {
         md.file_type().is_symlink()
     }
@@ -243,3 +379,10 @@ pub(crate) fn shell_recycle(p: &Path) -> (i32, bool) {
 pub(crate) fn downloads_dir() -> Option<PathBuf> {
     imp::downloads_dir()
 }
+pub(crate) fn probe(p: &Path) -> io::Result<Probe> {
+    imp::probe(p)
+}
+pub(crate) fn seek_penalty(p: &Path) -> Option<bool> {
+    imp::seek_penalty(p)
+}
+pub(crate) const READ_FLAGS: u32 = imp::READ_FLAGS;
