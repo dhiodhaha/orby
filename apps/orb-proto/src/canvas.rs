@@ -219,6 +219,14 @@ pub trait Canvas {
         spacing: f32,
     ) -> f32;
 
+    /// A plain axis-aligned rectangle (a text selection).
+    fn fill_rect(&mut self, l: f32, t: f32, r: f32, b: f32, c: Color);
+
+    /// An ellipse filled with a radial gradient centred on it, its focus moved by `origin`
+    /// (the metal sphere in Settings). `stops` are (position 0..1, colour), interpolated with
+    /// gamma 2.2 as Direct2D's default.
+    fn fill_radial(&mut self, e: &Ellipse, origin: Vector2, stops: &[(f32, Color)]);
+
     fn text_width(&self, s: &str, f: &Font) -> f32 {
         text_width(s, f)
     }

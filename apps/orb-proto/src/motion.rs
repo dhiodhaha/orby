@@ -57,14 +57,24 @@ pub fn active() -> bool {
     })
 }
 
+thread_local! {
+    /// Snapshot mode: every number shows its value and every list rests, so scenes are exact.
+    static STILL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes all motion still (snapshot mode).
+pub fn set_still(on: bool) {
+    STILL.with(|s| s.set(on));
+}
+
 #[cfg(windows)]
 fn reduced() -> bool {
-    crate::downloads::reduced_motion()
+    STILL.with(|s| s.get()) || crate::downloads::reduced_motion()
 }
 
 #[cfg(target_os = "macos")]
 fn reduced() -> bool {
-    crate::mac::reduced_motion()
+    STILL.with(|s| s.get()) || crate::mac::reduced_motion()
 }
 
 // ---- the critically damped spring ----
@@ -289,6 +299,22 @@ pub fn rolling_text_right(
     rolling_text(g, dc, key, value, kind, fmt, right - w, y, h, b);
 }
 
+/// `roll_text` with its right edge at `right` (the portable `rolling_text_right`).
+pub fn roll_text_right(
+    cv: &mut dyn Canvas,
+    key: &'static str,
+    value: &str,
+    kind: Roll,
+    fmt: &Font,
+    right: f32,
+    y: f32,
+    h: f32,
+    c: Color,
+) {
+    let w = text_width(value, fmt);
+    roll_text(cv, key, value, kind, fmt, right - w, y, h, c);
+}
+
 // ---- ripple ----
 
 struct RippleState {
@@ -433,6 +459,25 @@ pub fn with_row(dc: &ID2D1DeviceContext, fx: RowFx, draw: impl FnOnce()) {
         dc.PopLayer();
         dc.SetTransform(&before);
     }
+}
+
+/// `with_row` on the portable `Canvas`: the same translation and layer, so a row drawn through
+/// `D2dCanvas` gives the pixels `with_row` gave.
+///
+/// `motion::row(cv, motion::ripple_row("drink.rows", i), |cv| draw_row(cv, ..))`
+pub fn row(cv: &mut dyn Canvas, fx: RowFx, draw: impl FnOnce(&mut dyn Canvas)) {
+    if fx == RowFx::REST {
+        draw(cv);
+        return;
+    }
+    if fx.alpha <= 0.003 {
+        return;
+    }
+    cv.push_translate(0.0, fx.dy);
+    cv.push_layer(fx.alpha);
+    draw(cv);
+    cv.pop_layer();
+    cv.pop_translate();
 }
 
 #[cfg(test)]

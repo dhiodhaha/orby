@@ -915,6 +915,48 @@ impl Canvas for D2dCanvas<'_> {
         }
     }
 
+    fn fill_rect(&mut self, l: f32, t: f32, r: f32, b: f32, c: Color) {
+        unsafe {
+            self.dc.FillRectangle(
+                &D2D_RECT_F {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+                &brush(self.dc, c),
+            )
+        }
+    }
+
+    fn fill_radial(&mut self, e: &Ellipse, origin: Vector2, stops: &[(f32, Color)]) {
+        let stops: Vec<D2D1_GRADIENT_STOP> = stops
+            .iter()
+            .map(|(position, color)| D2D1_GRADIENT_STOP {
+                position: *position,
+                color: *color,
+            })
+            .collect();
+        unsafe {
+            let rt: &ID2D1RenderTarget = self.dc;
+            let Ok(coll) =
+                rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+            else {
+                return;
+            };
+            let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                center: e.point,
+                gradientOriginOffset: origin,
+                radiusX: e.rx,
+                radiusY: e.ry,
+            };
+            let Ok(b) = self.dc.CreateRadialGradientBrush(&props, None, &coll) else {
+                return;
+            };
+            self.dc.FillEllipse(&d2_ellipse(e), &b);
+        }
+    }
+
     fn lip(&mut self, c: Color, dy: f32, l: f32, t: f32, r: f32, b: f32, radius: f32) {
         crate::depth::lip_raw(self.g, self.dc, c, dy, l, t, r, b, radius);
     }

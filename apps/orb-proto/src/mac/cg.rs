@@ -12,7 +12,8 @@ use std::ffi::c_void;
 use objc2_core_foundation::{CFRetained, CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     kCGColorSpaceSRGB, CGBitmapContextCreate, CGBitmapContextCreateImage, CGColor, CGColorSpace,
-    CGContext, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, CGLineCap, CGLineJoin,
+    CGContext, CGGradient, CGGradientDrawingOptions, CGImage, CGImageAlphaInfo,
+    CGImageByteOrderInfo, CGLineCap, CGLineJoin,
 };
 
 use crate::canvas::{arc_center, Canvas, Color, Ellipse, Font, Path, RRect, Seg, Stroke, Vector2};
@@ -304,6 +305,59 @@ impl Canvas for CgCanvas<'_> {
     ) -> f32 {
         self.fill(c);
         super::text::draw_tracked(self.ctx, s, f, x, y, h, spacing)
+    }
+
+    fn fill_rect(&mut self, l: f32, t: f32, r: f32, b: f32, c: Color) {
+        self.fill(c);
+        CGContext::fill_rect(self.c(), rect(l, t, r, b));
+    }
+
+    fn fill_radial(&mut self, e: &Ellipse, origin: Vector2, stops: &[(f32, Color)]) {
+        if stops.is_empty() {
+            return;
+        }
+        // Direct2D blends the stops in gamma 2.2; Core Graphics blends linearly in the colour
+        // space's encoded values, which in sRGB is close to the same curve.
+        let mut comps: Vec<CGFloat> = Vec::with_capacity(stops.len() * 4);
+        let mut locs: Vec<CGFloat> = Vec::with_capacity(stops.len());
+        for (p, c) in stops {
+            comps.extend([c.r, c.g, c.b, c.a].map(|v| v as CGFloat));
+            locs.push(*p as CGFloat);
+        }
+        let Some(space) = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })) else {
+            return;
+        };
+        let Some(grad) = (unsafe {
+            CGGradient::with_color_components(
+                Some(&space),
+                comps.as_ptr(),
+                locs.as_ptr(),
+                locs.len(),
+            )
+        }) else {
+            return;
+        };
+        self.save();
+        self.add_ellipse(e);
+        CGContext::clip(self.c());
+        let focus = CGPoint {
+            x: (e.point.X + origin.X) as CGFloat,
+            y: (e.point.Y + origin.Y) as CGFloat,
+        };
+        let centre = CGPoint {
+            x: e.point.X as CGFloat,
+            y: e.point.Y as CGFloat,
+        };
+        CGContext::draw_radial_gradient(
+            self.c(),
+            Some(&grad),
+            focus,
+            0.0,
+            centre,
+            e.rx.max(e.ry) as CGFloat,
+            CGGradientDrawingOptions::DrawsAfterEndLocation,
+        );
+        self.restore();
     }
 
     fn lip(&mut self, c: Color, dy: f32, l: f32, t: f32, r: f32, b: f32, radius: f32) {

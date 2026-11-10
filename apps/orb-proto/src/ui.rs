@@ -216,6 +216,11 @@ pub fn text_num(
     gfx::right_text(g, dc, s, fmt, right, y, h, b);
 }
 
+/// `text_num` on the portable `Canvas`: a number with its right edge at `right`.
+pub fn num_text(cv: &mut dyn Canvas, s: &str, f: &Font, right: f32, y: f32, h: f32, c: Color) {
+    cv.right_text(s, f, right, y, h, c);
+}
+
 // ---- icons (Lucide-style, drawn on a 24 grid, stroke 1.6) ----
 
 #[derive(Clone, Copy, PartialEq, Debug)]

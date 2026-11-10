@@ -6,8 +6,9 @@ use std::path::Path;
 
 use app_core::prayer::{self as pr, Location, Prayer, Times};
 
+use crate::canvas::Canvas;
 use crate::settings_model::PrayerMethod;
-use crate::ui::{DialBranch, DialChild, DialItem, Icon, Pill, PillAction, PillPart};
+use crate::ui::{DialBranch, DialChild, DialItem, Fonts, Icon, Pill, PillAction, PillPart, Theme};
 
 pub const SCALE: f32 = 2.0;
 const NOW_MIN: f64 = 14.0 * 60.0 + 37.0 + 25.0 / 60.0;
@@ -145,6 +146,7 @@ pub const PILL_HOVER: PillPart = PillPart::None;
 
 #[cfg(windows)]
 pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
+    crate::motion::set_still(true);
     use crate::gfx::{render_offscreen, D2dCanvas, Shared};
     use crate::ui;
 
@@ -232,14 +234,53 @@ pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
             })?;
             write(dir, &format!("{name}-{tag}"), pw, ph, px);
         }
+        for s in panel_scenes(&fonts) {
+            let (pw, ph, px) = render_offscreen(&g, s.w, s.h, SCALE, |dc| {
+                (s.draw)(&mut D2dCanvas::new(&g, dc), &th, &fonts);
+            })?;
+            write(dir, &format!("{}-{tag}", s.name), pw, ph, px);
+        }
     }
     Ok(())
+}
+
+/// One panel scene: its file name (before `-light`/`-dark`), its size in logical pixels and how
+/// to draw it in a theme.
+pub struct Scene {
+    pub name: String,
+    pub w: f32,
+    pub h: f32,
+    #[allow(clippy::type_complexity)]
+    pub draw: Box<dyn Fn(&mut dyn Canvas, &Theme, &Fonts)>,
+}
+
+impl Scene {
+    pub fn new(
+        name: impl Into<String>,
+        w: f32,
+        h: f32,
+        draw: impl Fn(&mut dyn Canvas, &Theme, &Fonts) + 'static,
+    ) -> Scene {
+        Scene {
+            name: name.into(),
+            w,
+            h,
+            draw: Box::new(draw),
+        }
+    }
+}
+
+/// The panels' scenes, each unit's from its own `*_scenes.rs`. Both systems render all of them.
+fn panel_scenes(_f: &Fonts) -> Vec<Scene> {
+    #[allow(unused_mut)]
+    let mut out: Vec<Scene> = Vec::new();
+    out
 }
 
 /// The same scenes on macOS through Core Graphics and Core Text, plus the orb on Metal.
 #[cfg(target_os = "macos")]
 pub fn run_mac(dir: &Path) {
-    use crate::canvas::Canvas;
+    crate::motion::set_still(true);
     use crate::mac::cg::Bitmap;
     use crate::ui;
 
@@ -335,6 +376,11 @@ pub fn run_mac(dir: &Path) {
                 crate::panel::draw(cv, &th, &fonts, &view);
             },
         );
+        for s in panel_scenes(&fonts) {
+            shot(&format!("{}-{tag}", s.name), s.w, s.h, &|cv| {
+                (s.draw)(cv, &th, &fonts)
+            });
+        }
     }
     // The orb at rest: by day (Ashar light) and after Isya (dimmed).
     for (name, angle, brightness) in [("orb-day", 128.0, 1.0), ("orb-night", 90.0, 0.7)] {
