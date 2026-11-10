@@ -953,6 +953,19 @@ pub struct Pill {
     pub ttl_ms: u32,
 }
 
+/// A plain answer pill: an icon, two words, a close, gone after 4 s.
+pub fn info_pill(icon: Icon, title: &str, value: &str) -> Pill {
+    Pill {
+        icon,
+        dot: false,
+        title: title.into(),
+        value: value.into(),
+        action: None,
+        closable: true,
+        ttl_ms: 4000,
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct PillLayout {
     pub w: f32,

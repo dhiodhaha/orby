@@ -9,6 +9,9 @@
 //! - clock.rs: local time and the settings folder
 //! - disk.rs / disk_win.rs: the Disk window and what Disk asks of the system (disk_sys)
 //! - login.rs: start at login (SMAppService)
+//! - sys.rs: what the shared units ask of the system (`crate::sys` on macOS)
+//! - shim.rs: `crate::pill`, `orb`, `dial`, `prayer`, `settings`, `log_line`, `start_anim` over the `App`
+//! - panels.rs: `crate::panels`, the panel host (Prayer, Focus, Drink, History, Notices)
 
 pub mod app;
 pub mod cg;
@@ -19,6 +22,9 @@ pub mod hotkey;
 pub mod input;
 pub mod login;
 pub mod metal;
+pub mod panels;
+pub mod shim;
+pub mod sys;
 pub mod text;
 
 use objc2_app_kit::NSWorkspace;

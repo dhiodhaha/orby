@@ -406,12 +406,12 @@ fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>)
         ),
         Kind::Focus => habits::draw_focus_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Focus(p) = h { Some(p) } else { None }),
         ),
         Kind::Drink => habits::draw_drink_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Drink(p) = h { Some(p) } else { None }),
         ),
         Kind::Tasks => tasks::draw_panel(
@@ -437,7 +437,7 @@ fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>)
         ),
         Kind::History => history::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| {
                 if let Hit::History(p) = h {
                     Some(p)
@@ -448,7 +448,7 @@ fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>)
         ),
         Kind::Notices => notices::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| {
                 if let Hit::Notices(p) = h {
                     Some(p)

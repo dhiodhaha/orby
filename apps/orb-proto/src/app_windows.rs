@@ -407,8 +407,8 @@ unsafe extern "system" fn orb_proc(
         WM_TIMER => {
             with_app(|app| match wparam.0 {
                 TIMER_TUCK => orb::on_tuck_timer(app, hwnd),
-                TIMER_FOCUS => habits::on_focus_timer(app, hwnd),
-                TIMER_DRINK => habits::on_drink_timer(app, hwnd),
+                TIMER_FOCUS => habits::on_focus_timer(app),
+                TIMER_DRINK => habits::on_drink_timer(app),
                 TIMER_BRANCH => dial::on_branch_timer(app, hwnd),
                 TIMER_REMIND => prayer::on_remind_timer(app, hwnd),
                 TIMER_TASKS => tasks::on_timer(app),

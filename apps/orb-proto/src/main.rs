@@ -43,6 +43,7 @@
 
 // Shared by both systems.
 mod canvas;
+mod dial_menu;
 mod disk;
 mod disk_model;
 mod disk_panel;
@@ -52,10 +53,13 @@ mod downloads_model;
 mod downloads_panel;
 mod drink_panel;
 mod focus_panel;
+mod habits;
 mod habits_scenes;
+mod history;
 mod history_model;
 mod history_panel;
 mod motion;
+mod notices;
 mod notices_model;
 mod notices_panel;
 mod panel;
@@ -64,6 +68,8 @@ mod settings_model;
 mod settings_panel;
 mod settings_scenes;
 mod snapshot;
+mod store;
+mod sys;
 mod tasks_model;
 mod tasks_panel;
 mod tasks_scenes;
@@ -92,17 +98,11 @@ mod frame;
 #[cfg(windows)]
 mod gfx;
 #[cfg(windows)]
-mod habits;
-#[cfg(windows)]
-mod history;
-#[cfg(windows)]
 mod hook;
 #[cfg(windows)]
 mod khgt;
 #[cfg(windows)]
 mod morph;
-#[cfg(windows)]
-mod notices;
 #[cfg(windows)]
 mod orb;
 #[cfg(windows)]
@@ -113,8 +113,6 @@ mod pill;
 mod prayer;
 #[cfg(windows)]
 mod settings;
-#[cfg(windows)]
-mod store;
 #[cfg(windows)]
 mod tasks;
 #[cfg(windows)]
@@ -130,6 +128,15 @@ include!("app_windows.rs");
 mod mac;
 #[cfg(target_os = "macos")]
 pub(crate) use mac::app::App;
+// The window modules the shared units call, as shims over the Mac App (same paths as Windows).
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)] // start_anim: for the units that animate on their own (next stages)
+pub(crate) use mac::shim::{log_line, start_anim};
+#[cfg(target_os = "macos")]
+use mac::{
+    panels,
+    shim::{dial, orb, pill, prayer, settings},
+};
 
 #[cfg(target_os = "macos")]
 fn main() {

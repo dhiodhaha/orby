@@ -1,27 +1,21 @@
-//! The half dial: opens from the drop, aim by direction or keys, the picks, and the Focus and
-//! Drink branches (15/25/50 min, 150/250/500 ml) and More (Downloads, Disk, History, Notices, Settings) that fan out after 120 ms
-//! of steady aim.
+//! The half dial's window: opens from the drop, aim by direction or keys, and the Focus and
+//! Drink branches (15/25/50 min, 150/250/500 ml) and More (Downloads, Disk, History, Notices,
+//! Settings, All tasks) that fan out after 120 ms of steady aim. What the ring and branches show
+//! and what a pick does is shared with the Mac (dial_menu.rs).
 
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use app_core::prayer as pr;
-
+use crate::dial_menu::{self as menu, has_branch, MORE, N};
 use crate::gfx::{self, Surface};
 use crate::orb::{arm_tuck_timer, orb_center, set_tucked, set_visible, Side};
-use crate::panels::{self, Kind};
 use crate::pill::dismiss_pill;
-use crate::settings_model::Section;
-use crate::ui::{self, DialBranch, DialChild, DialItem, Icon};
+use crate::ui::{self, DialBranch};
 use crate::{
-    calendar, disk, downloads, habits, history, hook, log_line, notices, prayer, px, settings,
-    start_anim, sync_keys, tasks, with_app, App, HK_DOWN, HK_ENTER, HK_LEFT, HK_NUM, HK_RIGHT,
-    HK_UP, TIMER_BRANCH, TIMER_TUCK,
+    habits, hook, log_line, notices, px, start_anim, sync_keys, with_app, App, HK_DOWN, HK_ENTER,
+    HK_LEFT, HK_NUM, HK_RIGHT, HK_UP, TIMER_BRANCH, TIMER_TUCK,
 };
 
-const FOCUS: usize = 3;
-const DRINK: usize = 4;
-const MORE: usize = 5;
 /// Steady aim on a parent this long opens its branch, so a sweep across the ring never flashes one.
 const BRANCH_DELAY_MS: u32 = 120;
 /// After a dial key, the pointer must move this far (logical px) before it aims again, so a
@@ -41,62 +35,9 @@ fn latch_keyboard(app: &mut App) {
         .map(|_| (pt.x as f32, pt.y as f32));
 }
 
-fn has_branch(i: usize) -> bool {
-    i == FOCUS || i == DRINK || i == MORE
-}
-
-fn dial_items(app: &App) -> Vec<DialItem> {
-    let (np, nat, _) = prayer::next_prayer(app);
-    vec![
-        DialItem {
-            icon: Icon::Tasks,
-            name: "Tasks",
-            value: tasks::dial_value(app),
-        },
-        DialItem {
-            icon: Icon::Today,
-            name: "Today",
-            value: tasks::dial_today_value(app),
-        },
-        DialItem {
-            icon: Icon::Prayer,
-            name: "Prayer",
-            value: format!("{} {}", np.name(), pr::hhmm(nat)),
-        },
-        DialItem {
-            icon: Icon::Focus,
-            name: "Focus",
-            value: habits::dial_focus_value(app),
-        },
-        DialItem {
-            icon: Icon::Drink,
-            name: "Drink",
-            value: habits::dial_drink_value(app),
-        },
-        DialItem {
-            icon: Icon::More,
-            name: "More",
-            value: disk::dial_value(app).unwrap_or_else(|| downloads::dial_value(app)),
-        },
-    ]
-}
-
 /// The open branch's children and its default child.
-fn children(app: &App, parent: usize) -> (Vec<DialChild>, usize) {
-    match parent {
-        FOCUS => habits::focus_children(app),
-        DRINK => habits::drink_children(app),
-        MORE => {
-            let (mut kids, default) = downloads::dial_children(app);
-            kids.push(disk::dial_child(app));
-            kids.push(history::dial_child(app));
-            kids.push(notices::dial_child(app));
-            kids.push(settings::dial_child(app));
-            kids.push(crate::tasks_window::dial_child(app));
-            (kids, default)
-        }
-        _ => (Vec::new(), 0),
-    }
+fn children(app: &App, parent: usize) -> (Vec<ui::DialChild>, usize) {
+    menu::children(app, parent)
 }
 
 pub fn mirrored(app: &App) -> bool {
@@ -152,7 +93,7 @@ fn render_dial(app: &mut App) {
     if app.dial_surface.is_none() {
         app.dial_surface = Surface::new(&app.g, app.dial_hwnd, w, h, app.scale).ok();
     }
-    let items = dial_items(app);
+    let items = menu::items(app);
     let kids = app
         .dial_branch
         .map(|p| children(app, p).0)
@@ -269,41 +210,18 @@ fn pick(app: &mut App, i: usize) {
     }
     close_dial(app);
     crate::orb::kick(app, 1.0);
-    let name = ["tasks", "today", "prayer", "focus", "drink", "more"]
-        .get(i)
-        .copied()
-        .unwrap_or("?");
+    let name = menu::LOG_NAMES.get(i).copied().unwrap_or("?");
     log_line(app, &format!("dial pick {name}"));
-    match i {
-        0 => tasks::open(app, None),
-        1 => calendar::open(app),
-        2 => prayer::open_panel(app),
-        FOCUS => panels::open_panel(app, Kind::Focus),
-        DRINK => panels::open_panel(app, Kind::Drink),
-        _ => downloads::open(app),
-    }
+    menu::pick(app, i);
 }
 
 /// A branch child does its action at once: start a session, or log a glass.
 fn pick_child(app: &mut App, parent: usize, j: usize) {
     close_dial(app);
     crate::orb::kick(app, 1.0);
-    let name = match parent {
-        FOCUS => "focus",
-        DRINK => "drink",
-        _ => "more",
-    };
+    let name = menu::branch_log_name(parent);
     log_line(app, &format!("dial pick {name} child {j}"));
-    match parent {
-        FOCUS => habits::pick_focus_child(app, j),
-        DRINK => habits::pick_drink_child(app, j),
-        _ if j == 1 => disk::open(app),
-        _ if j == 2 => history::open(app, None),
-        _ if j == 3 => notices::open_panel(app),
-        _ if j == 4 => settings::open(app, Section::General),
-        _ if j == 5 => crate::tasks_window::show(app),
-        _ => downloads::open(app),
-    }
+    menu::pick_child(app, parent, j);
 }
 
 /// Ctrl+Alt+Space: opens the dial (showing the orb first if hidden); a second press while
@@ -360,9 +278,9 @@ pub fn on_key(app: &mut App, id: i32) -> bool {
         (HK_UP | HK_DOWN, _, _) => {
             close_branch(app);
             app.dial_aim = Some(if id == HK_UP {
-                (aim + 5) % 6
+                (aim + N - 1) % N
             } else {
-                (aim + 1) % 6
+                (aim + 1) % N
             });
             render_dial(app);
         }
