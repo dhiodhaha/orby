@@ -15,19 +15,25 @@
 //! - panels.rs: `crate::panels`, the panel host (Prayer, Focus, Drink, Tasks, Today, History, Notices)
 //! - input.rs: typing (NSTextInputClient), the pasteboard and system sounds
 //! - tasks_win.rs: the Tasks window (tasks_window.rs's state and logic are shared)
+//! - pacer.rs: frames on the display link (one per window, paused when still)
+//! - surface.rs: the IOSurface ring a window draws into (no bitmap or copy per frame)
+//! - frames.rs: the frame pipeline measurement (ORB_FRAMES=1) and the synthetic input drivers
 
 pub mod app;
 pub mod cg;
 pub mod clock;
 pub mod disk;
 pub mod disk_win;
+pub mod frames;
 pub mod hotkey;
 pub mod input;
 pub mod login;
 pub mod metal;
+pub mod pacer;
 pub mod panels;
 pub mod settings_win;
 pub mod shim;
+pub mod surface;
 pub mod sys;
 pub mod tasks_win;
 pub mod text;

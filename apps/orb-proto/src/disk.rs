@@ -471,6 +471,9 @@ pub struct Disk {
     live_seen: HashMap<String, (u64, Instant)>,
     anim: Anim,
     pub win: Win,
+    /// The screen's list this far past its first row (`dp::View::scroll_px`): set by the Mac's
+    /// trackpad scrolling, always 0 on Windows.
+    pub scroll_px: f32,
 }
 
 fn data_file() -> PathBuf {
@@ -555,6 +558,7 @@ impl Disk {
             live_seen: HashMap::new(),
             anim: Anim::default(),
             win: Win::default(),
+            scroll_px: 0.0,
         }
     }
 
@@ -3600,6 +3604,7 @@ pub fn view(app: &App) -> View {
         room: app.disk.win.room,
         max: app.disk.win.max,
         motion: motion(app, now),
+        scroll_px: app.disk.scroll_px,
     }
 }
 
@@ -4401,6 +4406,46 @@ pub fn on_esc(app: &mut App) {
     }
 }
 
+/// A list's first row shown and the furthest it can go (as `on_wheel` clamps it): the Mac's
+/// trackpad keeps its part of a row past the first, and none at the end.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn list_span(app: &App, v: &View, s: dp::Scroll) -> (usize, usize) {
+    let fit = dp::fit(&app.fonts, v);
+    let level_len = |files: bool| {
+        app.disk
+            .level
+            .as_ref()
+            .map_or(0, |l| if files { l.files.len() } else { l.rows.len() })
+    };
+    match s {
+        dp::Scroll::Folders => (
+            app.disk.first,
+            level_len(false).saturating_sub(fit.list + 1),
+        ),
+        dp::Scroll::Files => (
+            app.disk.files_first,
+            level_len(true).saturating_sub(fit.files),
+        ),
+        dp::Scroll::Dupes => {
+            let n = match &v.screen {
+                Screen::Dupes(d) => dp::dupe_entry_count(d),
+                _ => 0,
+            };
+            (app.disk.dupes.first, n.saturating_sub(fit.dupes))
+        }
+        dp::Scroll::Review => app.disk.review.as_ref().map_or((0, 0), |r| {
+            (r.first, r.items.len().saturating_sub(fit.review))
+        }),
+        dp::Scroll::Clean => {
+            let n = match &v.screen {
+                Screen::Clean(c) => dp::clean_entries(c).len(),
+                _ => 0,
+            };
+            (app.disk.clean_first, n.saturating_sub(fit.clean))
+        }
+    }
+}
+
 /// The wheel at (x, y), in window coordinates.
 pub fn on_wheel(app: &mut App, x: f32, y: f32, delta: i16) {
     level(app);
@@ -4917,6 +4962,7 @@ mod tests {
                 room,
                 max: false,
                 motion: dp::Motion::default(),
+                scroll_px: 0.0,
             };
             std::hint::black_box(dp::size(fonts, &v));
             std::hint::black_box(dp::fit(fonts, &v));

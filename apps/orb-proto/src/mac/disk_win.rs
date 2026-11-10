@@ -8,9 +8,16 @@
 use std::cell::Cell;
 use std::time::Instant;
 
+use super::app::with_app;
+use super::cg::Bitmap;
+use super::pacer::{Pacer, Who};
+use super::surface;
+use crate::disk;
+use crate::disk_panel::{self as dp, Hit};
+use crate::App;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
-use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AllocAnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSTrackingArea,
@@ -20,17 +27,10 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSOperationQueue, NSPoint, NSRect, NSSize, NSString,
 };
-use objc2_quartz_core::CATransaction;
-
-use super::app::with_app;
-use super::cg::Bitmap;
-use crate::disk;
-use crate::disk_panel::{self as dp, Hit};
-use crate::App;
 
 /// The least height the window opens at on a short screen, and can be dragged to.
 const MIN_ROOM: f32 = 480.0;
-/// Trackpad pixels per row the list scrolls.
+/// Trackpad pixels per row for the lists that move a row at a time (Review, Safe to clean).
 const ROW_PX: f32 = 36.0;
 
 pub struct Win {
@@ -44,10 +44,21 @@ pub struct Win {
     pub hover: Option<Hit>,
     /// The pointer in the window (logical px, y down).
     pub mouse: Option<(f32, f32)>,
-    /// Something moves: the run loop draws a frame per display refresh.
+    /// Something moves: a frame every display refresh.
     pub ticking: bool,
-    /// A redraw is due at the next turn of the run loop (input coalesces into one frame).
+    /// A redraw is due at the next display refresh (input coalesces into one frame).
     pub dirty: bool,
+    /// The display link's frames, running while there is something to draw.
+    pacer: Option<Pacer>,
+    /// Wheel notches since the last frame (+ shows earlier rows), and where.
+    rows: i32,
+    /// Trackpad pixels since the last frame (+ moves the list on, towards its end).
+    px: f32,
+    /// The list the part-row offset (`disk.scroll_px`) belongs to.
+    px_list: Option<dp::Scroll>,
+    scroll_at: (f32, f32),
+    /// The pointer moved since the last frame: what it is over is found at the frame.
+    hover_due: bool,
     window: Option<Retained<NSWindow>>,
     view: Option<Retained<DiskView>>,
     observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
@@ -69,6 +80,12 @@ impl Default for Win {
             mouse: None,
             ticking: false,
             dirty: false,
+            pacer: None,
+            rows: 0,
+            px: 0.0,
+            px_list: None,
+            scroll_at: (0.0, 0.0),
+            hover_due: false,
             window: None,
             view: None,
             observers: Vec::new(),
@@ -134,8 +151,10 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, e: &NSEvent) {
+            let t = super::frames::now();
             let p = self.point(e);
             with_app(|a| on_move(a, p));
+            super::frames::input("disk", e.timestamp(), (super::frames::now() - t) * 1000.0);
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -154,7 +173,9 @@ define_class!(
             let (x, y) = self.point(e);
             let precise = e.hasPreciseScrollingDeltas();
             let dy = e.scrollingDeltaY() as f32;
+            let t = super::frames::now();
             with_app(|a| on_scroll(a, x, y, dy, precise));
+            super::frames::input("disk", e.timestamp(), (super::frames::now() - t) * 1000.0);
         }
 
         #[unsafe(method(keyDown:))]
@@ -253,6 +274,7 @@ fn make(app: &mut App, mtm: MainThreadMarker) {
     w.setAcceptsMouseMovedEvents(true);
     let view = DiskView::new(mtm, dp::W, dp::H);
     w.setContentView(Some(&view));
+    app.disk.win.pacer = Some(Pacer::new(&view, Who::Disk));
     // A resize from outside (an edge, zoom): the lists take the new size.
     let center = NSNotificationCenter::defaultCenter();
     let resized = block2::RcBlock::new(|_n: std::ptr::NonNull<NSNotification>| {
@@ -269,6 +291,15 @@ fn make(app: &mut App, mtm: MainThreadMarker) {
     app.disk.win.observers.push(obs);
     app.disk.win.window = Some(w);
     app.disk.win.view = Some(view);
+}
+
+/// The window and its view while it is open (the test drivers aim at them).
+pub fn refs(app: &App) -> Option<(Retained<NSWindow>, Retained<NSView>)> {
+    let w = &app.disk.win;
+    if !w.open {
+        return None;
+    }
+    Some((w.window.clone()?, Retained::into_super(w.view.clone()?)))
 }
 
 /// The room on the orb's screen: `H` when it fits, less on a short one.
@@ -331,12 +362,19 @@ pub fn close(app: &mut App) {
     app.disk.win.mouse = None;
     app.disk.win.ticking = false;
     app.disk.win.dirty = false;
+    app.disk.win.rows = 0;
+    app.disk.win.px = 0.0;
+    app.disk.scroll_px = 0.0;
+    app.disk.win.hover_due = false;
+    if let Some(p) = &mut app.disk.win.pacer {
+        p.pause();
+    }
     if let Some(w) = &app.disk.win.window {
         w.orderOut(None);
     }
-    // The bitmap is about 4 MB at 2x; let it go while hidden.
-    if let Some(layer) = app.disk.win.view.as_ref().and_then(|v| v.layer()) {
-        unsafe { layer.setContents(None) };
+    // The surfaces are about 8 MB each at 2x; let them go while hidden.
+    if let Some(v) = &app.disk.win.view {
+        surface::release(v);
     }
     disk::on_closed(app);
     app.log("disk: window closed");
@@ -357,7 +395,120 @@ fn on_resized(app: &mut App) {
     app.disk.win.w = (b.size.width as f32).max(dp::W);
     app.disk.win.room = b.size.height as f32;
     app.disk.win.max = app.disk.win.window.as_ref().is_some_and(|w| w.isZoomed());
-    refresh(app);
+    // Drawn now, in the same transaction as the new size, so a live resize never shows a
+    // stretched frame.
+    disk::prepare(app);
+    follow_hover(app);
+    render(app);
+}
+
+/// Something to draw: the display link runs until the window is still again.
+fn wake(app: &mut App) {
+    if let Some(p) = &mut app.disk.win.pacer {
+        p.run();
+    }
+}
+
+/// One display refresh: the input since the last one, then at most one frame.
+pub fn on_vsync(app: &mut App) {
+    if !app.disk.win.open {
+        if let Some(p) = &mut app.disk.win.pacer {
+            p.pause();
+        }
+        return;
+    }
+    // Only a list scrolled (nothing else changed, nothing moves): its part of the window is all
+    // that is drawn again.
+    let was_dirty = app.disk.win.dirty || app.disk.win.ticking;
+    let hover_was = app.disk.win.hover;
+    let rows = std::mem::take(&mut app.disk.win.rows);
+    let (x, y) = app.disk.win.scroll_at;
+    // Content moving down (scrolling up) shows earlier rows: Windows' wheel up, +120.
+    for _ in 0..rows.unsigned_abs() {
+        disk::on_wheel(app, x, y, if rows > 0 { 120 } else { -120 });
+    }
+    let px = std::mem::take(&mut app.disk.win.px);
+    if px != 0.0 {
+        scroll_by_px(app, x, y, px);
+    }
+    if std::mem::take(&mut app.disk.win.hover_due) {
+        let h = app.disk.win.mouse.and_then(|(x, y)| disk::hit(app, x, y));
+        if h != app.disk.win.hover {
+            app.disk.win.hover = h;
+            disk::on_hover(app, h);
+            app.disk.win.dirty = true;
+        } else if matches!(h, Some(Hit::Tile(_))) {
+            // The label card follows the pointer across a tile.
+            app.disk.win.dirty = true;
+        }
+    }
+    if app.disk.win.dirty || app.disk.win.ticking {
+        // A row lit by the pointer as the list moves under it is inside the list too.
+        let hover = app.disk.win.hover;
+        let hover_stays =
+            hover == hover_was || dp::hover_in_list(hover) && dp::hover_in_list(hover_was);
+        let list_only = !was_dirty && hover_stays && !disk::animating(app);
+        draw(app, list_only);
+    }
+    let w = &mut app.disk.win;
+    if !w.dirty && !w.ticking && w.rows == 0 && w.px == 0.0 && !w.hover_due {
+        if let Some(p) = &mut w.pacer {
+            p.pause();
+        }
+    }
+}
+
+/// The trackpad moved the list under (x, y) by `d` px (+ towards its end). The lists that
+/// move by the pixel (`dp::px_list`) keep the part of a row as `disk.scroll_px` and step their
+/// first row each time a whole one has gone by; at either end the offset stops at 0. The
+/// others take whole rows, as a wheel gives them.
+fn scroll_by_px(app: &mut App, x: f32, y: f32, d: f32) {
+    let v = disk::view(app);
+    let target = dp::scroll_target(&app.fonts, &v, x, y);
+    let Some((kind, _)) = dp::px_list(&v).filter(|(k, _)| Some(*k) == target) else {
+        app.disk.scroll_px = 0.0;
+        app.disk.win.wheel -= d;
+        let n = (app.disk.win.wheel / ROW_PX).trunc();
+        app.disk.win.wheel -= n * ROW_PX;
+        for _ in 0..(n as i32).unsigned_abs() {
+            disk::on_wheel(app, x, y, if n > 0.0 { 120 } else { -120 });
+        }
+        return;
+    };
+    if app.disk.win.px_list != Some(kind) {
+        app.disk.win.px_list = Some(kind);
+        app.disk.scroll_px = 0.0;
+    }
+    let mut px = app.disk.scroll_px + d;
+    // A fling moves at most a screenful a frame; each step is one row.
+    for _ in 0..64 {
+        let v = disk::view(app);
+        let Some((_, h)) = dp::px_list(&v) else {
+            px = 0.0;
+            break;
+        };
+        let (first, last) = disk::list_span(app, &v, kind);
+        if px >= h && first < last {
+            disk::on_wheel(app, x, y, -120);
+            px -= h;
+        } else if px < 0.0 && first > 0 {
+            disk::on_wheel(app, x, y, 120);
+            let v = disk::view(app);
+            px += dp::px_list(&v).map_or(0.0, |(_, h)| h);
+        } else {
+            if first >= last && px > 0.0 || first == 0 && px < 0.0 {
+                px = 0.0;
+            }
+            break;
+        }
+    }
+    let px = px.clamp(0.0, ROW_PX * 2.0);
+    if px != app.disk.scroll_px {
+        app.disk.scroll_px = px;
+        // What is under the pointer moved with the list.
+        app.disk.win.hover_due = true;
+        app.disk.win.dirty = true;
+    }
 }
 
 fn follow_hover(app: &mut App) {
@@ -368,42 +519,49 @@ fn follow_hover(app: &mut App) {
     }
 }
 
-/// The data moved under the pointer (a scroll): the frame comes with the next turn of the run
-/// loop, so a burst of scroll events costs one frame.
+/// The data moved under the pointer (a scroll): drawn at the next display refresh.
 pub fn refresh_soon(app: &mut App) {
-    if !app.disk.win.open {
-        return;
-    }
-    disk::prepare(app);
-    follow_hover(app);
-    app.disk.win.dirty = true;
+    refresh(app);
 }
 
-/// Redraw after the data behind the window changed.
+/// Redraw after the data behind the window changed: at the next display refresh, so a burst
+/// of changes (clicks, a worker's reports) costs one frame.
 pub fn refresh(app: &mut App) {
     if !app.disk.win.open {
         return;
     }
     disk::prepare(app);
     follow_hover(app);
-    render(app);
+    app.disk.win.dirty = true;
+    wake(app);
 }
 
 /// Draws the window now: its size follows what the screen needs, unless zoomed.
 pub fn render(app: &mut App) {
+    draw(app, false);
+}
+
+/// Draws the window: all of it, or (`list_only`, a scroll with nothing else changed) only the
+/// scrolled list's part over the last frame.
+fn draw(app: &mut App, list_only: bool) {
     if !app.disk.win.open {
         return;
     }
     let t0 = Instant::now();
+    let mut sw = super::frames::Stopwatch::start();
     disk::prepare(app);
+    sw.lap("prepare");
     let v = disk::view(app);
     let (lw, lh) = dp::size(&app.fonts, &v);
+    sw.lap("view");
     let (Some(w), Some(view)) = (app.disk.win.window.clone(), app.disk.win.view.clone()) else {
         return;
     };
     let b = view.bounds();
     let (cw, ch) = (b.size.width as f32, b.size.height as f32);
-    if !app.disk.win.max && !w.inLiveResize() && ((lh - ch).abs() > 1.0 || (lw - cw).abs() > 1.0) {
+    let resized =
+        !app.disk.win.max && !w.inLiveResize() && ((lh - ch).abs() > 1.0 || (lw - cw).abs() > 1.0);
+    if resized {
         // Taller for a confirm sheet or more cards: keep the top where it is.
         let f = w.frame();
         let top = f.origin.y + f.size.height;
@@ -419,30 +577,41 @@ pub fn render(app: &mut App) {
     let (cw, ch) = (b.size.width as f32, b.size.height as f32);
     let scale = w.backingScaleFactor() as f32;
     let space = w.colorSpace().and_then(|s| s.CGColorSpace());
-    let bm = match &space {
-        Some(sp) => Bitmap::with_space(cw, ch, scale, sp),
-        None => Bitmap::new(cw, ch, scale),
-    };
     let mut v = v;
     v.w = cw.max(dp::W);
     v.room = ch;
-    dp::draw(
-        &mut bm.canvas(),
-        &app.theme,
-        &app.fonts,
-        &v,
-        app.disk.win.hover,
-    );
-    if let (Some(img), Some(layer)) = (bm.image(), view.layer()) {
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        // A CGImage is a CFType, toll-free bridged to an object.
-        let obj: &AnyObject =
-            unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
-        unsafe { layer.setContents(Some(obj)) };
-        layer.setContentsScale(scale as f64);
-        CATransaction::commit();
+    // A part-row belongs to the list it was scrolled on: another screen or tab starts at 0.
+    if v.scroll_px > 0.0 && dp::px_list(&v).map(|(k, _)| k) != app.disk.win.px_list {
+        app.disk.scroll_px = 0.0;
+        v.scroll_px = 0.0;
     }
+    let hover = app.disk.win.hover;
+    let part = dp::px_list_rect(&app.fonts, &v).filter(|_| list_only && !resized);
+    let drew_part = part.is_some_and(|p| {
+        surface::paint_part(
+            &view,
+            cw,
+            ch,
+            scale,
+            space.as_deref(),
+            p,
+            Some(&mut sw),
+            |cv| dp::draw(cv, &app.theme, &app.fonts, &v, hover),
+        )
+    });
+    if !drew_part {
+        surface::paint(
+            &view,
+            cw,
+            ch,
+            scale,
+            space.as_deref(),
+            Some(&mut sw),
+            |cv| dp::draw(cv, &app.theme, &app.fonts, &v, hover),
+        );
+    }
+    sw.frame.part = drew_part;
+    sw.done("disk");
     app.disk.win.frames += 1;
     app.disk.win.dirty = false;
     app.disk.win.ticking = disk::animating(app);
@@ -460,15 +629,8 @@ fn on_move(app: &mut App, p: (f32, f32)) {
         return;
     }
     app.disk.win.mouse = Some(p);
-    let h = disk::hit(app, p.0, p.1);
-    if h != app.disk.win.hover {
-        app.disk.win.hover = h;
-        disk::on_hover(app, h);
-        app.disk.win.dirty = true;
-    } else if matches!(h, Some(Hit::Tile(_))) {
-        // The label card follows the pointer across a tile.
-        app.disk.win.dirty = true;
-    }
+    app.disk.win.hover_due = true;
+    wake(app);
 }
 
 fn on_leave(app: &mut App) {
@@ -477,30 +639,45 @@ fn on_leave(app: &mut App) {
         app.disk.win.hover = None;
         disk::on_hover(app, None);
         app.disk.win.dirty = true;
+        wake(app);
     }
 }
 
 /// Trackpad deltas come in pixels and add up to whole rows; a mouse wheel's notch is a row.
+/// The rows move at the next display refresh, however many events came before it.
 fn on_scroll(app: &mut App, x: f32, y: f32, dy: f32, precise: bool) {
-    let rows = if precise {
-        app.disk.win.wheel += dy;
-        let n = (app.disk.win.wheel / ROW_PX).trunc();
-        app.disk.win.wheel -= n * ROW_PX;
-        n as i32
-    } else if dy.abs() > 0.01 {
+    if precise {
+        if dy != 0.0 {
+            // Content moving down (dy > 0) goes back towards the start.
+            app.disk.win.px -= dy;
+            app.disk.win.scroll_at = (x, y);
+            wake(app);
+        }
+        return;
+    }
+    let rows = if dy.abs() > 0.01 {
         dy.signum() as i32 * (dy.abs().ceil() as i32).min(3)
     } else {
         0
     };
-    // Content moving down (scrolling up) shows earlier rows: Windows' wheel up, +120.
-    for _ in 0..rows.unsigned_abs() {
-        disk::on_wheel(app, x, y, if rows > 0 { 120 } else { -120 });
+    if rows != 0 {
+        // A wheel moves whole rows: no part-row is left over.
+        app.disk.scroll_px = 0.0;
+        app.disk.win.rows += rows;
+        app.disk.win.scroll_at = (x, y);
+        wake(app);
     }
 }
 
 /// macOS key codes to the Windows virtual keys disk.rs reads.
 fn on_key(app: &mut App, code: u16, cmd: bool) {
     const ESC: u16 = 53;
+    // The keys move whole rows (and keep the cursor's row in view): no part-row.
+    if app.disk.scroll_px != 0.0 {
+        app.disk.scroll_px = 0.0;
+        app.disk.win.dirty = true;
+        wake(app);
+    }
     let vk = match code {
         126 => disk::VK_UP,
         125 => disk::VK_DOWN,
@@ -567,7 +744,10 @@ pub fn shot(app: &mut App, path: &str) {
             b.ph as u32,
             b.rgba(),
         );
-        app.log(&format!("disk: shot {path}"));
+        app.log(&format!(
+            "disk: shot {path} (part-row {:.1} px)",
+            app.disk.scroll_px
+        ));
     }
 }
 

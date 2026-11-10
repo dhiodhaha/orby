@@ -12,8 +12,16 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
+use super::app::with_app;
+use super::cg::Bitmap;
+use super::input::{Input, InputView};
+use super::pacer::{Pacer, Who};
+use crate::sys::{self, vk};
+use crate::tasks_window::{self as tw};
+use crate::tasks_window_panel::{self as twp};
+use crate::App;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{
     define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
@@ -24,15 +32,6 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSOperationQueue, NSPoint, NSRect, NSSize, NSString,
 };
-use objc2_quartz_core::CATransaction;
-
-use super::app::with_app;
-use super::cg::Bitmap;
-use super::input::{Input, InputView};
-use crate::sys::{self, vk};
-use crate::tasks_window::{self as tw};
-use crate::tasks_window_panel::{self as twp};
-use crate::App;
 
 /// The window on the Mac: the NSWindow, its view and input view, the Undo bar's deadline.
 #[derive(Default)]
@@ -43,6 +42,12 @@ pub struct MacWin {
     observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     /// When the Undo bar goes (Windows' TIMER_UNDO).
     undo_at: Option<Instant>,
+    /// The display link's frames, running while there is something to draw.
+    pacer: Option<Pacer>,
+    /// A redraw is due at the next display refresh.
+    dirty: bool,
+    /// The pointer moved since the last frame: what it is over is found at the frame.
+    hover_due: bool,
 }
 
 pub struct TasksViewIvars {
@@ -106,8 +111,10 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, e: &NSEvent) {
+            let t = super::frames::now();
             let p = self.point(e);
             with_app(|a| on_move(a, p));
+            super::frames::input("tasks", e.timestamp(), (super::frames::now() - t) * 1000.0);
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -126,7 +133,9 @@ define_class!(
             let dy = e.scrollingDeltaY();
             let precise = e.hasPreciseScrollingDeltas();
             if dy != 0.0 {
+                let t = super::frames::now();
                 with_app(|a| tw::on_wheel(a, super::panels::wheel_delta(dy, precise)));
+                super::frames::input("tasks", e.timestamp(), (super::frames::now() - t) * 1000.0);
             }
         }
     }
@@ -198,6 +207,7 @@ fn make(app: &mut App, mtm: MainThreadMarker) {
     w.setAcceptsMouseMovedEvents(true);
     let view = TasksView::new(mtm, twp::W, twp::H);
     w.setContentView(Some(&view));
+    app.tasks.win.mac.pacer = Some(Pacer::new(&view, Who::Tasks));
     let input = InputView::new(mtm);
     view.addSubview(&input);
     let center = NSNotificationCenter::defaultCenter();
@@ -246,6 +256,15 @@ fn sync_size(app: &mut App) {
     tw.max = max;
 }
 
+/// The window and its view while it is open (the test drivers aim at them).
+pub fn refs(app: &App) -> Option<(Retained<NSWindow>, Retained<NSView>)> {
+    if !app.tasks.win.open {
+        return None;
+    }
+    let m = &app.tasks.win.mac;
+    Some((m.window.clone()?, Retained::into_super(m.view.clone()?)))
+}
+
 /// Shows the window (`tasks_window::show`): `again` brings an open one to the front; otherwise
 /// it opens zoomed if it was closed so, else at its own size, centred on the orb's screen. Orby
 /// activates (it stays an accessory app) and the window takes the keyboard.
@@ -280,7 +299,8 @@ pub fn show_window(app: &mut App, again: bool) {
             }
             sync_size(app);
         }
-        render(app);
+        // Drawn before it comes on screen, so it never shows empty.
+        draw_now(app);
     }
     if let Some(w) = app.tasks.win.mac.window.clone() {
         if w.isMiniaturized() {
@@ -301,15 +321,20 @@ pub fn show_window(app: &mut App, again: bool) {
 pub fn close_window(app: &mut App) {
     let m = &mut app.tasks.win.mac;
     m.undo_at = None;
+    m.dirty = false;
+    m.hover_due = false;
+    if let Some(p) = &mut m.pacer {
+        p.pause();
+    }
     if let Some(i) = &m.input {
         i.discard_marked();
     }
     if let Some(w) = &m.window {
         w.orderOut(None);
     }
-    // The bitmap is a few MB at 2x; let it go while hidden.
-    if let Some(layer) = m.view.as_ref().and_then(|v| v.layer()) {
-        unsafe { layer.setContents(None) };
+    // The surfaces are a few MB each at 2x; let them go while hidden.
+    if let Some(v) = &m.view {
+        super::surface::release(v);
     }
 }
 
@@ -332,12 +357,7 @@ pub(crate) fn deadline(app: &App) -> Option<Instant> {
     app.tasks.win.mac.undo_at.filter(|_| app.tasks.win.open)
 }
 
-/// Frames while a ripple or a rolling number moves.
-pub(crate) fn animating(app: &App) -> bool {
-    app.tasks.win.open && app.tasks.win.ticking
-}
-
-/// One run-loop wake: the Undo bar's time, and a frame while something moves.
+/// One run-loop wake: the Undo bar's time (frames come from the display link).
 pub(crate) fn tick(app: &mut App) {
     if !app.tasks.win.open {
         return;
@@ -352,8 +372,37 @@ pub(crate) fn tick(app: &mut App) {
         app.tasks.win.mac.undo_at = None;
         tw::on_undo_timer(app);
     }
-    if app.tasks.win.ticking {
-        render(app);
+}
+
+/// One display refresh: the pointer since the last one, then at most one frame.
+pub fn on_vsync(app: &mut App) {
+    if !app.tasks.win.open {
+        if let Some(p) = &mut app.tasks.win.mac.pacer {
+            p.pause();
+        }
+        return;
+    }
+    if std::mem::take(&mut app.tasks.win.mac.hover_due) {
+        let h = app.tasks.win.mouse.and_then(|(x, y)| tw::hit(app, x, y));
+        if h != app.tasks.win.hover {
+            app.tasks.win.hover = h;
+            app.tasks.win.mac.dirty = true;
+        }
+    }
+    if app.tasks.win.mac.dirty || app.tasks.win.ticking {
+        draw_now(app);
+    }
+    let w = &mut app.tasks.win;
+    if !w.mac.dirty && !w.ticking && !w.mac.hover_due {
+        if let Some(p) = &mut w.mac.pacer {
+            p.pause();
+        }
+    }
+}
+
+fn wake(app: &mut App) {
+    if let Some(p) = &mut app.tasks.win.mac.pacer {
+        p.run();
     }
 }
 
@@ -363,6 +412,8 @@ fn on_resized(app: &mut App) {
     }
     sync_size(app);
     tw::after_resize(app);
+    // Drawn now, in the same transaction as the new size (a live resize stays in step).
+    draw_now(app);
 }
 
 fn on_activation(app: &mut App) {
@@ -382,8 +433,18 @@ fn on_activation(app: &mut App) {
     }
 }
 
-/// Draws the window now, at its view's size.
+/// The window is out of date (tasks_window.rs calls this for every change): drawn at the next
+/// display refresh, so changes that come together cost one frame.
 pub fn render(app: &mut App) {
+    if !app.tasks.win.open {
+        return;
+    }
+    app.tasks.win.mac.dirty = true;
+    wake(app);
+}
+
+/// Draws the window now, at its view's size.
+fn draw_now(app: &mut App) {
     if !app.tasks.win.open {
         return;
     }
@@ -393,32 +454,25 @@ pub fn render(app: &mut App) {
     ) else {
         return;
     };
+    let mut sw = super::frames::Stopwatch::start();
     let b = view.bounds();
     let (cw, ch) = (b.size.width as f32, b.size.height as f32);
     let scale = w.backingScaleFactor() as f32;
     let space = w.colorSpace().and_then(|s| s.CGColorSpace());
-    let bm = match &space {
-        Some(sp) => Bitmap::with_space(cw, ch, scale, sp),
-        None => Bitmap::new(cw, ch, scale),
-    };
     let v = tw::view(app);
-    twp::draw(
-        &mut bm.canvas(),
-        &app.theme,
-        &app.fonts,
-        &v,
-        app.tasks.win.hover,
+    sw.lap("view");
+    let hover = app.tasks.win.hover;
+    super::surface::paint(
+        &view,
+        cw,
+        ch,
+        scale,
+        space.as_deref(),
+        Some(&mut sw),
+        |cv| twp::draw(cv, &app.theme, &app.fonts, &v, hover),
     );
-    if let (Some(img), Some(layer)) = (bm.image(), view.layer()) {
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        // A CGImage is a CFType, toll-free bridged to an object.
-        let obj: &AnyObject =
-            unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
-        unsafe { layer.setContents(Some(obj)) };
-        layer.setContentsScale(scale as f64);
-        CATransaction::commit();
-    }
+    sw.done("tasks");
+    app.tasks.win.mac.dirty = false;
     // Frames only while a ripple or a rolling number moves.
     app.tasks.win.ticking = crate::motion::active();
 }
@@ -428,11 +482,8 @@ fn on_move(app: &mut App, p: (f32, f32)) {
         return;
     }
     app.tasks.win.mouse = Some(p);
-    let h = tw::hit(app, p.0, p.1);
-    if h != app.tasks.win.hover {
-        app.tasks.win.hover = h;
-        render(app);
-    }
+    app.tasks.win.mac.hover_due = true;
+    wake(app);
 }
 
 fn on_leave(app: &mut App) {
