@@ -416,6 +416,62 @@ impl Surface {
     }
 }
 
+/// Draws into an offscreen bitmap (`w` x `h` logical pixels at `scale`) and returns its pixels as
+/// premultiplied RGBA rows: the snapshot mode's renderer, on the same device context as the
+/// windows, so a snapshot is exactly what a window would show.
+pub fn render_offscreen(
+    g: &Shared,
+    w: f32,
+    h: f32,
+    scale: f32,
+    draw: impl FnOnce(&ID2D1DeviceContext),
+) -> Result<(u32, u32, Vec<u8>)> {
+    let (pw, ph) = ((w * scale).ceil() as u32, (h * scale).ceil() as u32);
+    unsafe {
+        let props = |opts| D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0 * scale,
+            dpiY: 96.0 * scale,
+            bitmapOptions: opts,
+            ..Default::default()
+        };
+        let size = D2D_SIZE_U {
+            width: pw,
+            height: ph,
+        };
+        let target = g
+            .dc
+            .CreateBitmap(size, None, 0, &props(D2D1_BITMAP_OPTIONS_TARGET))?;
+        let cpu = g.dc.CreateBitmap(
+            size,
+            None,
+            0,
+            &props(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW),
+        )?;
+        g.dc.SetTarget(&target);
+        g.dc.SetDpi(96.0 * scale, 96.0 * scale);
+        g.dc.BeginDraw();
+        g.dc.Clear(Some(&D2D1_COLOR_F::default()));
+        draw(&g.dc);
+        g.dc.EndDraw(None, None)?;
+        g.dc.SetTarget(None);
+        cpu.CopyFromBitmap(None, &target, None)?;
+        let m = cpu.Map(D2D1_MAP_OPTIONS_READ)?;
+        let mut out = Vec::with_capacity((pw * ph * 4) as usize);
+        for y in 0..ph {
+            let row = std::slice::from_raw_parts(m.bits.add((y * m.pitch) as usize), pw as usize * 4);
+            for px in row.chunks(4) {
+                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        cpu.Unmap()?;
+        Ok((pw, ph, out))
+    }
+}
+
 // ---- small drawing helpers ----
 
 pub fn rgba(hex: u32, a: f32) -> D2D1_COLOR_F {

@@ -62,10 +62,12 @@ mod orb;
 mod panel;
 mod panels;
 mod pill;
+mod png;
 mod prayer;
 mod settings;
 mod settings_model;
 mod settings_panel;
+mod snapshot;
 mod store;
 mod tasks;
 mod tasks_model;
@@ -583,6 +585,10 @@ fn step(name: &str) {
 }
 
 fn main() {
+    if let Some(dir) = std::env::var_os("ORB_SNAPSHOT") {
+        let _ = snapshot::run_windows(std::path::Path::new(&dir));
+        return;
+    }
     if let Err(e) = run() {
         let last =
             std::fs::read_to_string(exe_dir().join("orb-proto-step.txt")).unwrap_or_default();
