@@ -33,6 +33,7 @@
 #![windows_subsystem = "windows"]
 
 mod calendar;
+mod canvas;
 mod depth;
 mod dial;
 mod disk;

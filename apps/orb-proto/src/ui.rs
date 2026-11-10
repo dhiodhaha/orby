@@ -2,46 +2,50 @@
 //! Pill and dial drawing on the v6.3 tokens: true neutral, Inter Variable (bundled, gfx.rs) with
 //! tabular figures everywhere, and the shared number column helper `text_num`.
 
-use windows::core::w;
-use windows::Win32::Graphics::Direct2D::Common::*;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct2D::*;
+#[cfg(windows)]
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::Win32::System::Registry::*;
 
-use crate::gfx::*;
+use crate::canvas::*;
+#[cfg(windows)]
+use crate::gfx::{self, Shared};
 
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub dark: bool,
-    pub surface: D2D1_COLOR_F,
-    pub band: D2D1_COLOR_F,
-    pub hair: D2D1_COLOR_F,
-    pub text: D2D1_COLOR_F,
-    pub muted: D2D1_COLOR_F,
-    pub chip: D2D1_COLOR_F,
-    pub button: D2D1_COLOR_F,
-    pub button_hover: D2D1_COLOR_F,
-    pub panel: D2D1_COLOR_F,
-    pub raised: D2D1_COLOR_F,
-    pub track: D2D1_COLOR_F,
-    pub passed: D2D1_COLOR_F,
+    pub surface: Color,
+    pub band: Color,
+    pub hair: Color,
+    pub text: Color,
+    pub muted: Color,
+    pub chip: Color,
+    pub button: Color,
+    pub button_hover: Color,
+    pub panel: Color,
+    pub raised: Color,
+    pub track: Color,
+    pub passed: Color,
     /// Drink water: moonlight white in dark, a soft grey in white. Never blue.
-    pub water: D2D1_COLOR_F,
-    pub meniscus: D2D1_COLOR_F,
+    pub water: Color,
+    pub meniscus: Color,
     /// Needs you: failures only, never offline. The same in both themes.
-    pub ember: D2D1_COLOR_F,
+    pub ember: Color,
     /// The History grid's five levels, nothing logged to goal met (or 2 h of focus).
-    pub heat: [D2D1_COLOR_F; 5],
+    pub heat: [Color; 5],
 }
 
 /// Whether Windows draws apps dark (Settings, Personalisation, Colours, app mode).
+#[cfg(windows)]
 pub fn windows_dark() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::Registry::*;
     let mut v: u32 = 0;
     let mut size: u32 = 4;
     let light = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
             w!("AppsUseLightTheme"),
             RRF_RT_REG_DWORD,
             None,
@@ -110,27 +114,28 @@ pub fn theme(dark: bool) -> Theme {
     }
 }
 
-pub fn with_alpha(c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F { a: c.a * a, ..c }
+pub fn with_alpha(c: Color, a: f32) -> Color {
+    Color { a: c.a * a, ..c }
 }
 
 pub struct Fonts {
-    pub title: IDWriteTextFormat,
-    pub body: IDWriteTextFormat,
-    pub small: IDWriteTextFormat,
-    pub small_medium: IDWriteTextFormat,
-    pub panel_title: IDWriteTextFormat,
-    pub big: IDWriteTextFormat,
-    pub timer: IDWriteTextFormat,
-    pub heading: IDWriteTextFormat,
+    pub title: Font,
+    pub body: Font,
+    pub small: Font,
+    pub small_medium: Font,
+    pub panel_title: Font,
+    pub big: Font,
+    pub timer: Font,
+    pub heading: Font,
     /// The orb badge's digits.
-    pub badge: IDWriteTextFormat,
+    pub badge: Font,
     /// Wrapping body text, top aligned (the Disk cards and the confirm sheet).
-    pub small_wrap: IDWriteTextFormat,
-    pub body_wrap: IDWriteTextFormat,
+    pub small_wrap: Font,
+    pub body_wrap: Font,
 }
 
-fn wrapping(f: IDWriteTextFormat) -> IDWriteTextFormat {
+#[cfg(windows)]
+fn wrapping(f: Font) -> Font {
     unsafe {
         let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
         let _ = f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
@@ -139,6 +144,7 @@ fn wrapping(f: IDWriteTextFormat) -> IDWriteTextFormat {
 }
 
 impl Fonts {
+    #[cfg(windows)]
     pub fn new(g: &Shared) -> Self {
         Self {
             title: g.format(13.0, DWRITE_FONT_WEIGHT_MEDIUM).unwrap(),
@@ -152,6 +158,25 @@ impl Fonts {
             badge: g.format(10.0, DWRITE_FONT_WEIGHT_MEDIUM).unwrap(),
             small_wrap: wrapping(g.format(12.0, DWRITE_FONT_WEIGHT_NORMAL).unwrap()),
             body_wrap: wrapping(g.format(13.0, DWRITE_FONT_WEIGHT_NORMAL).unwrap()),
+        }
+    }
+
+    /// The same sizes and weights in the bundled Inter, through Core Text.
+    #[cfg(target_os = "macos")]
+    pub fn new() -> Self {
+        use crate::mac::text::font;
+        Self {
+            title: font(13.0, 500.0, false),
+            body: font(13.0, 400.0, false),
+            small: font(12.0, 400.0, false),
+            small_medium: font(12.0, 500.0, false),
+            panel_title: font(14.0, 500.0, false),
+            big: font(26.0, 500.0, false),
+            timer: font(40.0, 500.0, false),
+            heading: font(20.0, 500.0, false),
+            badge: font(10.0, 500.0, false),
+            small_wrap: font(12.0, 400.0, true),
+            body_wrap: font(13.0, 400.0, true),
         }
     }
 }
@@ -173,6 +198,7 @@ pub const NUM_COL_GAP: f32 = 10.0;
 /// column; for a value that should roll when it changes, use `motion::rolling_text_right`.
 ///
 /// `text_num(g, dc, "182 GB", &f.title, right, y, h, &ink)`
+#[cfg(windows)]
 pub fn text_num(
     g: &Shared,
     dc: &ID2D1DeviceContext,
@@ -183,7 +209,7 @@ pub fn text_num(
     h: f32,
     b: &ID2D1SolidColorBrush,
 ) {
-    right_text(g, dc, s, fmt, right, y, h, b);
+    gfx::right_text(g, dc, s, fmt, right, y, h, b);
 }
 
 // ---- icons (Lucide-style, drawn on a 24 grid, stroke 1.6) ----
@@ -268,6 +294,7 @@ impl Icon {
     }
 }
 
+#[cfg(windows)]
 /// A 28 px title-band button (close, maximize): no fill until hovered, a 14 px muted icon.
 pub fn title_button(
     g: &Shared,
@@ -279,13 +306,18 @@ pub fn title_button(
 ) {
     if hover {
         unsafe {
-            dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, t.button_hover))
+            dc.FillRoundedRectangle(
+                &gfx::rrect(r.0, r.1, r.2, r.3, 14.0),
+                &gfx::brush(dc, t.button_hover),
+            )
         };
     }
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
-    draw_icon(g, dc, icon, cx, cy, 14.0, &brush(dc, t.muted));
+    draw_icon(g, dc, icon, cx, cy, 14.0, &gfx::brush(dc, t.muted));
 }
 
+/// `paint_icon` on a Direct2D context, for the panels that still draw with Direct2D.
+#[cfg(windows)]
 pub fn draw_icon(
     g: &Shared,
     dc: &ID2D1DeviceContext,
@@ -295,12 +327,40 @@ pub fn draw_icon(
     size: f32,
     b: &ID2D1SolidColorBrush,
 ) {
+    let c = unsafe { b.GetColor() };
+    paint_icon(&mut gfx::D2dCanvas::new(g, dc), icon, cx, cy, size, c);
+}
+
+/// The lip's colour: white, black 4% at the bottom; dark, white 6% at the top.
+pub fn lip_color(t: &Theme) -> Color {
+    if t.dark {
+        rgba(0xFFFFFF, 0.06)
+    } else {
+        rgba(0x000000, 0.04)
+    }
+}
+
+/// The T3 lip on a rounded rect: a one-pixel crescent along the inside of the bottom edge
+/// (white) or the top edge (dark), following the corners. `a` scales its alpha.
+pub fn lip(cv: &mut dyn Canvas, t: &Theme, l: f32, top: f32, r: f32, b: f32, radius: f32, a: f32) {
+    if a <= 0.01 || r - l < 2.0 || b - top < 2.0 {
+        return;
+    }
+    let c = lip_color(t);
+    let dy = if t.dark { 1.0 } else { -1.0 };
+    cv.lip(Color { a: c.a * a, ..c }, dy, l, top, r, b, radius);
+}
+
+/// A Lucide-style icon on the 24 grid, `size` px, stroke 1.6 at 16 px.
+pub fn paint_icon(cv: &mut dyn Canvas, icon: Icon, cx: f32, cy: f32, size: f32, b: Color) {
     let s = size / 24.0;
     let p = |x: f32, y: f32| pt(cx + (x - 12.0) * s, cy + (y - 12.0) * s);
     let sw = 1.6 * (size / 16.0);
-    let st = round_stroke(g);
-    unsafe {
-        let line = |a: (f32, f32), c: (f32, f32)| dc.DrawLine(p(a.0, a.1), p(c.0, c.1), b, sw, &st);
+    let st = Stroke::Round;
+    {
+        let line = |cv: &mut dyn Canvas, a: (f32, f32), c: (f32, f32)| {
+            cv.line(p(a.0, a.1), p(c.0, c.1), b, sw, st)
+        };
         match icon {
             Icon::Tasks => {
                 let r = rrect(
@@ -310,12 +370,12 @@ pub fn draw_icon(
                     cy + 8.0 * s,
                     5.0 * s,
                 );
-                dc.DrawRoundedRectangle(&r, b, sw, &st);
-                let geo = path(g, p(8.5, 12.0), false, |k| {
+                cv.stroke_rrect(&r, b, sw, st);
+                let geo = path(p(8.5, 12.0), false, |k| {
                     line_to(k, p(11.0, 14.5));
                     line_to(k, p(15.5, 9.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Today => {
                 let r = rrect(
@@ -325,47 +385,47 @@ pub fn draw_icon(
                     cy + 9.0 * s,
                     3.0 * s,
                 );
-                dc.DrawRoundedRectangle(&r, b, sw, &st);
-                line((3.0, 10.0), (21.0, 10.0));
-                line((8.0, 3.0), (8.0, 7.0));
-                line((16.0, 3.0), (16.0, 7.0));
+                cv.stroke_rrect(&r, b, sw, st);
+                line(cv, (3.0, 10.0), (21.0, 10.0));
+                line(cv, (8.0, 3.0), (8.0, 7.0));
+                line(cv, (16.0, 3.0), (16.0, 7.0));
             }
             Icon::Prayer => {
                 // A small day arc with the sun on it, echoing the prayer arc.
-                let geo = path(g, p(4.0, 17.0), false, |k| {
+                let geo = path(p(4.0, 17.0), false, |k| {
                     arc_to(k, p(20.0, 17.0), 8.0 * s, false, true)
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((2.5, 17.0), (21.5, 17.0));
-                dc.FillEllipse(&ellipse(p(15.4, 9.8).X, p(15.4, 9.8).Y, 2.2 * s), b);
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (2.5, 17.0), (21.5, 17.0));
+                cv.fill_ellipse(&ellipse(p(15.4, 9.8).X, p(15.4, 9.8).Y, 2.2 * s), b);
             }
             Icon::Focus => {
-                dc.DrawEllipse(&ellipse(cx, cy + 1.0 * s, 8.0 * s), b, sw, &st);
-                let geo = path(g, p(12.0, 9.0), false, |k| {
+                cv.stroke_ellipse(&ellipse(cx, cy + 1.0 * s, 8.0 * s), b, sw, st);
+                let geo = path(p(12.0, 9.0), false, |k| {
                     line_to(k, p(12.0, 13.0));
                     line_to(k, p(14.5, 15.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((10.0, 2.5), (14.0, 2.5));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (10.0, 2.5), (14.0, 2.5));
             }
             Icon::Drink => {
-                let geo = path(g, p(5.0, 4.0), false, |k| {
+                let geo = path(p(5.0, 4.0), false, |k| {
                     line_to(k, p(19.0, 4.0));
                     line_to(k, p(17.4, 19.2));
                     line_to(k, p(6.6, 19.2));
                     line_to(k, p(5.0, 4.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((5.7, 10.0), (18.3, 10.0));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (5.7, 10.0), (18.3, 10.0));
             }
             Icon::More => {
                 for x in [6.0, 12.0, 18.0] {
                     let q = p(x, 12.0);
-                    dc.FillEllipse(&ellipse(q.X, q.Y, 1.7 * s), b);
+                    cv.fill_ellipse(&ellipse(q.X, q.Y, 1.7 * s), b);
                 }
             }
             Icon::Bell => {
-                let geo = path(g, p(6.0, 13.0), false, |k| {
+                let geo = path(p(6.0, 13.0), false, |k| {
                     line_to(k, p(6.0, 9.0));
                     arc_to(k, p(18.0, 9.0), 6.0 * s, false, true);
                     line_to(k, p(18.0, 13.0));
@@ -373,57 +433,57 @@ pub fn draw_icon(
                     line_to(k, p(3.5, 17.0));
                     line_to(k, p(6.0, 13.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((10.3, 20.5), (13.7, 20.5));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (10.3, 20.5), (13.7, 20.5));
             }
             Icon::Info => {
-                dc.DrawEllipse(&ellipse(cx, cy, 9.0 * s), b, sw, &st);
-                line((12.0, 11.0), (12.0, 16.0));
+                cv.stroke_ellipse(&ellipse(cx, cy, 9.0 * s), b, sw, st);
+                line(cv, (12.0, 11.0), (12.0, 16.0));
                 let q = p(12.0, 7.8);
-                dc.FillEllipse(&ellipse(q.X, q.Y, 1.2 * s), b);
+                cv.fill_ellipse(&ellipse(q.X, q.Y, 1.2 * s), b);
             }
             Icon::Close => {
-                line((7.0, 7.0), (17.0, 17.0));
-                line((17.0, 7.0), (7.0, 17.0));
+                line(cv, (7.0, 7.0), (17.0, 17.0));
+                line(cv, (17.0, 7.0), (7.0, 17.0));
             }
             Icon::Maximize => {
                 let (a, z) = (p(6.5, 6.5), p(17.5, 17.5));
-                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, z.X, z.Y, 2.5 * s), b, sw, &st);
+                cv.stroke_rrect(&rrect(a.X, a.Y, z.X, z.Y, 2.5 * s), b, sw, st);
             }
             Icon::Restore => {
                 // The front window, and the edge of the one behind it.
                 let (a, z) = (p(5.5, 9.0), p(15.0, 18.5));
-                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, z.X, z.Y, 2.2 * s), b, sw, &st);
-                let geo = path(g, p(9.0, 5.5), false, |k| {
+                cv.stroke_rrect(&rrect(a.X, a.Y, z.X, z.Y, 2.2 * s), b, sw, st);
+                let geo = path(p(9.0, 5.5), false, |k| {
                     line_to(k, p(16.3, 5.5));
                     arc_to(k, p(18.5, 7.7), 2.2 * s, false, true);
                     line_to(k, p(18.5, 15.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Pause => {
-                line((9.0, 6.5), (9.0, 17.5));
-                line((15.0, 6.5), (15.0, 17.5));
+                line(cv, (9.0, 6.5), (9.0, 17.5));
+                line(cv, (15.0, 6.5), (15.0, 17.5));
             }
             Icon::Play => {
-                let geo = path(g, p(8.0, 6.0), false, |k| {
+                let geo = path(p(8.0, 6.0), false, |k| {
                     line_to(k, p(18.0, 12.0));
                     line_to(k, p(8.0, 18.0));
                     line_to(k, p(8.0, 6.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Skip => {
-                let geo = path(g, p(6.0, 6.5), false, |k| {
+                let geo = path(p(6.0, 6.5), false, |k| {
                     line_to(k, p(14.5, 12.0));
                     line_to(k, p(6.0, 17.5));
                     line_to(k, p(6.0, 6.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((18.0, 6.5), (18.0, 17.5));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (18.0, 6.5), (18.0, 17.5));
             }
             Icon::Stop => {
-                dc.DrawRoundedRectangle(
+                cv.stroke_rrect(
                     &rrect(
                         cx - 6.0 * s,
                         cy - 6.0 * s,
@@ -433,19 +493,19 @@ pub fn draw_icon(
                     ),
                     b,
                     sw,
-                    &st,
+                    st,
                 );
             }
             Icon::Clock => {
-                dc.DrawEllipse(&ellipse(cx, cy, 9.0 * s), b, sw, &st);
-                let geo = path(g, p(12.0, 7.5), false, |k| {
+                cv.stroke_ellipse(&ellipse(cx, cy, 9.0 * s), b, sw, st);
+                let geo = path(p(12.0, 7.5), false, |k| {
                     line_to(k, p(12.0, 12.0));
                     line_to(k, p(15.0, 14.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Check => {
-                dc.DrawRoundedRectangle(
+                cv.stroke_rrect(
                     &rrect(
                         cx - 7.0 * s,
                         cy - 7.0 * s,
@@ -455,19 +515,19 @@ pub fn draw_icon(
                     ),
                     b,
                     sw,
-                    &st,
+                    st,
                 );
             }
             Icon::Inbox => {
-                let geo = path(g, p(3.5, 12.5), false, |k| {
+                let geo = path(p(3.5, 12.5), false, |k| {
                     line_to(k, p(8.0, 12.5));
                     line_to(k, p(9.5, 15.0));
                     line_to(k, p(14.5, 15.0));
                     line_to(k, p(16.0, 12.5));
                     line_to(k, p(20.5, 12.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                let box_ = path(g, p(6.5, 5.0), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                let box_ = path(p(6.5, 5.0), false, |k| {
                     line_to(k, p(17.5, 5.0));
                     line_to(k, p(20.5, 12.5));
                     line_to(k, p(20.5, 19.0));
@@ -475,43 +535,44 @@ pub fn draw_icon(
                     line_to(k, p(3.5, 12.5));
                     line_to(k, p(6.5, 5.0));
                 });
-                dc.DrawGeometry(&box_, b, sw, &st);
+                cv.stroke_path(&box_, b, sw, st);
             }
             Icon::Sun => {
-                dc.DrawEllipse(&ellipse(cx, cy, 4.0 * s), b, sw, &st);
+                cv.stroke_ellipse(&ellipse(cx, cy, 4.0 * s), b, sw, st);
                 for i in 0..8 {
                     let a = (i as f32 * 45.0).to_radians();
                     let (dx, dy) = (a.sin(), -a.cos());
                     line(
+                        cv,
                         (12.0 + dx * 7.0, 12.0 + dy * 7.0),
                         (12.0 + dx * 9.0, 12.0 + dy * 9.0),
                     );
                 }
             }
             Icon::Person => {
-                dc.DrawEllipse(&ellipse(cx, cy - 4.0 * s, 3.5 * s), b, sw, &st);
-                let geo = path(g, p(5.5, 20.0), false, |k| {
+                cv.stroke_ellipse(&ellipse(cx, cy - 4.0 * s, 3.5 * s), b, sw, st);
+                let geo = path(p(5.5, 20.0), false, |k| {
                     arc_to(k, p(18.5, 20.0), 6.5 * s, false, true)
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::People => {
-                dc.DrawEllipse(&ellipse(p(9.0, 8.5).X, p(9.0, 8.5).Y, 3.0 * s), b, sw, &st);
-                let geo = path(g, p(3.5, 19.0), false, |k| {
+                cv.stroke_ellipse(&ellipse(p(9.0, 8.5).X, p(9.0, 8.5).Y, 3.0 * s), b, sw, st);
+                let geo = path(p(3.5, 19.0), false, |k| {
                     arc_to(k, p(14.5, 19.0), 5.5 * s, false, true)
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                let geo = path(g, p(15.5, 5.8), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                let geo = path(p(15.5, 5.8), false, |k| {
                     arc_to(k, p(15.5, 11.2), 2.7 * s, false, true)
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                let geo = path(g, p(17.5, 14.0), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                let geo = path(p(17.5, 14.0), false, |k| {
                     arc_to(k, p(20.5, 19.0), 5.0 * s, false, true)
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Lock | Icon::Private => {
-                dc.DrawRoundedRectangle(
+                cv.stroke_rrect(
                     &rrect(
                         cx - 7.0 * s,
                         cy - 1.0 * s,
@@ -521,17 +582,17 @@ pub fn draw_icon(
                     ),
                     b,
                     sw,
-                    &st,
+                    st,
                 );
-                let geo = path(g, p(8.0, 11.0), false, |k| {
+                let geo = path(p(8.0, 11.0), false, |k| {
                     line_to(k, p(8.0, 8.0));
                     arc_to(k, p(16.0, 8.0), 4.0 * s, false, true);
                     line_to(k, p(16.0, 11.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Folder => {
-                let geo = path(g, p(3.5, 6.5), false, |k| {
+                let geo = path(p(3.5, 6.5), false, |k| {
                     line_to(k, p(9.5, 6.5));
                     line_to(k, p(11.5, 8.5));
                     line_to(k, p(20.5, 8.5));
@@ -539,63 +600,63 @@ pub fn draw_icon(
                     line_to(k, p(3.5, 18.5));
                     line_to(k, p(3.5, 6.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::List => {
                 for y in [7.0, 12.0, 17.0] {
-                    line((9.0, y), (20.0, y));
+                    line(cv, (9.0, y), (20.0, y));
                     let q = p(4.8, y);
-                    dc.FillEllipse(&ellipse(q.X, q.Y, 1.2 * s), b);
+                    cv.fill_ellipse(&ellipse(q.X, q.Y, 1.2 * s), b);
                 }
             }
             Icon::Plus => {
-                line((12.0, 5.0), (12.0, 19.0));
-                line((5.0, 12.0), (19.0, 12.0));
+                line(cv, (12.0, 5.0), (12.0, 19.0));
+                line(cv, (5.0, 12.0), (19.0, 12.0));
             }
             Icon::ChevronRight => {
-                let geo = path(g, p(10.0, 7.0), false, |k| {
+                let geo = path(p(10.0, 7.0), false, |k| {
                     line_to(k, p(15.0, 12.0));
                     line_to(k, p(10.0, 17.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::ChevronLeft => {
-                let geo = path(g, p(14.0, 7.0), false, |k| {
+                let geo = path(p(14.0, 7.0), false, |k| {
                     line_to(k, p(9.0, 12.0));
                     line_to(k, p(14.0, 17.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Grid => {
                 for (x, y) in [(4.0, 4.0), (13.5, 4.0), (4.0, 13.5), (13.5, 13.5)] {
                     let (a, z) = (p(x, y), p(x + 6.5, y + 6.5));
-                    dc.DrawRoundedRectangle(&rrect(a.X, a.Y, z.X, z.Y, 1.8 * s), b, sw, &st);
+                    cv.stroke_rrect(&rrect(a.X, a.Y, z.X, z.Y, 1.8 * s), b, sw, st);
                 }
             }
             Icon::ChevronDown => {
-                let geo = path(g, p(7.0, 10.0), false, |k| {
+                let geo = path(p(7.0, 10.0), false, |k| {
                     line_to(k, p(12.0, 15.0));
                     line_to(k, p(17.0, 10.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Repeat => {
-                let geo = path(g, p(5.0, 11.0), false, |k| {
+                let geo = path(p(5.0, 11.0), false, |k| {
                     line_to(k, p(5.0, 9.0));
                     arc_to(k, p(8.0, 6.0), 3.0 * s, false, true);
                     line_to(k, p(19.0, 6.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((16.0, 3.0), (19.0, 6.0));
-                line((16.0, 9.0), (19.0, 6.0));
-                let geo = path(g, p(19.0, 13.0), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (16.0, 3.0), (19.0, 6.0));
+                line(cv, (16.0, 9.0), (19.0, 6.0));
+                let geo = path(p(19.0, 13.0), false, |k| {
                     line_to(k, p(19.0, 15.0));
                     arc_to(k, p(16.0, 18.0), 3.0 * s, false, true);
                     line_to(k, p(5.0, 18.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((8.0, 15.0), (5.0, 18.0));
-                line((8.0, 21.0), (5.0, 18.0));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (8.0, 15.0), (5.0, 18.0));
+                line(cv, (8.0, 21.0), (5.0, 18.0));
             }
             Icon::Link => {
                 let r1 = rrect(
@@ -612,103 +673,103 @@ pub fn draw_icon(
                     p(21.0, 15.0).Y,
                     3.0 * s,
                 );
-                dc.DrawRoundedRectangle(&r1, b, sw, &st);
-                dc.DrawRoundedRectangle(&r2, b, sw, &st);
+                cv.stroke_rrect(&r1, b, sw, st);
+                cv.stroke_rrect(&r2, b, sw, st);
             }
             Icon::CloudOff => {
-                let geo = path(g, p(7.0, 18.0), false, |k| {
+                let geo = path(p(7.0, 18.0), false, |k| {
                     arc_to(k, p(7.0, 11.0), 3.5 * s, false, true);
                     arc_to(k, p(17.0, 10.0), 5.2 * s, false, true);
                     arc_to(k, p(17.0, 18.0), 4.0 * s, false, true);
                     line_to(k, p(7.0, 18.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((4.0, 4.0), (20.0, 20.0));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (4.0, 4.0), (20.0, 20.0));
             }
             Icon::Video => {
                 let (a, c) = (p(2.0, 6.0), p(16.0, 18.0));
-                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, c.X, c.Y, 2.0 * s), b, sw, &st);
-                let geo = path(g, p(16.0, 10.5), false, |k| {
+                cv.stroke_rrect(&rrect(a.X, a.Y, c.X, c.Y, 2.0 * s), b, sw, st);
+                let geo = path(p(16.0, 10.5), false, |k| {
                     line_to(k, p(21.5, 7.5));
                     line_to(k, p(21.5, 16.5));
                     line_to(k, p(16.0, 13.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Film => {
                 let (a, c) = (p(3.0, 5.0), p(21.0, 19.0));
-                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, c.X, c.Y, 3.0 * s), b, sw, &st);
-                let geo = path(g, p(10.0, 9.0), false, |k| {
+                cv.stroke_rrect(&rrect(a.X, a.Y, c.X, c.Y, 3.0 * s), b, sw, st);
+                let geo = path(p(10.0, 9.0), false, |k| {
                     line_to(k, p(15.0, 12.0));
                     line_to(k, p(10.0, 15.0));
                     line_to(k, p(10.0, 9.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Music => {
-                let geo = path(g, p(9.0, 18.0), false, |k| {
+                let geo = path(p(9.0, 18.0), false, |k| {
                     line_to(k, p(9.0, 5.0));
                     line_to(k, p(20.0, 3.0));
                     line_to(k, p(20.0, 16.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
                 for (x, y) in [(6.0, 18.0), (17.0, 16.0)] {
                     let q = p(x, y);
-                    dc.DrawEllipse(&ellipse(q.X, q.Y, 3.0 * s), b, sw, &st);
+                    cv.stroke_ellipse(&ellipse(q.X, q.Y, 3.0 * s), b, sw, st);
                 }
             }
             Icon::Download => {
-                line((12.0, 4.0), (12.0, 15.0));
-                let geo = path(g, p(7.0, 10.5), false, |k| {
+                line(cv, (12.0, 4.0), (12.0, 15.0));
+                let geo = path(p(7.0, 10.5), false, |k| {
                     line_to(k, p(12.0, 15.5));
                     line_to(k, p(17.0, 10.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((5.0, 20.0), (19.0, 20.0));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (5.0, 20.0), (19.0, 20.0));
             }
             Icon::Tick => {
-                let geo = path(g, p(5.0, 12.5), false, |k| {
+                let geo = path(p(5.0, 12.5), false, |k| {
                     line_to(k, p(10.0, 17.0));
                     line_to(k, p(19.0, 7.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Alert => {
-                dc.DrawEllipse(&ellipse(cx, cy, 9.0 * s), b, sw, &st);
-                line((12.0, 7.5), (12.0, 12.8));
+                cv.stroke_ellipse(&ellipse(cx, cy, 9.0 * s), b, sw, st);
+                line(cv, (12.0, 7.5), (12.0, 12.8));
                 let q = p(12.0, 16.2);
-                dc.FillEllipse(&ellipse(q.X, q.Y, 1.2 * s), b);
+                cv.fill_ellipse(&ellipse(q.X, q.Y, 1.2 * s), b);
             }
             Icon::Trash => {
-                line((4.0, 6.5), (20.0, 6.5));
-                let geo = path(g, p(9.0, 6.5), false, |k| {
+                line(cv, (4.0, 6.5), (20.0, 6.5));
+                let geo = path(p(9.0, 6.5), false, |k| {
                     line_to(k, p(9.0, 4.0));
                     line_to(k, p(15.0, 4.0));
                     line_to(k, p(15.0, 6.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                let geo = path(g, p(6.0, 6.5), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                let geo = path(p(6.0, 6.5), false, |k| {
                     line_to(k, p(7.0, 20.0));
                     line_to(k, p(17.0, 20.0));
                     line_to(k, p(18.0, 6.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((10.0, 10.5), (10.0, 16.0));
-                line((14.0, 10.5), (14.0, 16.0));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (10.0, 10.5), (10.0, 16.0));
+                line(cv, (14.0, 10.5), (14.0, 16.0));
             }
             Icon::Refresh => {
-                let geo = path(g, p(19.5, 12.0), false, |k| {
+                let geo = path(p(19.5, 12.0), false, |k| {
                     arc_to(k, p(7.0, 6.4), 7.5 * s, true, true)
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                let geo = path(g, p(6.5, 3.0), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                let geo = path(p(6.5, 3.0), false, |k| {
                     line_to(k, p(6.5, 7.0));
                     line_to(k, p(10.5, 7.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Shield => {
-                let geo = path(g, p(12.0, 3.0), false, |k| {
+                let geo = path(p(12.0, 3.0), false, |k| {
                     line_to(k, p(19.0, 6.0));
                     line_to(k, p(19.0, 11.0));
                     quad_to(k, p(19.0, 18.0), p(12.0, 21.0));
@@ -716,14 +777,14 @@ pub fn draw_icon(
                     line_to(k, p(5.0, 6.0));
                     line_to(k, p(12.0, 3.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Sliders => {
                 for (x, knob) in [(6.0, 15.0), (12.0, 8.0), (18.0, 13.0)] {
-                    line((x, 4.0), (x, knob - 2.0));
-                    line((x, knob + 2.0), (x, 20.0));
-                    line((x - 2.5, knob - 2.0), (x + 2.5, knob - 2.0));
-                    line((x - 2.5, knob + 2.0), (x + 2.5, knob + 2.0));
+                    line(cv, (x, 4.0), (x, knob - 2.0));
+                    line(cv, (x, knob + 2.0), (x, 20.0));
+                    line(cv, (x - 2.5, knob - 2.0), (x + 2.5, knob - 2.0));
+                    line(cv, (x - 2.5, knob + 2.0), (x + 2.5, knob + 2.0));
                 }
             }
             Icon::Gear => {
@@ -743,129 +804,129 @@ pub fn draw_icon(
                         (12.0 + r * t.sin(), 12.0 - r * t.cos())
                     })
                     .collect();
-                let geo = path(g, p(pts[0].0, pts[0].1), false, |k| {
+                let geo = path(p(pts[0].0, pts[0].1), false, |k| {
                     for &(x, y) in pts.iter().skip(1) {
                         line_to(k, p(x, y));
                     }
                     line_to(k, p(pts[0].0, pts[0].1));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                dc.DrawEllipse(&ellipse(cx, cy, 3.0 * s), b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
+                cv.stroke_ellipse(&ellipse(cx, cy, 3.0 * s), b, sw, st);
             }
             Icon::Layers => {
-                let geo = path(g, p(12.0, 3.5), false, |k| {
+                let geo = path(p(12.0, 3.5), false, |k| {
                     line_to(k, p(21.0, 8.0));
                     line_to(k, p(12.0, 12.5));
                     line_to(k, p(3.0, 8.0));
                     line_to(k, p(12.0, 3.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
                 for y in [12.5, 16.5] {
-                    let geo = path(g, p(3.0, y), false, |k| {
+                    let geo = path(p(3.0, y), false, |k| {
                         line_to(k, p(12.0, y + 4.5));
                         line_to(k, p(21.0, y));
                     });
-                    dc.DrawGeometry(&geo, b, sw, &st);
+                    cv.stroke_path(&geo, b, sw, st);
                 }
             }
             Icon::Globe => {
-                dc.DrawEllipse(&ellipse(cx, cy, 9.0 * s), b, sw, &st);
-                dc.DrawEllipse(
-                    &D2D1_ELLIPSE {
+                cv.stroke_ellipse(&ellipse(cx, cy, 9.0 * s), b, sw, st);
+                cv.stroke_ellipse(
+                    &Ellipse {
                         point: pt(cx, cy),
-                        radiusX: 3.8 * s,
-                        radiusY: 9.0 * s,
+                        rx: 3.8 * s,
+                        ry: 9.0 * s,
                     },
                     b,
                     sw,
-                    &st,
+                    st,
                 );
-                line((3.0, 12.0), (21.0, 12.0));
+                line(cv, (3.0, 12.0), (21.0, 12.0));
             }
             Icon::Archive => {
                 let (a, c) = (p(3.0, 4.5), p(21.0, 9.0));
-                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, c.X, c.Y, 1.5 * s), b, sw, &st);
-                let geo = path(g, p(5.0, 9.0), false, |k| {
+                cv.stroke_rrect(&rrect(a.X, a.Y, c.X, c.Y, 1.5 * s), b, sw, st);
+                let geo = path(p(5.0, 9.0), false, |k| {
                     line_to(k, p(5.0, 19.5));
                     line_to(k, p(19.0, 19.5));
                     line_to(k, p(19.0, 9.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((10.0, 13.0), (14.0, 13.0));
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (10.0, 13.0), (14.0, 13.0));
             }
             Icon::File => {
-                let geo = path(g, p(6.0, 3.0), false, |k| {
+                let geo = path(p(6.0, 3.0), false, |k| {
                     line_to(k, p(14.0, 3.0));
                     line_to(k, p(19.0, 8.0));
                     line_to(k, p(19.0, 21.0));
                     line_to(k, p(6.0, 21.0));
                     line_to(k, p(6.0, 3.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                let geo = path(g, p(14.0, 3.0), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                let geo = path(p(14.0, 3.0), false, |k| {
                     line_to(k, p(14.0, 8.0));
                     line_to(k, p(19.0, 8.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::External => {
-                let geo = path(g, p(11.0, 5.0), false, |k| {
+                let geo = path(p(11.0, 5.0), false, |k| {
                     line_to(k, p(5.0, 5.0));
                     line_to(k, p(5.0, 19.0));
                     line_to(k, p(19.0, 19.0));
                     line_to(k, p(19.0, 13.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                line((11.0, 13.0), (20.0, 4.0));
-                let geo = path(g, p(14.5, 4.0), false, |k| {
+                cv.stroke_path(&geo, b, sw, st);
+                line(cv, (11.0, 13.0), (20.0, 4.0));
+                let geo = path(p(14.5, 4.0), false, |k| {
                     line_to(k, p(20.0, 4.0));
                     line_to(k, p(20.0, 9.5));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::ArrowLeft => {
-                line((19.0, 12.0), (5.0, 12.0));
-                let geo = path(g, p(11.0, 6.0), false, |k| {
+                line(cv, (19.0, 12.0), (5.0, 12.0));
+                let geo = path(p(11.0, 6.0), false, |k| {
                     line_to(k, p(5.0, 12.0));
                     line_to(k, p(11.0, 18.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
+                cv.stroke_path(&geo, b, sw, st);
             }
             Icon::Search => {
                 let c0 = p(10.5, 10.5);
-                dc.DrawEllipse(&ellipse(c0.X, c0.Y, 6.0 * s), b, sw, &st);
-                line((15.0, 15.0), (20.0, 20.0));
+                cv.stroke_ellipse(&ellipse(c0.X, c0.Y, 6.0 * s), b, sw, st);
+                line(cv, (15.0, 15.0), (20.0, 20.0));
             }
             Icon::Pin => {
-                let geo = path(g, p(12.0, 21.0), false, |k| {
+                let geo = path(p(12.0, 21.0), false, |k| {
                     quad_to(k, p(5.0, 14.0), p(5.0, 10.0));
                     arc_to(k, p(19.0, 10.0), 7.0 * s, false, true);
                     quad_to(k, p(19.0, 14.0), p(12.0, 21.0));
                 });
-                dc.DrawGeometry(&geo, b, sw, &st);
-                dc.DrawEllipse(
+                cv.stroke_path(&geo, b, sw, st);
+                cv.stroke_ellipse(
                     &ellipse(p(12.0, 10.0).X, p(12.0, 10.0).Y, 2.5 * s),
                     b,
                     sw,
-                    &st,
+                    st,
                 );
             }
             Icon::Keyboard => {
                 let (a, c) = (p(2.5, 6.0), p(21.5, 18.0));
-                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, c.X, c.Y, 2.5 * s), b, sw, &st);
+                cv.stroke_rrect(&rrect(a.X, a.Y, c.X, c.Y, 2.5 * s), b, sw, st);
                 for (x, y) in [(7.0, 10.0), (10.5, 10.0), (14.0, 10.0), (17.5, 10.0)] {
                     let q = p(x, y);
-                    dc.FillEllipse(&ellipse(q.X, q.Y, 0.9 * s), b);
+                    cv.fill_ellipse(&ellipse(q.X, q.Y, 0.9 * s), b);
                 }
-                line((8.0, 14.5), (16.0, 14.5));
+                line(cv, (8.0, 14.5), (16.0, 14.5));
             }
             Icon::Drive | Icon::HardDrive => {
                 let (a, c) = (p(3.0, 6.0), p(21.0, 18.0));
-                dc.DrawRoundedRectangle(&rrect(a.X, a.Y, c.X, c.Y, 3.0 * s), b, sw, &st);
-                line((3.0, 12.5), (21.0, 12.5));
+                cv.stroke_rrect(&rrect(a.X, a.Y, c.X, c.Y, 3.0 * s), b, sw, st);
+                line(cv, (3.0, 12.5), (21.0, 12.5));
                 for x in [7.0, 10.5] {
                     let q = p(x, 15.3);
-                    dc.FillEllipse(&ellipse(q.X, q.Y, 1.1 * s), b);
+                    cv.fill_ellipse(&ellipse(q.X, q.Y, 1.1 * s), b);
                 }
             }
         }
@@ -941,23 +1002,23 @@ pub struct PillLayout {
 pub const PILL_H: f32 = 48.0;
 pub const PILL_PAD: f32 = 4.0; // window margin around the pill
 
-pub fn layout_pill(g: &Shared, f: &Fonts, p: &Pill) -> PillLayout {
+pub fn layout_pill(f: &Fonts, p: &Pill) -> PillLayout {
     let mut l = PillLayout::default();
     let mut x = 6.0 + 36.0 + 10.0;
     l.title_x = x;
-    l.title_w = g.text_width(&p.title, &f.title);
+    l.title_w = text_width(&p.title, &f.title);
     x += l.title_w;
     if !p.value.is_empty() {
         x += 4.0;
         l.value_x = x;
-        l.value_w = g.text_width(&p.value, &f.body);
+        l.value_w = text_width(&p.value, &f.body);
         x += l.value_w;
     }
     let mut last_is_text = true;
     if let Some((label, a)) = &p.action {
         x += 10.0;
         let bw =
-            g.text_width(label, &f.title) + 24.0 + if a.has_menu() { CHEVRON_W - 6.0 } else { 0.0 };
+            text_width(label, &f.title) + 24.0 + if a.has_menu() { CHEVRON_W - 6.0 } else { 0.0 };
         l.action = Some((x, bw));
         x += bw;
         last_is_text = false;
@@ -1008,8 +1069,7 @@ pub fn hit_pill(l: &PillLayout, menu: bool, x: f32, y: f32) -> PillPart {
 /// `reveal` 0..1 grows the pill out of the drop. `grow_left` = the orb is on the right. The
 /// pill's full shape has its top left at (`ox`, `oy`).
 pub fn draw_pill(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     p: &Pill,
@@ -1029,9 +1089,9 @@ pub fn draw_pill(
     };
     let top = oy;
     let ca = ((r - 0.55) / 0.4).clamp(0.0, 1.0); // content fades in late
-    unsafe {
+    {
         let shape = rrect(left, top, right, top + PILL_H, PILL_H / 2.0);
-        dc.FillRoundedRectangle(&shape, &brush(dc, t.surface));
+        cv.fill_rrect(&shape, t.surface);
         let hair = rrect(
             left + 0.5,
             top + 0.5,
@@ -1039,70 +1099,57 @@ pub fn draw_pill(
             top + PILL_H - 0.5,
             PILL_H / 2.0 - 0.5,
         );
-        dc.DrawRoundedRectangle(&hair, &brush(dc, t.hair), 1.0, None);
-        crate::depth::lip(g, dc, t, left, top, right, top + PILL_H, PILL_H / 2.0, 1.0);
+        cv.stroke_rrect(&hair, t.hair, 1.0, Stroke::Plain);
+        lip(cv, t, left, top, right, top + PILL_H, PILL_H / 2.0, 1.0);
         if ca <= 0.0 {
             return;
         }
-        dc.PushAxisAlignedClip(
-            &D2D_RECT_F {
-                left,
-                top,
-                right,
-                bottom: top + PILL_H,
-            },
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        );
+        cv.push_clip(left, top, right, top + PILL_H);
         // Content sits at its final place; while growing it is clipped by the shape.
         let cy = top + PILL_H / 2.0;
         let chip = ellipse(ox + 6.0 + 18.0, cy, 18.0);
         let ember = p.icon.is_ember();
-        dc.FillEllipse(
+        cv.fill_ellipse(
             &chip,
-            &brush(
-                dc,
-                with_alpha(
-                    if ember {
-                        with_alpha(t.ember, 0.14)
-                    } else {
-                        t.chip
-                    },
-                    ca,
-                ),
+            with_alpha(
+                if ember {
+                    with_alpha(t.ember, 0.14)
+                } else {
+                    t.chip
+                },
+                ca,
             ),
         );
-        let ink = brush(dc, with_alpha(t.text, ca));
+        let ink = with_alpha(t.text, ca);
         if p.dot {
-            dc.FillEllipse(&ellipse(chip.point.X, cy, 5.0), &ink);
+            cv.fill_ellipse(&ellipse(chip.point.X, cy, 5.0), ink);
         } else {
             let icon_c = if ember {
-                brush(dc, with_alpha(t.ember, ca))
+                with_alpha(t.ember, ca)
             } else {
-                ink.clone()
+                ink
             };
-            draw_icon(g, dc, p.icon, chip.point.X, cy, 16.0, &icon_c);
+            paint_icon(cv, p.icon, chip.point.X, cy, 16.0, icon_c);
         }
-        text(
-            dc,
+        cv.text(
             &p.title,
             &f.title,
             ox + l.title_x,
             top,
             l.title_w + 2.0,
             PILL_H,
-            &ink,
+            ink,
         );
         if !p.value.is_empty() {
-            let muted = brush(dc, with_alpha(t.muted, ca));
-            text(
-                dc,
+            let muted = with_alpha(t.muted, ca);
+            cv.text(
                 &p.value,
                 &f.body,
                 ox + l.value_x,
                 top,
                 l.value_w + 2.0,
                 PILL_H,
-                &muted,
+                muted,
             );
         }
         if let (Some((label, a)), Some((ax, aw))) = (&p.action, l.action) {
@@ -1111,13 +1158,12 @@ pub fn draw_pill(
             } else {
                 t.button
             };
-            dc.FillRoundedRectangle(
+            cv.fill_rrect(
                 &rrect(ox + ax, top + 8.0, ox + ax + aw, top + 40.0, 16.0),
-                &brush(dc, with_alpha(bg, ca)),
+                with_alpha(bg, ca),
             );
-            crate::depth::lip(
-                g,
-                dc,
+            lip(
+                cv,
                 t,
                 ox + ax,
                 top + 8.0,
@@ -1126,54 +1172,41 @@ pub fn draw_pill(
                 16.0,
                 ca,
             );
-            text(
-                dc,
-                label,
-                &f.title,
-                ox + ax + 12.0,
-                top,
-                aw - 12.0,
-                PILL_H,
-                &ink,
-            );
+            cv.text(label, &f.title, ox + ax + 12.0, top, aw - 12.0, PILL_H, ink);
             if a.has_menu() {
                 // The split: a hairline, then the chevron for the format menu.
                 let sx = ox + ax + aw - CHEVRON_W;
                 if hover == PillPart::Menu {
-                    dc.FillRoundedRectangle(
+                    cv.fill_rrect(
                         &rrect(sx, top + 8.0, ox + ax + aw, top + 40.0, 16.0),
-                        &brush(dc, with_alpha(t.button_hover, ca)),
+                        with_alpha(t.button_hover, ca),
                     );
                 }
-                dc.DrawLine(
+                cv.line(
                     pt(sx, top + 15.0),
                     pt(sx, top + 33.0),
-                    &brush(dc, with_alpha(t.hair, ca)),
+                    with_alpha(t.hair, ca),
                     1.0,
-                    None,
+                    Stroke::Plain,
                 );
-                draw_icon(
-                    g,
-                    dc,
+                paint_icon(
+                    cv,
                     Icon::ChevronDown,
                     sx + CHEVRON_W / 2.0 - 1.0,
                     cy,
                     14.0,
-                    &ink,
+                    ink,
                 );
             }
         }
         if let Some(cx) = l.close {
             if hover == PillPart::Close {
-                dc.FillEllipse(
-                    &ellipse(ox + cx + 14.0, cy, 14.0),
-                    &brush(dc, with_alpha(t.button, ca)),
-                );
+                cv.fill_ellipse(&ellipse(ox + cx + 14.0, cy, 14.0), with_alpha(t.button, ca));
             }
-            let m = brush(dc, with_alpha(t.muted, ca));
-            draw_icon(g, dc, Icon::Close, ox + cx + 14.0, cy, 14.0, &m);
+            let m = with_alpha(t.muted, ca);
+            paint_icon(cv, Icon::Close, ox + cx + 14.0, cy, 14.0, m);
         }
-        dc.PopAxisAlignedClip();
+        cv.pop_clip();
     }
 }
 
@@ -1328,8 +1361,7 @@ pub fn aim_child(dx: f32, dy: f32, mirrored: bool, parent: usize, n: usize) -> O
 
 /// A two-tone label pill: the noun in text colour 500, the value muted. Sits beside `c`.
 fn label_pill(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     name: &str,
@@ -1342,12 +1374,12 @@ fn label_pill(
     let name_w = if name.is_empty() {
         0.0
     } else {
-        g.text_width(name, &f.title)
+        text_width(name, &f.title)
     };
     let val_w = if value.is_empty() {
         0.0
     } else {
-        g.text_width(value, &f.body)
+        text_width(value, &f.body)
     };
     let gap = if name_w > 0.0 && val_w > 0.0 {
         5.0
@@ -1362,48 +1394,42 @@ fn label_pill(
         (c.X - off - tw, c.X - off)
     };
     let tt = c.Y - th / 2.0;
-    unsafe {
-        dc.FillRoundedRectangle(
-            &rrect(tl, tt, tr, tt + th, th / 2.0),
-            &brush(dc, with_alpha(t.band, e)),
-        );
-        dc.DrawRoundedRectangle(
+    {
+        cv.fill_rrect(&rrect(tl, tt, tr, tt + th, th / 2.0), with_alpha(t.band, e));
+        cv.stroke_rrect(
             &rrect(tl + 0.5, tt + 0.5, tr - 0.5, tt + th - 0.5, th / 2.0 - 0.5),
-            &brush(dc, with_alpha(t.hair, e)),
+            with_alpha(t.hair, e),
             1.0,
-            None,
+            Stroke::Plain,
         );
     }
     let x = tl + 11.0;
     if name_w > 0.0 {
-        text(
-            dc,
+        cv.text(
             name,
             &f.title,
             x,
             tt,
             name_w + 2.0,
             th,
-            &brush(dc, with_alpha(t.text, e)),
+            with_alpha(t.text, e),
         );
     }
     if val_w > 0.0 {
-        text(
-            dc,
+        cv.text(
             value,
             &f.body,
             x + name_w + gap,
             tt,
             val_w + 2.0,
             th,
-            &brush(dc, with_alpha(t.muted, e)),
+            with_alpha(t.muted, e),
         );
     }
 }
 
 pub fn draw_dial(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     items: &[DialItem],
@@ -1421,8 +1447,8 @@ pub fn draw_dial(
         return;
     }
     let band_a = rv.min(1.0);
-    let st = round_stroke(g);
-    unsafe {
+    let st = Stroke::Round;
+    {
         // The band: a thick half-ring stroke with round ends, opening away from the edge.
         let (a0, a1) = if mirrored {
             (5.0, 175.0)
@@ -1432,14 +1458,9 @@ pub fn draw_dial(
         let r = DIAL_R * (0.82 + 0.18 * rv.min(1.0));
         let start = polar(cx, cy, r, a0);
         let end = polar(cx, cy, r, a1);
-        let geo = path(g, start, false, |k| arc_to(k, end, r, false, true));
-        dc.DrawGeometry(
-            &geo,
-            &brush(dc, with_alpha(t.hair, band_a)),
-            DIAL_BAND + 1.5,
-            &st,
-        );
-        dc.DrawGeometry(&geo, &brush(dc, with_alpha(t.band, band_a)), DIAL_BAND, &st);
+        let geo = path(start, false, |k| arc_to(k, end, r, false, true));
+        cv.stroke_path(&geo, with_alpha(t.hair, band_a), DIAL_BAND + 1.5, st);
+        cv.stroke_path(&geo, with_alpha(t.band, band_a), DIAL_BAND, st);
 
         for (i, it) in items.iter().enumerate() {
             // Chips ripple in from the middle out, 30 ms apart.
@@ -1451,50 +1472,31 @@ pub fn draw_dial(
             let c = polar(cx, cy, r, item_angle(i, mirrored));
             let on = aimed == Some(i);
             let chip_bg = if on { t.text } else { t.chip };
-            dc.FillEllipse(
+            cv.fill_ellipse(
                 &ellipse(c.X, c.Y, DIAL_CHIP * (0.7 + 0.3 * e)),
-                &brush(dc, with_alpha(chip_bg, e)),
+                with_alpha(chip_bg, e),
             );
             if on && keyboard {
-                dc.DrawEllipse(
+                cv.stroke_ellipse(
                     &ellipse(c.X, c.Y, DIAL_CHIP + 3.0),
-                    &brush(dc, with_alpha(t.text, e)),
+                    with_alpha(t.text, e),
                     2.0,
-                    None,
+                    Stroke::Plain,
                 );
             }
             // A running focus draws its ring around the Focus chip too: dotted ahead, solid spent.
             if let (Some(p), Icon::Focus) = (focus_ring, it.icon) {
                 let rr = DIAL_CHIP + 3.5;
-                dc.DrawEllipse(
+                cv.stroke_ellipse(
                     &ellipse(c.X, c.Y, rr),
-                    &brush(dc, with_alpha(t.track, e)),
+                    with_alpha(t.track, e),
                     1.5,
-                    &dotted_stroke(g),
+                    Stroke::Dotted,
                 );
-                draw_arc(
-                    g,
-                    dc,
-                    c.X,
-                    c.Y,
-                    rr,
-                    0.0,
-                    360.0 * p,
-                    &brush(dc, with_alpha(t.text, e)),
-                    2.0,
-                    &st,
-                );
+                cv.arc(c.X, c.Y, rr, 0.0, 360.0 * p, with_alpha(t.text, e), 2.0, st);
             }
             let icon_c = if on { t.band } else { t.text };
-            draw_icon(
-                g,
-                dc,
-                it.icon,
-                c.X,
-                c.Y,
-                16.0,
-                &brush(dc, with_alpha(icon_c, e)),
-            );
+            paint_icon(cv, it.icon, c.X, c.Y, 16.0, with_alpha(icon_c, e));
 
             // Tag outside the band: the live value, or the name and value when aimed.
             // While a branch parent is aimed or open the main tags step aside for it.
@@ -1508,14 +1510,14 @@ pub fn draw_dial(
                 continue;
             }
             let name_w = if show_name {
-                g.text_width(it.name, &f.small_medium)
+                text_width(it.name, &f.small_medium)
             } else {
                 0.0
             };
             let val_w = if it.value.is_empty() {
                 0.0
             } else {
-                g.text_width(&it.value, &f.small)
+                text_width(&it.value, &f.small)
             };
             let gap = if show_name && val_w > 0.0 { 4.0 } else { 0.0 };
             let tw = name_w + gap + val_w + 20.0;
@@ -1526,40 +1528,35 @@ pub fn draw_dial(
                 (c.X - 32.0 - tw, c.X - 32.0)
             };
             let tt = c.Y - th / 2.0;
-            dc.FillRoundedRectangle(
-                &rrect(tl, tt, tr, tt + th, th / 2.0),
-                &brush(dc, with_alpha(t.band, e)),
-            );
-            dc.DrawRoundedRectangle(
+            cv.fill_rrect(&rrect(tl, tt, tr, tt + th, th / 2.0), with_alpha(t.band, e));
+            cv.stroke_rrect(
                 &rrect(tl + 0.5, tt + 0.5, tr - 0.5, tt + th - 0.5, th / 2.0 - 0.5),
-                &brush(dc, with_alpha(t.hair, e)),
+                with_alpha(t.hair, e),
                 1.0,
-                None,
+                Stroke::Plain,
             );
             let mut x = tl + 10.0;
             if show_name {
-                text(
-                    dc,
+                cv.text(
                     it.name,
                     &f.small_medium,
                     x,
                     tt,
                     name_w + 2.0,
                     th,
-                    &brush(dc, with_alpha(t.text, e)),
+                    with_alpha(t.text, e),
                 );
                 x += name_w + gap;
             }
             if val_w > 0.0 {
-                text(
-                    dc,
+                cv.text(
                     &it.value,
                     &f.small,
                     x,
                     tt,
                     val_w + 2.0,
                     th,
-                    &brush(dc, with_alpha(t.muted, e)),
+                    with_alpha(t.muted, e),
                 );
             }
         }
@@ -1577,44 +1574,38 @@ pub fn draw_dial(
     let pad = 12.0 * BRANCH_R / branch_geom(b.children.len()).0;
     let lo = angles.iter().copied().fold(f32::MAX, f32::min) - pad;
     let hi = angles.iter().copied().fold(f32::MIN, f32::max) + pad;
-    unsafe {
-        let geo = path(g, polar(cx, cy, br, lo), false, |k| {
+    {
+        let geo = path(polar(cx, cy, br, lo), false, |k| {
             arc_to(k, polar(cx, cy, br, hi), br, false, true)
         });
-        dc.DrawGeometry(
-            &geo,
-            &brush(dc, with_alpha(t.hair, e)),
-            BRANCH_BAND + 1.5,
-            &st,
-        );
-        dc.DrawGeometry(&geo, &brush(dc, with_alpha(t.band, e)), BRANCH_BAND, &st);
+        cv.stroke_path(&geo, with_alpha(t.hair, e), BRANCH_BAND + 1.5, st);
+        cv.stroke_path(&geo, with_alpha(t.band, e), BRANCH_BAND, st);
         for (j, ch) in b.children.iter().enumerate() {
             let c = polar(cx, cy, br, angles[j]);
             let on = b.aimed == Some(j);
-            dc.FillEllipse(
+            cv.fill_ellipse(
                 &ellipse(c.X, c.Y, CHILD_CHIP * (0.7 + 0.3 * e)),
-                &brush(dc, with_alpha(if on { t.text } else { t.chip }, e)),
+                with_alpha(if on { t.text } else { t.chip }, e),
             );
             if on && keyboard {
-                dc.DrawEllipse(
+                cv.stroke_ellipse(
                     &ellipse(c.X, c.Y, CHILD_CHIP + 3.0),
-                    &brush(dc, with_alpha(t.text, e)),
+                    with_alpha(t.text, e),
                     2.0,
-                    None,
+                    Stroke::Plain,
                 );
             }
-            let ink = brush(dc, with_alpha(if on { t.band } else { t.text }, e));
+            let ink = with_alpha(if on { t.band } else { t.text }, e);
             match ch.icon {
-                Some(icon) => draw_icon(g, dc, icon, c.X, c.Y, 15.0, &ink),
-                None => center_text(g, dc, &ch.text, &f.title, c.X, c.Y - 10.0, 20.0, &ink),
+                Some(icon) => paint_icon(cv, icon, c.X, c.Y, 15.0, ink),
+                None => cv.center_text(&ch.text, &f.title, c.X, c.Y - 10.0, 20.0, ink),
             }
         }
         if let Some(j) = b.aimed {
             let ch = &b.children[j];
             let c = polar(cx, cy, br, angles[j]);
             label_pill(
-                g,
-                dc,
+                cv,
                 t,
                 f,
                 &ch.name,

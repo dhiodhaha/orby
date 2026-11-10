@@ -7,7 +7,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use app_core::prayer as pr;
 
-use crate::gfx::Surface;
+use crate::gfx::{self, Surface};
 use crate::orb::{arm_tuck_timer, orb_center, set_tucked, set_visible, Side};
 use crate::panels::{self, Kind};
 use crate::pill::dismiss_pill;
@@ -169,8 +169,7 @@ fn render_dial(app: &mut App) {
     };
     let dc = s.begin(&app.g);
     ui::draw_dial(
-        &app.g,
-        dc,
+        &mut gfx::D2dCanvas::new(&app.g, dc),
         &app.theme,
         &app.fonts,
         &items,

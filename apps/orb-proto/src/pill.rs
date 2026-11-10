@@ -310,8 +310,7 @@ pub(crate) fn render_pill(app: &mut App) {
                 _ => PillPart::None,
             };
             ui::draw_pill(
-                &app.g,
-                dc,
+                &mut gfx::D2dCanvas::new(&app.g, dc),
                 t,
                 &app.fonts,
                 ip,
@@ -381,8 +380,7 @@ pub(crate) fn render_pill(app: &mut App) {
         _ => PillPart::None,
     };
     ui::draw_pill(
-        &app.g,
-        dc,
+        &mut gfx::D2dCanvas::new(&app.g, dc),
         t,
         &app.fonts,
         &p,
@@ -460,7 +458,7 @@ pub fn update_pill(app: &mut App, p: Pill) {
 }
 
 fn put_pill(app: &mut App, p: Pill) {
-    app.pill_layout = ui::layout_pill(&app.g, &app.fonts, &p);
+    app.pill_layout = ui::layout_pill(&app.fonts, &p);
     let ttl = p.ttl_ms;
     app.pill = Some(p);
     place_pill(app);
@@ -525,7 +523,7 @@ fn fill_items(app: &mut App) {
         .collect();
     app.stack.items = items
         .into_iter()
-        .map(|(id, p)| (id, ui::layout_pill(&app.g, &app.fonts, &p), p))
+        .map(|(id, p)| (id, ui::layout_pill(&app.fonts, &p), p))
         .map(|(id, l, p)| (id, p, l))
         .collect();
 }

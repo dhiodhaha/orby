@@ -18,11 +18,16 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct2D::Common::*;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct2D::*;
+#[cfg(windows)]
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 
-use crate::gfx::{text, Shared};
+use crate::canvas::{line_height, text_width, Canvas, Color, Font};
+#[cfg(windows)]
+use crate::gfx::{D2dCanvas, Shared};
 
 thread_local! {
     /// The last moment any motion still moves.
@@ -52,8 +57,14 @@ pub fn active() -> bool {
     })
 }
 
+#[cfg(windows)]
 fn reduced() -> bool {
     crate::downloads::reduced_motion()
+}
+
+#[cfg(target_os = "macos")]
+fn reduced() -> bool {
+    crate::mac::reduced_motion()
 }
 
 // ---- the critically damped spring ----
@@ -155,6 +166,8 @@ fn digits_value(s: &str) -> u64 {
 /// `gfx::text`. `key` names this number (one per place on screen, e.g. "drink.total"); when
 /// `value` differs from what that key showed last, its changed digits roll to the new ones.
 /// Non-digits (units, separators) never roll. Tabular figures keep every digit the same width.
+/// `roll_text` on a Direct2D context, for the panels that still draw with Direct2D.
+#[cfg(windows)]
 pub fn rolling_text(
     g: &Shared,
     dc: &ID2D1DeviceContext,
@@ -166,6 +179,31 @@ pub fn rolling_text(
     y: f32,
     h: f32,
     b: &ID2D1SolidColorBrush,
+) {
+    let c = unsafe { b.GetColor() };
+    roll_text(
+        &mut D2dCanvas::new(g, dc),
+        key,
+        value,
+        kind,
+        fmt,
+        x,
+        y,
+        h,
+        c,
+    );
+}
+
+pub fn roll_text(
+    cv: &mut dyn Canvas,
+    key: &'static str,
+    value: &str,
+    kind: Roll,
+    fmt: &Font,
+    x: f32,
+    y: f32,
+    h: f32,
+    c: Color,
 ) {
     let (from, p) = ROLLS.with(|r| {
         let mut r = r.borrow_mut();
@@ -189,39 +227,31 @@ pub fn rolling_text(
         (st.from.clone(), st.progress())
     });
     if p >= 1.0 {
-        text(dc, value, fmt, x, y, g.text_width(value, fmt) + 2.0, h, b);
+        cv.text(value, fmt, x, y, text_width(value, fmt) + 2.0, h, c);
         return;
     }
     let up = digits_value(value) >= digits_value(&from);
     let cols = columns(&from, value, up);
     // One line's height: digits travel a full line per step.
-    let line = g
-        .layout("0", fmt, 100.0, 100.0)
-        .map(|l| unsafe {
-            let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
-            let _ = l.GetMetrics(&mut m);
-            m.height
-        })
-        .unwrap_or(h);
+    let line = line_height(fmt);
     let chars: Vec<char> = value.chars().collect();
     let mut cx = x;
-    for (i, c) in chars.iter().enumerate() {
-        let s = c.to_string();
-        let cw = g.text_width(&s, fmt);
+    for (i, ch) in chars.iter().enumerate() {
+        let s = ch.to_string();
+        let cw = text_width(&s, fmt);
         match cols[i] {
-            None => text(dc, &s, fmt, cx, y, cw + 2.0, h, b),
-            Some((old, steps)) => unsafe {
+            None => cv.text(&s, fmt, cx, y, cw + 2.0, h, c),
+            Some((old, steps)) => {
                 // The column's position in digits, and the two digits in view.
                 let pos = steps as f32 * p;
                 let base = pos.floor();
                 let frac = pos - base;
-                let clip = D2D_RECT_F {
-                    left: cx - 1.0,
-                    top: y + (h - line) / 2.0,
-                    right: cx + cw + 1.0,
-                    bottom: y + (h + line) / 2.0,
-                };
-                dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                cv.push_clip(
+                    cx - 1.0,
+                    y + (h - line) / 2.0,
+                    cx + cw + 1.0,
+                    y + (h + line) / 2.0,
+                );
                 for k in 0..2 {
                     let d = (old as i32 + base as i32 + k).rem_euclid(10);
                     // Counting up, the next digit comes from below; counting down, from above.
@@ -230,21 +260,11 @@ pub fn rolling_text(
                     if a <= 0.01 {
                         continue;
                     }
-                    let br = dc
-                        .CreateSolidColorBrush(
-                            &D2D1_COLOR_F {
-                                a: b.GetColor().a * a,
-                                ..b.GetColor()
-                            },
-                            None,
-                        )
-                        .ok();
-                    if let Some(br) = br {
-                        text(dc, &d.to_string(), fmt, cx, y + dy, cw + 2.0, h, &br);
-                    }
+                    let faded = Color { a: c.a * a, ..c };
+                    cv.text(&d.to_string(), fmt, cx, y + dy, cw + 2.0, h, faded);
                 }
-                dc.PopAxisAlignedClip();
-            },
+                cv.pop_clip();
+            }
         }
         cx += cw;
     }
@@ -252,6 +272,7 @@ pub fn rolling_text(
 
 /// `rolling_text` with its right edge at `right`: the column helper for sizes, amounts and
 /// percents. The width snaps to the new value at once, so the column never slides.
+#[cfg(windows)]
 pub fn rolling_text_right(
     g: &Shared,
     dc: &ID2D1DeviceContext,
@@ -264,7 +285,7 @@ pub fn rolling_text_right(
     h: f32,
     b: &ID2D1SolidColorBrush,
 ) {
-    let w = g.text_width(value, fmt);
+    let w = text_width(value, fmt);
     rolling_text(g, dc, key, value, kind, fmt, right - w, y, h, b);
 }
 
@@ -379,6 +400,7 @@ pub fn ripple_reset_all() {
 /// layer. At rest it just calls `draw`, so a settled list costs nothing extra.
 ///
 /// `motion::with_row(dc, motion::ripple_row("disk.rows", i), || draw_row(..))`
+#[cfg(windows)]
 pub fn with_row(dc: &ID2D1DeviceContext, fx: RowFx, draw: impl FnOnce()) {
     if fx == RowFx::REST {
         draw();

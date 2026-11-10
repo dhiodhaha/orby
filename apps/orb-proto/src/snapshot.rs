@@ -145,7 +145,7 @@ pub const PILL_HOVER: PillPart = PillPart::None;
 
 #[cfg(windows)]
 pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
-    use crate::gfx::{render_offscreen, Shared};
+    use crate::gfx::{render_offscreen, D2dCanvas, Shared};
     use crate::ui;
 
     let g = Shared::new()?;
@@ -158,7 +158,19 @@ pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
         let th = ui::theme(dark);
         let tag = if dark { "dark" } else { "light" };
         let (w, h, px) = render_offscreen(&g, ui::DIAL_W, ui::DIAL_H, SCALE, |dc| {
-            ui::draw_dial(&g, dc, &th, &fonts, &items, Some(2), 1.0, false, false, None, None, 1.0);
+            ui::draw_dial(
+                &mut D2dCanvas::new(&g, dc),
+                &th,
+                &fonts,
+                &items,
+                Some(2),
+                1.0,
+                false,
+                false,
+                None,
+                None,
+                1.0,
+            );
         })?;
         write(dir, &format!("dial-{tag}"), w, h, px);
         let branch = DialBranch {
@@ -169,8 +181,7 @@ pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
         };
         let (w, h, px) = render_offscreen(&g, ui::DIAL_W, ui::DIAL_H, SCALE, |dc| {
             ui::draw_dial(
-                &g,
-                dc,
+                &mut D2dCanvas::new(&g, dc),
                 &th,
                 &fonts,
                 &items,
@@ -184,19 +195,31 @@ pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
             );
         })?;
         write(dir, &format!("dial-branch-{tag}"), w, h, px);
-        for (name, p) in [("pill-drink", drink_pill()), ("pill-prayer", prayer_pill(&t))] {
-            let l = ui::layout_pill(&g, &fonts, &p);
+        for (name, p) in [
+            ("pill-drink", drink_pill()),
+            ("pill-prayer", prayer_pill(&t)),
+        ] {
+            let l = ui::layout_pill(&fonts, &p);
             let (pw, ph) = (l.w + 2.0 * ui::PILL_PAD, ui::PILL_H + 2.0 * ui::PILL_PAD);
             let (w, h, px) = render_offscreen(&g, pw, ph, SCALE, |dc| {
                 ui::draw_pill(
-                    &g, dc, &th, &fonts, &p, &l, 1.0, true, PILL_HOVER, ui::PILL_PAD, ui::PILL_PAD,
+                    &mut D2dCanvas::new(&g, dc),
+                    &th,
+                    &fonts,
+                    &p,
+                    &l,
+                    1.0,
+                    true,
+                    PILL_HOVER,
+                    ui::PILL_PAD,
+                    ui::PILL_PAD,
                 );
             })?;
             write(dir, &format!("{name}-{tag}"), w, h, px);
         }
         let view = panel_view(&pd);
         let (w, h, px) = render_offscreen(&g, crate::panel::W, crate::panel::H, SCALE, |dc| {
-            crate::panel::draw(&g, dc, &th, &fonts, &view);
+            crate::panel::draw(&mut D2dCanvas::new(&g, dc), &th, &fonts, &view);
         })?;
         write(dir, &format!("prayer-{tag}"), w, h, px);
     }

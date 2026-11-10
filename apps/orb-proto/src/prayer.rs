@@ -451,7 +451,12 @@ pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<panel::Hit>)
         reminders: app.settings.prefs.prayer_reminders,
         hover,
     };
-    panel::draw(&app.g, dc, &app.theme, &app.fonts, &view);
+    panel::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &view,
+    );
 }
 
 pub fn open_panel(app: &mut App) {
