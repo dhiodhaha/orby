@@ -247,6 +247,24 @@ define_class!(
                 key(VK_ESCAPE, m);
                 return;
             }
+            // Option+Up and Option+Down are Windows' Alt+Up and Alt+Down (the Tasks window
+            // moves a task), not the text system's paragraph moves.
+            if m.alt && !has_marked && matches!(e.keyCode(), 125 | 126) {
+                key(if e.keyCode() == 126 { VK_UP } else { VK_DOWN }, m);
+                return;
+            }
+            // F1 to F35 have no text: the ones the units read arrive as their keys (F2 renames
+            // a task), the others are dropped instead of typing a private-use character.
+            let fkey = chars
+                .chars()
+                .next()
+                .is_some_and(|c| ('\u{F704}'..='\u{F726}').contains(&c));
+            if fkey && !has_marked {
+                if let Some(vk) = crate::sys::vk_from_mac(e.keyCode()) {
+                    key(vk, m);
+                }
+                return;
+            }
             let events = NSArray::from_slice(&[e]);
             self.interpretKeyEvents(&events);
         }

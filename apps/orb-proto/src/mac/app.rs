@@ -2,7 +2,8 @@
 //! orb, the dial, the pill, the panel window) and a menu bar item.
 //!
 //! The shared units run on it as on Windows: notices.rs (the queue every pill goes through),
-//! habits.rs (focus and drink), history.rs, dial_menu.rs (what the dial shows and does), over
+//! habits.rs (focus and drink), history.rs, tasks.rs and tasks_window.rs (the window itself is
+//! mac/tasks_win.rs), calendar.rs (Today), dial_menu.rs (what the dial shows and does), over
 //! `crate::sys` (mac/sys.rs), the shims in mac/shim.rs and the panel host mac/panels.rs. Their
 //! timers (`sys::Timer`) are deadlines in `timers`, fired by `tick` and waited for by `schedule`.
 //!
@@ -167,7 +168,9 @@ define_class!(
         fn scroll_wheel(&self, e: &NSEvent) {
             if self.kind() == Kind::Panel {
                 let dy = e.scrollingDeltaY();
-                with_app(|a| crate::mac::panels::on_wheel(a, dy));
+                let precise = e.hasPreciseScrollingDeltas();
+                let x = self.convertPoint_fromView(e.locationInWindow(), None).x as f32;
+                with_app(|a| crate::mac::panels::on_wheel(a, x, dy, precise));
             }
         }
 
@@ -335,6 +338,54 @@ impl Win {
         self.panel.isKeyWindow()
     }
 
+    /// The window has the keyboard.
+    pub(crate) fn is_key(&self) -> bool {
+        self.panel.isKeyWindow()
+    }
+
+    /// Adds a subview on top of the window's own view (an input view).
+    pub(crate) fn add_subview(&self, v: &NSView) {
+        self.view.addSubview(v);
+    }
+
+    /// Who takes the keys in the window: `v` (an input view), or the window's own view.
+    pub(crate) fn set_responder(&self, v: Option<&NSView>) -> bool {
+        match v {
+            Some(v) => self.panel.makeFirstResponder(Some(v)),
+            None => self.panel.makeFirstResponder(Some(&self.view)),
+        }
+    }
+
+    /// The window's frame on screen (y up).
+    pub(crate) fn frame(&self) -> NSRect {
+        self.panel.frame()
+    }
+
+    /// Calls `f` when the window becomes key (`true`) or stops being key (`false`).
+    pub(crate) fn observe_key(
+        &self,
+        f: fn(bool),
+    ) -> Vec<Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>> {
+        let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+        let mut out = Vec::new();
+        for (name, on) in [
+            ("NSWindowDidBecomeKeyNotification", true),
+            ("NSWindowDidResignKeyNotification", false),
+        ] {
+            let block = RcBlock::new(move |_n: NonNull<NSNotification>| f(on));
+            let obs = unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(&NSString::from_str(name)),
+                    Some(&self.panel),
+                    Some(&NSOperationQueue::mainQueue()),
+                    &block,
+                )
+            };
+            out.push(obs);
+        }
+        out
+    }
+
     pub(crate) fn show(&mut self) {
         if !self.shown {
             self.panel.orderFrontRegardless();
@@ -445,6 +496,22 @@ define_class!(
                 // for the next turn of the run loop instead of being lost.
                 let _: () = unsafe {
                     msg_send![self, performSelector: sel!(diskWake:), withObject: None::<&AnyObject>, afterDelay: 0.02f64]
+                };
+            }
+        }
+
+        /// A calendar read finished on its worker (sys::CalWaker, performSelectorOnMainThread).
+        #[unsafe(method(calWake:))]
+        fn cal_wake(&self, _sender: Option<&AnyObject>) {
+            let mut ran = false;
+            with_app(|a| {
+                ran = true;
+                crate::calendar::on_read_done(a);
+            });
+            if !ran {
+                // The app was busy: the answer waits in its channel for the next turn.
+                let _: () = unsafe {
+                    msg_send![self, performSelector: sel!(calWake:), withObject: None::<&AnyObject>, afterDelay: 0.02f64]
                 };
             }
         }
@@ -565,6 +632,19 @@ pub(crate) struct App {
     pub(crate) notices: notices::Notices,
     pub(crate) habits: habits::Habits,
     pub(crate) history: history::History,
+    /// Tasks (the panel, the window, the due timer) on the same `app.db` store as Windows.
+    pub(crate) tasks: crate::tasks::Tasks,
+    /// The calendar link and the Today panel.
+    pub(crate) cal: crate::calendar::Cal,
+    /// The day `times` are for (Windows' `times_day`; Today's markers read it).
+    pub(crate) times_day: (i32, u32, u32),
+    /// The panel window's typing view (mac/input.rs), first responder while Tasks types.
+    pub(crate) panel_input: Retained<super::input::InputView>,
+    /// The app that was in front when the panel took the keyboard (it gets it back after).
+    pub(crate) panel_prev_app: Option<Retained<objc2_app_kit::NSRunningApplication>>,
+    /// Observers of the panel window becoming and leaving key (kept alive).
+    _panel_key_obs:
+        Vec<Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>>,
     /// `sys::Timer` deadlines and their repeat interval (Win32 SetTimer's meaning).
     pub(crate) timers: HashMap<Timer, (Instant, Duration)>,
     /// While away from the computer: when to look for fresh input again (mac/sys.rs).
@@ -1461,6 +1541,15 @@ impl App {
                 self.dismiss_pill();
                 crate::disk::retry_scan(self);
             }
+            A::TaskDone(id) => crate::tasks::done_from_pill(self, &id),
+            A::Join(url) => {
+                self.dismiss_pill();
+                crate::calendar::join(self, &url);
+            }
+            A::OpenTasks => {
+                self.dismiss_pill();
+                crate::tasks::open(self, Some(crate::tasks_model::Selection::Today));
+            }
             other => {
                 self.dismiss_pill();
                 self.log(&format!("pill action {other:?} is not on the Mac yet"));
@@ -1473,6 +1562,7 @@ impl App {
         let d = clock::today();
         if d != self.day {
             self.day = d;
+            self.times_day = d;
             (self.times, self.tomorrow_subuh) = compute_times(&self.prefs, d);
             self.log(&format!(
                 "times {}: Subuh {} Dzuhur {} Ashar {} Maghrib {} Isya {}",
@@ -1579,6 +1669,52 @@ impl App {
 
     pub(crate) fn close_panel(&mut self) {
         panels::close_panel(self);
+    }
+
+    /// The Tasks panel types: Orby activates (remembering the app in front, as Windows'
+    /// `panel_prev_fg`), the panel window becomes key and its input view first responder.
+    /// Returns whether the window is key.
+    pub(crate) fn take_panel_keys(&mut self) -> bool {
+        let mtm = MainThreadMarker::new().expect("main thread");
+        let me = objc2_app_kit::NSRunningApplication::currentApplication();
+        if let Some(front) = NSWorkspace::sharedWorkspace().frontmostApplication() {
+            if front.processIdentifier() != me.processIdentifier() {
+                self.panel_prev_app = Some(front);
+            }
+        }
+        NSApplication::sharedApplication(mtm).activate();
+        let key = self.panel_win.make_key();
+        self.panel_win.set_responder(Some(&self.panel_input));
+        self.place_caret();
+        key
+    }
+
+    /// The input view lets go of the keyboard (a composition is dropped); if Orby still has it
+    /// in front, the app that was in front before gets it back.
+    pub(crate) fn release_panel_keys(&mut self) {
+        self.panel_input.discard_marked();
+        self.panel_win.set_responder(None);
+        let mtm = MainThreadMarker::new().expect("main thread");
+        let ours = NSApplication::sharedApplication(mtm).isActive()
+            && self.panel_win.is_key()
+            && !self.tasks.win.open
+            && !self.disk.win.open;
+        if let Some(prev) = self.panel_prev_app.take() {
+            if ours {
+                prev.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty());
+            }
+        }
+    }
+
+    /// Where an input method's candidate window opens: under the quick add field (its line in
+    /// tasks_panel.rs, 288 px in and 118 px down from the panel's corner).
+    pub(crate) fn place_caret(&self) {
+        let f = self.panel_win.frame();
+        let top = f.origin.y + f.size.height;
+        super::input::set_caret_rect(NSRect::new(
+            NSPoint::new(f.origin.x + 288.0, top - 112.0),
+            NSSize::new(1.0, 18.0),
+        ));
     }
     // ---- input ----
 
@@ -1701,6 +1837,8 @@ impl App {
             self.close_dial();
         }
         if self.panel_open {
+            // A click in another app gives that app the keyboard: nothing to hand back.
+            self.panel_prev_app = None;
             self.close_panel();
         }
     }
@@ -1882,6 +2020,7 @@ impl App {
                 self.log(&format!("resources: resident {rss:.1} MB"));
             }
             _ if cmd.starts_with("disk-") => crate::disk::test_command(self, cmd),
+            _ if self.tasks_test_command(cmd) => {}
             _ => {
                 if let Some(off) = cmd
                     .strip_prefix("remind")
@@ -1893,6 +2032,139 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The test channel's Tasks and Today commands (one log line each). Rows are counted as the
+    /// Tasks window lists them (headers included) while it is open, else as the panel does.
+    /// Returns whether `cmd` was one of them.
+    fn tasks_test_command(&mut self, cmd: &str) -> bool {
+        use super::input::{Input, Mods};
+        use crate::{calendar, tasks, tasks_panel, tasks_window, tasks_window_panel};
+        let arg = |p: &str| cmd.strip_prefix(p).map(str::to_string);
+        let index = |p: &str| arg(p).and_then(|s| s.trim().parse::<usize>().ok());
+        let win = self.tasks.win.open;
+        match cmd {
+            "tasks" => tasks::open(self, None),
+            "today" => calendar::open(self),
+            "tasks-window" => tasks_window::show(self),
+            "tasks-window-close" => tasks_window::close(self),
+            "task-undo" if win => tasks_window::undo(self),
+            "task-undo" => {
+                self.log("task-undo: the panel has no Undo (as on Windows); open the Tasks window")
+            }
+            "tasks-state" => {
+                let line = self.tasks_state_line();
+                self.log(&format!("tasks state: {line}"));
+            }
+            "today-state" => {
+                let line = calendar::state_line(self);
+                self.log(&format!("today state: {line}"));
+            }
+            _ if cmd.starts_with("task-add:") => {
+                let text = arg("task-add:").unwrap_or_default();
+                let panel_types = self.panel_open && self.panel_kind == panels::Kind::Tasks;
+                if !super::tasks_win::has_keyboard(self) && !panel_types {
+                    tasks::open(self, None);
+                }
+                // One character at a time, as the input view delivers typing; then Return.
+                for c in text.chars() {
+                    self.on_input(Input::Text(c.to_string()));
+                }
+                self.on_input(Input::Key {
+                    vk: crate::sys::vk::VK_RETURN,
+                    mods: Mods::default(),
+                });
+                self.log(&format!(
+                    "task-add: \"{text}\" -> {} tasks",
+                    self.tasks.snap.tasks.len()
+                ));
+            }
+            _ if cmd.starts_with("task-check:") || cmd.starts_with("task-delete:") => {
+                let check = cmd.starts_with("task-check:");
+                let Some(i) = index(if check { "task-check:" } else { "task-delete:" }) else {
+                    self.log("task-check/delete: give a row number");
+                    return true;
+                };
+                if win {
+                    let h = if check {
+                        tasks_window_panel::Hit::Check(i)
+                    } else {
+                        tasks_window_panel::Hit::Delete(i)
+                    };
+                    let title = tasks_window::task_at(self, i).map(|t| t.title);
+                    tasks_window::click(self, Some(h));
+                    self.log(&format!("{cmd}: window row {i} {title:?}"));
+                } else {
+                    let h = if check {
+                        tasks_panel::Hit::Check(i)
+                    } else {
+                        tasks_panel::Hit::Delete(i)
+                    };
+                    tasks::click(self, h);
+                    self.log(&format!("{cmd}: panel row {i}"));
+                }
+            }
+            _ if cmd.starts_with("type:") => {
+                let text = arg("type:").unwrap_or_default();
+                for c in text.chars() {
+                    self.on_input(Input::Text(c.to_string()));
+                }
+                self.log(&format!("type: {} characters", text.chars().count()));
+            }
+            _ if cmd.starts_with("key:") => {
+                let s = arg("key:").unwrap_or_default();
+                let s = s.trim();
+                let vk = match s.strip_prefix("0x") {
+                    Some(h) => u16::from_str_radix(h, 16).ok(),
+                    None => s.parse().ok(),
+                };
+                match vk {
+                    Some(vk) => {
+                        self.on_input(Input::Key {
+                            vk,
+                            mods: Mods::default(),
+                        });
+                        self.log(&format!("key: {vk:#04x}"));
+                    }
+                    None => self.log("key: give a virtual-key number (13 or 0x0d)"),
+                }
+            }
+            _ if cmd.starts_with("tasks-shot:") => {
+                super::tasks_win::shot(self, &cmd["tasks-shot:".len()..]);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `tasks-state`: the store, the overdue count, the panel's field and first rows, the window.
+    fn tasks_state_line(&self) -> String {
+        use crate::tasks_panel::RowView;
+        let v = crate::tasks::view(self);
+        let rows: Vec<String> = v
+            .rows
+            .iter()
+            .take(8)
+            .map(|r| match r {
+                RowView::Task { title, done, .. } => {
+                    format!("{title}{}", if *done { " (done)" } else { "" })
+                }
+                RowView::Prayer { name, time } => format!("[{name} {time}]"),
+            })
+            .collect();
+        format!(
+            "{} tasks, {} open, {} overdue, store {}, panel {} \"{}\" field \"{}\" focused {}, rows: {}; {}",
+            self.tasks.snap.tasks.len(),
+            self.tasks.snap.tasks.values().filter(|t| !t.done).count(),
+            self.tasks.overdue,
+            crate::sys::data_dir().join("app.db").display(),
+            if self.panel_open && self.panel_kind == panels::Kind::Tasks { "open" } else { "closed" },
+            v.title,
+            self.tasks.field.text(),
+            self.tasks.focused,
+            rows.join(" | "),
+            crate::tasks_window::state_line(self),
+        )
     }
 
     /// One line for the test channel's `state`: the panel, drink, focus and the queue.
@@ -1926,10 +2198,9 @@ impl App {
             Timer::Drink => habits::on_drink_timer(self),
             Timer::Notices => notices::on_timer(self),
             Timer::Panel => panels::on_timer(self),
-            Timer::Tasks | Timer::CalCue | Timer::CalRead => {
-                self.timers.remove(&t);
-                self.log(&format!("timer {t:?}: not on the Mac yet"));
-            }
+            Timer::Tasks => crate::tasks::on_timer(self),
+            Timer::CalCue => crate::calendar::on_cue_timer(self),
+            Timer::CalRead => crate::calendar::on_read_timer(self),
         }
     }
 
@@ -1943,6 +2214,7 @@ impl App {
             || panels::animating(self)
             || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002))
             || (self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty))
+            || super::tasks_win::animating(self)
     }
 
     fn tick(&mut self) {
@@ -2055,6 +2327,7 @@ impl App {
         if self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty) {
             super::disk_win::render(self);
         }
+        super::tasks_win::tick(self);
     }
 
     /// Sets the one timer to the next frame or the next deadline.
@@ -2072,6 +2345,7 @@ impl App {
                 self.disk_check_at,
                 self.disk_release_at,
                 self.away_check_at,
+                super::tasks_win::deadline(self),
             ]
             .into_iter()
             .flatten()
@@ -2143,6 +2417,31 @@ fn menu_item(
     item
 }
 
+/// What an input view typed (mac/input.rs): to whatever has the keyboard.
+fn route_input(i: super::input::Input) {
+    with_app(|a| a.on_input(i));
+}
+
+/// The panel window became key or stopped being key: the Tasks panel's caret follows.
+fn on_panel_key(on: bool) {
+    with_app(|a| {
+        if a.panel_open && a.panel_kind == panels::Kind::Tasks {
+            crate::tasks::on_activate(a, on);
+        }
+    });
+}
+
+impl App {
+    /// Typed input: the Tasks window when it has the keyboard, else the open panel.
+    pub(crate) fn on_input(&mut self, i: super::input::Input) {
+        if super::tasks_win::has_keyboard(self) {
+            super::tasks_win::on_input(self, i);
+        } else if self.panel_open {
+            panels::on_input(self, i);
+        }
+    }
+}
+
 pub fn run() {
     let mtm = MainThreadMarker::new().expect("Orby starts on the main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -2204,6 +2503,11 @@ pub fn run() {
         panel_win.view.addSubview(&v);
         v
     };
+    // Typing in the panel (the Tasks quick add) goes through this view (mac/input.rs).
+    let panel_input = super::input::InputView::new(mtm);
+    panel_win.add_subview(&panel_input);
+    let panel_key_obs = panel_win.observe_key(on_panel_key);
+    super::input::set_sink(route_input);
 
     // The menu bar item.
     let target = MenuTarget::new(mtm);
@@ -2292,6 +2596,12 @@ pub fn run() {
         notices: notices::Notices::load(&dir),
         habits: habits::Habits::load(dir.join("habits.json")),
         history: history::History::new(),
+        tasks: crate::tasks::Tasks::load(&dir),
+        cal: crate::calendar::Cal::load(&dir),
+        times_day: day,
+        panel_input,
+        panel_prev_app: None,
+        _panel_key_obs: panel_key_obs,
         timers: HashMap::new(),
         away_check_at: None,
         disk: crate::disk::Disk::load(),
@@ -2315,6 +2625,9 @@ pub fn run() {
     a.schedule_reminders();
     habits::schedule_drink(&mut a);
     habits::arm_focus(&mut a);
+    // Tasks' due timer, then the calendar: its cached day, event pills, 10 min reads.
+    crate::tasks::schedule(&mut a);
+    crate::calendar::start(&mut a);
     a.place_orb();
     a.orb.show();
     a.render_orb();

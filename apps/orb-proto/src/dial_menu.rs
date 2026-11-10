@@ -4,15 +4,15 @@
 //! each pick. The windows (dial.rs on Windows, the Mac `App`'s dial) own aiming, keys, springs
 //! and closing; they call `items`, `children`, `pick` and `pick_child` here.
 //!
-//! Units that are not shared yet are reached through `pending`: on Windows the real unit, on
-//! macOS a plain child and a quiet "Coming to Mac" pill. Each later stage moves its unit out of
-//! `pending` and calls it directly.
+//! Units that are not shared yet (Downloads, Settings) are reached through `pending`: on Windows
+//! the real unit, on macOS a plain child and a quiet "Coming to Mac" pill. Each later stage
+//! moves its unit out of `pending` and calls it directly (Tasks, Today and All tasks are out).
 
 use app_core::prayer as pr;
 
 use crate::panels::{self, Kind};
 use crate::ui::{DialChild, DialItem, Icon};
-use crate::{disk, habits, history, notices, prayer, App};
+use crate::{calendar, disk, habits, history, notices, prayer, tasks, tasks_window, App};
 
 pub const TASKS: usize = 0;
 pub const TODAY: usize = 1;
@@ -47,12 +47,12 @@ pub fn items(app: &App) -> Vec<DialItem> {
         DialItem {
             icon: Icon::Tasks,
             name: "Tasks",
-            value: pending::tasks_value(app),
+            value: tasks::dial_value(app),
         },
         DialItem {
             icon: Icon::Today,
             name: "Today",
-            value: pending::today_value(app),
+            value: tasks::dial_today_value(app),
         },
         DialItem {
             icon: Icon::Prayer,
@@ -88,7 +88,7 @@ pub fn children(app: &App, parent: usize) -> (Vec<DialChild>, usize) {
             kids.push(history::dial_child(app));
             kids.push(notices::dial_child(app));
             kids.push(pending::settings_child(app));
-            kids.push(pending::all_tasks_child(app));
+            kids.push(tasks_window::dial_child(app));
             (kids, default)
         }
         _ => (Vec::new(), 0),
@@ -99,8 +99,8 @@ pub fn children(app: &App, parent: usize) -> (Vec<DialChild>, usize) {
 /// panel of its own; the window fans out its children instead and never calls this for it).
 pub fn pick(app: &mut App, i: usize) {
     match i {
-        TASKS => pending::open_tasks(app),
-        TODAY => pending::open_today(app),
+        TASKS => tasks::open(app, None),
+        TODAY => calendar::open(app),
         PRAYER => prayer::open_panel(app),
         FOCUS => panels::open_panel(app, Kind::Focus),
         DRINK => panels::open_panel(app, Kind::Drink),
@@ -117,7 +117,7 @@ pub fn pick_child(app: &mut App, parent: usize, j: usize) {
         _ if j == 2 => history::open(app, None),
         _ if j == 3 => notices::open_panel(app),
         _ if j == 4 => pending::open_settings(app),
-        _ if j == 5 => pending::open_all_tasks(app),
+        _ if j == 5 => tasks_window::show(app),
         _ => pending::open_downloads(app),
     }
 }
@@ -127,15 +127,7 @@ pub fn pick_child(app: &mut App, parent: usize, j: usize) {
 mod pending {
     use crate::settings_model::Section;
     use crate::ui::DialChild;
-    use crate::{calendar, downloads, settings, tasks, tasks_window, App};
-
-    pub fn tasks_value(app: &App) -> String {
-        tasks::dial_value(app)
-    }
-
-    pub fn today_value(app: &App) -> String {
-        tasks::dial_today_value(app)
-    }
+    use crate::{downloads, settings, App};
 
     pub fn downloads_value(app: &App) -> String {
         downloads::dial_value(app)
@@ -149,28 +141,12 @@ mod pending {
         settings::dial_child(app)
     }
 
-    pub fn all_tasks_child(app: &App) -> DialChild {
-        tasks_window::dial_child(app)
-    }
-
-    pub fn open_tasks(app: &mut App) {
-        tasks::open(app, None);
-    }
-
-    pub fn open_today(app: &mut App) {
-        calendar::open(app);
-    }
-
     pub fn open_downloads(app: &mut App) {
         downloads::open(app);
     }
 
     pub fn open_settings(app: &mut App) {
         settings::open(app, Section::General);
-    }
-
-    pub fn open_all_tasks(app: &mut App) {
-        tasks_window::show(app);
     }
 }
 
@@ -194,14 +170,6 @@ mod pending {
         notices::reply(app, info_pill(Icon::Info, "Coming to Mac", what));
     }
 
-    pub fn tasks_value(_app: &App) -> String {
-        String::new()
-    }
-
-    pub fn today_value(_app: &App) -> String {
-        String::new()
-    }
-
     pub fn downloads_value(_app: &App) -> String {
         String::new()
     }
@@ -215,27 +183,11 @@ mod pending {
         plain(Icon::Gear, "Settings")
     }
 
-    pub fn all_tasks_child(_app: &App) -> DialChild {
-        plain(Icon::List, "All tasks")
-    }
-
-    pub fn open_tasks(app: &mut App) {
-        coming(app, "Tasks");
-    }
-
-    pub fn open_today(app: &mut App) {
-        coming(app, "Today");
-    }
-
     pub fn open_downloads(app: &mut App) {
         coming(app, "Downloads");
     }
 
     pub fn open_settings(app: &mut App) {
         coming(app, "Settings");
-    }
-
-    pub fn open_all_tasks(app: &mut App) {
-        coming(app, "All tasks");
     }
 }

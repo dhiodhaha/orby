@@ -416,12 +416,12 @@ fn draw_kind(app: &App, dc: &ID2D1DeviceContext, kind: Kind, hover: Option<Hit>)
         ),
         Kind::Tasks => tasks::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Tasks(p) = h { Some(p) } else { None }),
         ),
         Kind::Today => calendar::draw_panel(
             app,
-            dc,
+            &mut crate::gfx::D2dCanvas::new(&app.g, dc),
             hover.and_then(|h| if let Hit::Today(p) = h { Some(p) } else { None }),
         ),
         Kind::Downloads => downloads::draw_panel(

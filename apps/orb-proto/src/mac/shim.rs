@@ -100,6 +100,15 @@ pub mod prayer {
         pr::next(&app.times, clock::now_minutes(), app.tomorrow_subuh)
     }
 
+    /// Today's times, when the day turned over (and the next reminder with them).
+    pub fn refresh_day(app: &mut App) {
+        let before = app.times_day;
+        app.refresh_day();
+        if app.times_day != before {
+            app.schedule_reminders();
+        }
+    }
+
     /// Closing the adzan's pill stops the adzan: the Mac plays no adzan yet.
     pub fn on_pill_closed_by_you(_app: &mut App) {}
 

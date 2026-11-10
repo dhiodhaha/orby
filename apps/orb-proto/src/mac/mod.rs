@@ -11,7 +11,9 @@
 //! - login.rs: start at login (SMAppService)
 //! - sys.rs: what the shared units ask of the system (`crate::sys` on macOS)
 //! - shim.rs: `crate::pill`, `orb`, `dial`, `prayer`, `settings`, `log_line`, `start_anim` over the `App`
-//! - panels.rs: `crate::panels`, the panel host (Prayer, Focus, Drink, History, Notices)
+//! - panels.rs: `crate::panels`, the panel host (Prayer, Focus, Drink, Tasks, Today, History, Notices)
+//! - input.rs: typing (NSTextInputClient), the pasteboard and system sounds
+//! - tasks_win.rs: the Tasks window (tasks_window.rs's state and logic are shared)
 
 pub mod app;
 pub mod cg;
@@ -25,6 +27,7 @@ pub mod metal;
 pub mod panels;
 pub mod shim;
 pub mod sys;
+pub mod tasks_win;
 pub mod text;
 
 use objc2_app_kit::NSWorkspace;
