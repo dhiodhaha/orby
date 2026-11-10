@@ -69,6 +69,8 @@ mod disk_restore;
 #[cfg(windows)]
 mod disk_scenes;
 #[cfg(windows)]
+mod disk_sys;
+#[cfg(windows)]
 mod disk_window;
 #[cfg(windows)]
 mod downloads;

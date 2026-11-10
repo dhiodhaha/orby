@@ -1063,14 +1063,14 @@ fn sel_bar_rects(f: &Fonts, b: f32, open: bool, primary_w: f32, vw: f32) -> Vec<
     let cx = r - primary_w - 8.0;
     out.push((Hit::SelClear, (cx - cw, t, cx, t + 32.0)));
     if open {
-        let ow = tall_w(f, "Open in Explorer", true);
+        let ow = tall_w(f, crate::disk_model::os::OPEN_IN, true);
         let ox = cx - cw - 8.0;
         out.push((Hit::SelOpen, (ox - ow, t, ox, t + 32.0)));
     }
     out
 }
 
-const PRIMARY: &str = "Move to Recycle Bin";
+const PRIMARY: &str = crate::disk_model::os::MOVE;
 
 /// The primary button's width, springing between its plain and its suffixed label.
 fn primary_w(f: &Fonts, m: &Motion) -> f32 {
@@ -1083,7 +1083,7 @@ fn primary_w(f: &Fonts, m: &Motion) -> f32 {
 }
 
 fn strip_open_rect(f: &Fonts, b: f32, vw: f32) -> Rect {
-    let w = quiet_w(f, "Open in Explorer", true);
+    let w = quiet_w(f, crate::disk_model::os::OPEN_IN, true);
     let t = b - STRIP_H / 2.0 - 14.0;
     (vw - 8.0 - w, t, vw - 8.0, t + 28.0)
 }
@@ -1763,7 +1763,7 @@ fn draw_sel_bar(
                 t,
                 f,
                 r,
-                "Open in Explorer",
+                crate::disk_model::os::OPEN_IN,
                 Some(Icon::External),
                 false,
                 hover == Some(h),
@@ -2481,7 +2481,7 @@ fn draw_strip(
         t,
         f,
         open,
-        "Open in Explorer",
+        crate::disk_model::os::OPEN_IN,
         Some(Icon::External),
         hover == Some(Hit::StripOpen),
         true,
@@ -3022,7 +3022,7 @@ fn draw_clean(
                 );
                 let (title, body, label, hit) = if bin {
                     (
-                        "Recycle Bin",
+                        crate::disk_model::os::BIN,
                         "Already deleted. Emptying it is permanent, so that stays your call.",
                         "Open",
                         Hit::BinOpen,
@@ -3030,7 +3030,7 @@ fn draw_clean(
                 } else {
                     (
                         "System files",
-                        "Update leftovers and restore points. Windows manages these itself.",
+                        crate::disk_model::os::SYSTEM_BODY,
                         "Settings",
                         Hit::Settings,
                     )

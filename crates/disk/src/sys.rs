@@ -505,17 +505,75 @@ mod imp {
     /// NSFileManager trashItemAtURL:resultingItemURL:error:, the Finder's Move to Trash. It
     /// only ever moves into the user's Trash; it never deletes, and it fails where there is no
     /// Trash. Put Back works from the Finder.
-    pub fn trash(p: &Path) -> Result<(), RecycleError> {
+    pub fn trash(p: &Path) -> Result<Option<PathBuf>, RecycleError> {
         use objc2_foundation::{NSFileManager, NSString, NSURL};
         let Some(s) = p.to_str() else { return Err(RecycleError::InvalidPath) };
         objc2::rc::autoreleasepool(|_| {
             let url = NSURL::fileURLWithPath(&NSString::from_str(s));
             let fm = NSFileManager::defaultManager();
-            fm.trashItemAtURL_resultingItemURL_error(&url, None).map_err(|e| {
+            let mut out: Option<objc2::rc::Retained<NSURL>> = None;
+            fm.trashItemAtURL_resultingItemURL_error(&url, Some(&mut out)).map_err(|e| {
                 let cocoa = e.domain().to_string() == "NSCocoaErrorDomain";
                 trash_error(cocoa, e.code())
-            })
+            })?;
+            // Where the item now is in the Trash, for Put Back.
+            Ok(out.and_then(|u| u.path()).map(|s| PathBuf::from(s.to_string())))
         })
+    }
+
+    // <sys/attr.h>: the extended common attributes, asked for in `forkattr` with
+    // FSOPT_ATTR_CMN_EXTENDED.
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+    const ATTR_CMNEXT_PRIVATESIZE: u32 = 0x0000_0008;
+    const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
+    const FSOPT_ATTR_CMN_EXTENDED: u32 = 0x0000_0020;
+
+    #[repr(C)]
+    struct AttrList {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+
+    extern "C" {
+        fn getattrlist(path: *const libc::c_char, list: *mut AttrList, buf: *mut libc::c_void, size: libc::size_t, options: u32) -> libc::c_int;
+    }
+
+    /// The bytes moving this file would free at once: on APFS, its blocks that no clone and no
+    /// snapshot shares (`ATTR_CMNEXT_PRIVATESIZE`, getattrlist(2)). A clone of another file frees
+    /// close to nothing. None when the volume does not say.
+    pub fn frees(p: &Path) -> Option<u64> {
+        let c = CString::new(p.as_os_str().as_bytes()).ok()?;
+        let mut list = AttrList {
+            bitmapcount: ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: ATTR_CMN_RETURNED_ATTRS,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: 0,
+            forkattr: ATTR_CMNEXT_PRIVATESIZE,
+        };
+        // u32 length, attribute_set_t (five u32), then the off_t.
+        let mut buf = [0u8; 64];
+        // SAFETY: `c` is NUL terminated, `list` and `buf` are valid for the call.
+        let r = unsafe {
+            getattrlist(c.as_ptr(), &mut list, buf.as_mut_ptr().cast(), buf.len(), FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED)
+        };
+        if r != 0 {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_ne_bytes(buf[o..o + 4].try_into().unwrap_or_default());
+        // The returned set's fork word says whether the volume answered.
+        if u32_at(4 + 16) & ATTR_CMNEXT_PRIVATESIZE == 0 {
+            return None;
+        }
+        let v = i64::from_ne_bytes(buf[24..32].try_into().ok()?);
+        Some(v.max(0) as u64)
     }
 
     pub fn downloads_dir() -> Option<PathBuf> {
@@ -662,7 +720,7 @@ mod imp {
     pub fn recycle_bin_size(_p: &Path) -> io::Result<u64> {
         unsupported()
     }
-    pub fn trash(_p: &Path) -> Result<(), crate::recycle::RecycleError> {
+    pub fn trash(_p: &Path) -> Result<Option<PathBuf>, crate::recycle::RecycleError> {
         Err(crate::recycle::RecycleError::NoRecycleBin)
     }
     pub fn downloads_dir() -> Option<PathBuf> {
@@ -741,10 +799,18 @@ pub(crate) fn recycle_bin_size(p: &Path) -> io::Result<u64> {
 pub(crate) fn shell_recycle(p: &Path) -> (i32, bool) {
     imp::shell_recycle(p)
 }
-/// Moves one item to the user's Trash; never deletes.
+/// Moves one item to the user's Trash; never deletes. Gives where it now is, when known.
 #[cfg(not(windows))]
-pub(crate) fn trash(p: &Path) -> Result<(), crate::recycle::RecycleError> {
+pub(crate) fn trash(p: &Path) -> Result<Option<PathBuf>, crate::recycle::RecycleError> {
     imp::trash(p)
+}
+/// The bytes moving this file would free at once (APFS: blocks no clone or snapshot shares).
+/// None where the file system does not say (Windows, other volumes).
+pub(crate) fn frees(_p: &Path) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    return imp::frees(_p);
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 pub(crate) fn downloads_dir() -> Option<PathBuf> {
     imp::downloads_dir()

@@ -188,6 +188,7 @@ fn the_keeper_is_never_the_library_or_downloads_copy() {
         path: p,
         size: 1,
         modified: Some(UNIX_EPOCH + Duration::from_secs(1_000_000_000 - days * 86_400)),
+        frees: None,
     };
     let files = [
         at(home.join("Library/Application Support/App/a.mp4"), 900),
@@ -218,4 +219,39 @@ fn moves_a_file_and_a_folder_to_the_trash_and_reports_a_missing_one() {
     assert_eq!(report.failed, [(missing, RecycleError::NotFound)]);
     assert!(!file.exists() && !folder.exists());
     assert!(dir.exists(), "only the named items move");
+}
+
+extern "C" {
+    fn clonefile(src: *const std::ffi::c_char, dst: *const std::ffi::c_char, flags: u32) -> std::ffi::c_int;
+}
+
+#[test]
+fn an_apfs_clone_is_found_identical_but_frees_almost_nothing() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = fresh("clones");
+    let home = root.join("Home");
+    let data = bytes(3 << 20, 7);
+    let (a, b, c) = (home.join("Movies/a.bin"), home.join("Movies/b.bin"), home.join("Documents/c.bin"));
+    write(&a, &data);
+    write(&c, &data);
+    fs::create_dir_all(b.parent().unwrap()).unwrap();
+    let cs = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    // SAFETY: both paths are NUL terminated; clonefile only reads `a` and creates `b`.
+    let made = unsafe { clonefile(cs(&a).as_ptr(), cs(&b).as_ptr(), 0) } == 0;
+    if !made {
+        eprintln!("clonefile is not available on this volume; skipping");
+        return;
+    }
+    let tree = scan(&root, &ScanOptions::default(), |_| {}, &AtomicBool::new(false)).unwrap();
+    let report = find_duplicates(&candidates(&tree, &opts(&root)), &opts(&root), |_| {}, &AtomicBool::new(false));
+    assert_eq!(report.groups.len(), 1);
+    let g = &report.groups[0];
+    assert_eq!(g.files.len(), 3);
+    let frees = |p: &Path| g.files.iter().find(|f| f.path == p).and_then(|f| f.frees).unwrap();
+    // The clone pair shares every block; the plain copy owns all of its own.
+    assert!(frees(&a) < 64 << 10 && frees(&b) < 64 << 10, "{} {}", frees(&a), frees(&b));
+    assert!(frees(&c) >= 3 << 20);
+    assert!(g.shares_space());
+    // Keeping the plain copy, moving both clones frees nearly nothing; never 2 x 3 MB.
+    assert!(g.reclaimable() < 128 << 10, "{}", g.reclaimable());
 }

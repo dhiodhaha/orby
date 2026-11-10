@@ -102,8 +102,63 @@ fn os_recycle(p: &Path) -> Result<(), RecycleError> {
     Ok(())
 }
 
-/// The user's Trash through NSFileManager (macOS). Never a permanent delete.
+/// The user's Trash through NSFileManager (macOS). Never a permanent delete. Where the item
+/// went is kept for [`put_back`].
 #[cfg(not(windows))]
 fn os_recycle(p: &Path) -> Result<(), RecycleError> {
-    sys::trash(p)
+    if let Some(at) = sys::trash(p)? {
+        if let Ok(mut l) = TRASHED.lock() {
+            l.push((p.to_path_buf(), at));
+        }
+    }
+    Ok(())
+}
+
+/// What this process moved to the Trash: (where it was, where it is now). Put Back reads it.
+#[cfg(not(windows))]
+static TRASHED: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// Why an item could not be put back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutBackError {
+    /// Not moved by this process, or no longer in the Trash (emptied, or put back already).
+    NotInBin,
+    /// Something new is at the old place; nothing is overwritten.
+    Occupied,
+    /// The rename failed (the old folder is gone, or no permission).
+    Failed,
+}
+
+/// Puts an item this process moved to the Trash back where it was, like the Finder's Put Back:
+/// a rename out of the Trash on the same volume. Never overwrites, never creates folders, never
+/// deletes. Windows has its own restore from the Recycle Bin's records (the app's
+/// disk_restore.rs), so there this always answers `NotInBin`.
+pub fn put_back(original: &Path) -> Result<(), PutBackError> {
+    #[cfg(windows)]
+    {
+        let _ = original;
+        Err(PutBackError::NotInBin)
+    }
+    #[cfg(not(windows))]
+    {
+        let at = {
+            let l = TRASHED.lock().map_err(|_| PutBackError::Failed)?;
+            l.iter().rev().find(|(o, _)| o == original).map(|(_, t)| t.clone())
+        };
+        let Some(at) = at else { return Err(PutBackError::NotInBin) };
+        if at.symlink_metadata().is_err() {
+            return Err(PutBackError::NotInBin);
+        }
+        if original.symlink_metadata().is_ok() {
+            return Err(PutBackError::Occupied);
+        }
+        if original.parent().is_none_or(|d| !d.is_dir()) {
+            return Err(PutBackError::Failed);
+        }
+        std::fs::rename(&at, original).map_err(|_| PutBackError::Failed)?;
+        if let Ok(mut l) = TRASHED.lock() {
+            l.retain(|(o, t)| !(o == original && *t == at));
+        }
+        Ok(())
+    }
 }

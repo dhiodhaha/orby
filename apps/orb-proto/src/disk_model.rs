@@ -152,6 +152,54 @@ pub fn when(at: Stamp, today: Stamp) -> String {
     format!("{day} at {}", hhmm(at.minute))
 }
 
+// ---- the system's own words ----
+
+/// What the bin, the file viewer and the system are called where Orby runs.
+pub mod os {
+    #[cfg(windows)]
+    mod w {
+        pub const BIN: &str = "Recycle Bin";
+        pub const THE_BIN: &str = "the Recycle Bin";
+        pub const VIEWER: &str = "Explorer";
+        pub const OPEN_IN: &str = "Open in Explorer";
+        pub const MOVE: &str = "Move to Recycle Bin";
+        pub const SYSTEM: &str = "Windows";
+        pub const PUT_IT_BACK: &str =
+            "You can put it back from the Recycle Bin until it's emptied. Orby never empties it for you.";
+        pub const PUT_THEM_BACK: &str =
+            "You can put them back from the Recycle Bin until it's emptied. Orby never empties it for you.";
+        pub const TEMP_FILES: &str = "Windows temp files";
+        pub const TEMP_BODY: &str = "Windows makes new ones when needed. Files in use are skipped.";
+        pub const BROWSER_BODY: &str =
+            "Edge and Chrome load sites a bit slower for a day. You stay signed in.";
+        pub const SKIPPED_BODY: &str =
+            "Windows keeps them private, so what is in them is not counted. The scan went on past them.";
+        pub const SYSTEM_BODY: &str =
+            "Update leftovers and restore points. Windows manages these itself.";
+    }
+    #[cfg(not(windows))]
+    mod w {
+        pub const BIN: &str = "Trash";
+        pub const THE_BIN: &str = "the Trash";
+        pub const VIEWER: &str = "Finder";
+        pub const OPEN_IN: &str = "Show in Finder";
+        pub const MOVE: &str = "Move to Trash";
+        pub const SYSTEM: &str = "macOS";
+        pub const PUT_IT_BACK: &str =
+            "You can put it back from the Trash until it's emptied. Orby never empties it for you.";
+        pub const PUT_THEM_BACK: &str =
+            "You can put them back from the Trash until it's emptied. Orby never empties it for you.";
+        pub const TEMP_FILES: &str = "Temporary files";
+        pub const TEMP_BODY: &str = "macOS makes new ones when needed. Files in use are skipped.";
+        pub const BROWSER_BODY: &str =
+            "Chrome and Edge load sites a bit slower for a day. You stay signed in.";
+        pub const SKIPPED_BODY: &str =
+            "macOS keeps them private until Orby has Full Disk Access, so what is in them is not counted. The scan went on past them.";
+        pub const SYSTEM_BODY: &str = "Snapshots, caches and updates. macOS manages these itself.";
+    }
+    pub use w::*;
+}
+
 // ---- pills ----
 
 /// The low-space pill: "C:" then "has 38 GB left".
@@ -191,7 +239,11 @@ pub fn scan_error_words(root: &Path, e: &ScanError) -> (String, String, &'static
         ScanError::NotReady | ScanError::NotFound if is_drive_root(root) => (
             place,
             "is not ready".into(),
-            "Plug the drive back in, or unlock it in Explorer, then scan again.",
+            if cfg!(windows) {
+                "Plug the drive back in, or unlock it in Explorer, then scan again."
+            } else {
+                "Plug the disk back in, or unlock it in the Finder, then scan again."
+            },
         ),
         ScanError::NotFound => (
             place,
@@ -201,7 +253,11 @@ pub fn scan_error_words(root: &Path, e: &ScanError) -> (String, String, &'static
         ScanError::AccessDenied => (
             place,
             "can't be read".into(),
-            "Windows keeps this folder private, so nothing in it was counted.",
+            if cfg!(windows) {
+                "Windows keeps this folder private, so nothing in it was counted."
+            } else {
+                "macOS keeps this folder private, so nothing in it was counted. Full Disk Access lets Orby read it."
+            },
         ),
         ScanError::NotADirectory => (
             place,
@@ -211,12 +267,20 @@ pub fn scan_error_words(root: &Path, e: &ScanError) -> (String, String, &'static
         ScanError::NotReady => (
             place,
             "is not ready".into(),
-            "Plug the drive back in, or unlock it in Explorer, then scan again.",
+            if cfg!(windows) {
+                "Plug the drive back in, or unlock it in Explorer, then scan again."
+            } else {
+                "Plug the disk back in, or unlock it in the Finder, then scan again."
+            },
         ),
         ScanError::Io(_) => (
             place,
             "couldn't be read".into(),
-            "Windows would not list it. Try again in a moment.",
+            if cfg!(windows) {
+                "Windows would not list it. Try again in a moment."
+            } else {
+                "macOS would not list it. Try again in a moment."
+            },
         ),
     }
 }
@@ -580,9 +644,9 @@ pub const CONFIRM_LIST: usize = 5;
 
 pub fn confirm_title(n: usize) -> String {
     if n == 1 {
-        "Move 1 item to the Recycle Bin?".into()
+        format!("Move 1 item to {}?", os::THE_BIN)
     } else {
-        format!("Move {n} items to the Recycle Bin?")
+        format!("Move {n} items to {}?", os::THE_BIN)
     }
 }
 
@@ -592,15 +656,16 @@ pub fn confirm_more(n: usize) -> Option<String> {
 
 /// "You can put it back" for one item, "them" for more.
 pub fn put_back_words(n: usize) -> &'static str {
-    if n == 1 {
-        "You can put it back from the Recycle Bin until it is emptied."
-    } else {
-        "You can put them back from the Recycle Bin until it is emptied."
+    match (n == 1, cfg!(windows)) {
+        (true, true) => "You can put it back from the Recycle Bin until it is emptied.",
+        (false, true) => "You can put them back from the Recycle Bin until it is emptied.",
+        (true, false) => "You can put it back from the Trash until it is emptied.",
+        (false, false) => "You can put them back from the Trash until it is emptied.",
     }
 }
 
 pub fn confirm_honest(total: u64) -> String {
-    format!("The {} comes back only when the Recycle Bin is emptied. Orby never empties it for you, and has no permanent delete.", size(total))
+    format!("The {} comes back only when {} is emptied. Orby never empties it for you, and has no permanent delete.", size(total), os::THE_BIN)
 }
 
 /// What a move reported, in the card's words. `in_use` names the first file that stayed.
@@ -626,7 +691,7 @@ pub fn moved_words(
     let first = in_use
         .first()
         .map(|p| format!("{} is open in another app.", name(p)))
-        .unwrap_or_else(|| "Windows would not move it.".into());
+        .unwrap_or_else(|| format!("{} would not move it.", os::SYSTEM));
     let tail = match moved {
         0 => String::new(),
         1 => " The other item was moved.".into(),
@@ -637,7 +702,7 @@ pub fn moved_words(
 
 /// "In Recycle Bin" and "2 items".
 pub fn in_bin_words(n: usize) -> (String, String) {
-    ("In Recycle Bin".into(), plural(n as u64, "item", "items"))
+    (format!("In {}", os::BIN), plural(n as u64, "item", "items"))
 }
 
 #[allow(unused_imports)] // Until the Disk window redraw uses them (see `mod cleaning`).
@@ -1000,6 +1065,8 @@ pub struct DupeCopy {
     pub path: PathBuf,
     pub modified: Option<SystemTime>,
     pub gone: bool,
+    /// What moving it frees, when the file system says (APFS: a clone frees close to nothing).
+    pub frees: Option<u64>,
 }
 
 /// One group of identical files with its keeper and what is picked for removal. The keeper is
@@ -1065,9 +1132,28 @@ impl DupeSet {
         self.picked.iter().copied()
     }
 
-    /// (live - 1) × size.
+    /// What one copy frees: what the file system says (APFS), else its size.
+    pub fn frees(&self, i: usize) -> u64 {
+        self.copies[i].frees.unwrap_or(self.size)
+    }
+
+    /// What moving every live copy but the keeper frees: (live - 1) × size, or on APFS what
+    /// those copies say they free (a clone of the keeper frees close to nothing).
     pub fn reclaimable(&self) -> u64 {
-        self.size * (self.live() as u64).saturating_sub(1)
+        if self.live() < 2 {
+            return 0;
+        }
+        (0..self.copies.len())
+            .filter(|&i| i != self.keep && !self.copies[i].gone)
+            .map(|i| self.frees(i))
+            .sum()
+    }
+
+    /// Some copies share their blocks with another file (APFS clones, or a snapshot holds them).
+    pub fn shares_space(&self) -> bool {
+        self.copies
+            .iter()
+            .any(|c| !c.gone && c.frees.is_some_and(|b| b < self.size / 2))
     }
 
     /// One click: this copy stays. A copy that is gone cannot be the keeper.
@@ -1145,6 +1231,7 @@ impl DupeList {
                             path: f.path.clone(),
                             modified: f.modified,
                             gone: false,
+                            frees: f.frees,
                         })
                         .collect();
                     DupeSet::new(g.size, copies)
@@ -1167,8 +1254,8 @@ impl DupeList {
     /// Picked copies and their bytes.
     pub fn selection(&self) -> (usize, u64) {
         self.sets.iter().fold((0, 0), |(n, b), s| {
-            let k = s.picked.len();
-            (n + k, b + k as u64 * s.size)
+            let bytes: u64 = s.picked.iter().map(|&i| s.frees(i)).sum();
+            (n + s.picked.len(), b + bytes)
         })
     }
 
@@ -1190,7 +1277,7 @@ impl DupeList {
             .flat_map(|s| {
                 let keep = s.copies[s.keep].path.clone();
                 s.picked()
-                    .map(move |i| (s.copies[i].path.clone(), s.size, keep.clone()))
+                    .map(move |i| (s.copies[i].path.clone(), s.frees(i), keep.clone()))
             })
             .collect()
     }
@@ -1249,11 +1336,16 @@ fn short_size(bytes: u64) -> String {
 }
 
 /// "3 copies · 1.2 GB to reclaim".
-pub fn dupe_group_words(copies: usize, reclaimable: u64) -> String {
+pub fn dupe_group_words(copies: usize, reclaimable: u64, shares: bool) -> String {
     format!(
-        "{} · {} to reclaim",
+        "{} · {} to reclaim{}",
         plural(copies as u64, "copy", "copies"),
-        short_size(reclaimable)
+        short_size(reclaimable),
+        if shares {
+            " · shares space (APFS clone)"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1735,6 +1827,7 @@ mod tests {
                 std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000 - days_old * 86_400),
             ),
             gone: false,
+            frees: None,
         }
     }
 
@@ -1802,6 +1895,7 @@ mod tests {
                         path: p.clone(),
                         modified: None,
                         gone: false,
+                        frees: None,
                     })
                     .collect(),
             );
@@ -1845,6 +1939,7 @@ mod tests {
                     path: PathBuf::from(format!(r"C:\{n}")),
                     size: 100,
                     modified: None,
+                    frees: None,
                 })
                 .collect(),
         }];
@@ -1873,6 +1968,7 @@ mod tests {
                     path: PathBuf::from(p),
                     size: 5,
                     modified: None,
+                    frees: None,
                 })
                 .collect(),
         }]);
@@ -1883,10 +1979,17 @@ mod tests {
     #[test]
     fn duplicate_words_read_plainly() {
         assert_eq!(
-            dupe_group_words(3, 1288490188),
+            dupe_group_words(3, 1288490188, false),
             "3 copies · 1.2 GB to reclaim"
         );
-        assert_eq!(dupe_group_words(2, 3 << 30), "2 copies · 3 GB to reclaim");
+        assert_eq!(
+            dupe_group_words(2, 3 << 30, false),
+            "2 copies · 3 GB to reclaim"
+        );
+        assert_eq!(
+            dupe_group_words(2, 0, true),
+            "2 copies · 0 KB to reclaim · shares space (APFS clone)"
+        );
         let (line, frac) = dupe_progress_words(&app_disk::DupeProgress {
             stage: app_disk::DupeStage::Contents,
             files_done: 1204,
