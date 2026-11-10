@@ -674,3 +674,10 @@ pub(crate) fn shot(app: &mut App, path: &str) {
     }
     app.log(&format!("panel-shot: {kind:?} {w:.0}x{h:.0} -> {path}"));
 }
+
+/// The open panel moves only because a number rolls (no full redraw due, no ripple).
+pub(crate) fn only_rolling(app: &App) -> bool {
+    app.panel_open
+        && !app.panel_dirty
+        && (app.panel_kind == Kind::Prayer || app.roll_rect.is_some())
+}

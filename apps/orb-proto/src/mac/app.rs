@@ -2286,6 +2286,18 @@ impl App {
             || super::tasks_win::animating(self)
     }
 
+    /// The only thing moving is a rolling number in the open panel.
+    fn only_panel_rolls(&self) -> bool {
+        let other = !self.x.settled(0.3)
+            || !self.opacity.settled(0.002)
+            || (self.dial.shown && !self.dial_reveal.settled(0.002))
+            || (self.pill_win.shown && !self.pill_reveal.settled(0.002))
+            || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002))
+            || (self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty))
+            || super::tasks_win::animating(self);
+        !other && panels::only_rolling(self)
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
         let dt = now
@@ -2402,7 +2414,13 @@ impl App {
     /// Sets the one timer to the next frame or the next deadline.
     fn schedule(&mut self) {
         let wait = if self.animating() {
-            FRAME
+            // A panel's rolling number alone (the countdowns each second) moves at 30 Hz: a
+            // 0.3 s digit roll looks the same and costs half.
+            if self.only_panel_rolls() {
+                2.0 * FRAME
+            } else {
+                FRAME
+            }
         } else {
             let now = Instant::now();
             [
