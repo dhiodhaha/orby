@@ -48,6 +48,11 @@ mod disk_model;
 mod disk_panel;
 mod disk_scenes;
 mod disk_sys;
+mod drink_panel;
+mod focus_panel;
+mod habits_scenes;
+mod history_model;
+mod history_panel;
 mod motion;
 mod notices_model;
 mod panel;
@@ -74,10 +79,6 @@ mod downloads_model;
 #[cfg(windows)]
 mod downloads_panel;
 #[cfg(windows)]
-mod drink_panel;
-#[cfg(windows)]
-mod focus_panel;
-#[cfg(windows)]
 mod frame;
 #[cfg(windows)]
 mod gfx;
@@ -85,10 +86,6 @@ mod gfx;
 mod habits;
 #[cfg(windows)]
 mod history;
-#[cfg(windows)]
-mod history_model;
-#[cfg(windows)]
-mod history_panel;
 #[cfg(windows)]
 mod hook;
 #[cfg(windows)]

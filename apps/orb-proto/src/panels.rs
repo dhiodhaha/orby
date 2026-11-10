@@ -72,12 +72,8 @@ fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
     let (x, y) = (x - ox, y - oy);
     match app.panel_kind {
         Kind::Prayer => panel::hit(&app.fonts, x, y).map(Hit::Prayer),
-        Kind::Focus => {
-            focus_panel::hit(&app.g, &app.fonts, &habits::focus_view(app), x, y).map(Hit::Focus)
-        }
-        Kind::Drink => {
-            drink_panel::hit(&app.g, &app.fonts, &habits::drink_view(app), x, y).map(Hit::Drink)
-        }
+        Kind::Focus => focus_panel::hit(&app.fonts, &habits::focus_view(app), x, y).map(Hit::Focus),
+        Kind::Drink => drink_panel::hit(&app.fonts, &habits::drink_view(app), x, y).map(Hit::Drink),
         Kind::Tasks => tasks::hit(app, x, y).map(Hit::Tasks),
         Kind::Today => calendar::hit(app, x, y).map(Hit::Today),
         Kind::Downloads => downloads::hit(app, x, y).map(Hit::Downloads),

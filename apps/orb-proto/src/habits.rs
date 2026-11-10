@@ -1119,11 +1119,23 @@ pub fn drink_click(app: &mut App, hit: drink_panel::Hit) {
 }
 
 pub fn draw_focus_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<focus_panel::Hit>) {
-    focus_panel::draw(&app.g, dc, &app.theme, &app.fonts, &focus_view(app), hover);
+    focus_panel::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &focus_view(app),
+        hover,
+    );
 }
 
 pub fn draw_drink_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<drink_panel::Hit>) {
-    drink_panel::draw(&app.g, dc, &app.theme, &app.fonts, &drink_view(app), hover);
+    drink_panel::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &drink_view(app),
+        hover,
+    );
 }
 
 #[cfg(test)]
