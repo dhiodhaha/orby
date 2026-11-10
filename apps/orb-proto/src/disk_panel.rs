@@ -1085,7 +1085,8 @@ fn primary_w(f: &Fonts, m: &Motion) -> f32 {
 fn strip_open_rect(f: &Fonts, b: f32, vw: f32) -> Rect {
     let w = quiet_w(f, crate::disk_model::os::OPEN_IN, true);
     let t = b - STRIP_H / 2.0 - 14.0;
-    (vw - 8.0 - w, t, vw - 8.0, t + 28.0)
+    // The same right margin as the selection bar's buttons.
+    (vw - 12.0 - w, t, vw - 12.0, t + 28.0)
 }
 
 fn results_rects(f: &Fonts, r: &ResultsView, v: &View, b: f32) -> Vec<(Hit, Rect)> {
