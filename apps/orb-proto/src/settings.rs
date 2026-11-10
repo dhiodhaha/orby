@@ -904,7 +904,7 @@ fn weekday(y: i32, m: u32, d: u32) -> u32 {
 }
 
 fn layout(app: &App) -> (Vec<(Hit, sp::Rect)>, f32) {
-    sp::layout(&app.g, &app.theme, &app.fonts, &view(app))
+    sp::layout(&app.theme, &app.fonts, &view(app))
 }
 
 pub fn render(app: &mut App) {
@@ -928,7 +928,12 @@ pub fn render(app: &mut App) {
         return;
     };
     let dc = s.begin(&app.g);
-    sp::draw(&app.g, dc, &app.theme, &app.fonts, &v);
+    sp::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &v,
+    );
     // The T3 lip along the window's edge (depth.rs); radius as in `place`'s region.
     let rad = if matches!(screen, Screen::FirstRun(_)) {
         20.0
