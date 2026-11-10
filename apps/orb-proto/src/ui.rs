@@ -132,6 +132,8 @@ pub struct Fonts {
     /// Wrapping body text, top aligned (the Disk cards and the confirm sheet).
     pub small_wrap: Font,
     pub body_wrap: Font,
+    /// 11/500: the Disk tags and the keep column.
+    pub tag: Font,
 }
 
 #[cfg(windows)]
@@ -158,6 +160,7 @@ impl Fonts {
             badge: g.format(10.0, DWRITE_FONT_WEIGHT_MEDIUM).unwrap(),
             small_wrap: wrapping(g.format(12.0, DWRITE_FONT_WEIGHT_NORMAL).unwrap()),
             body_wrap: wrapping(g.format(13.0, DWRITE_FONT_WEIGHT_NORMAL).unwrap()),
+            tag: g.format(11.0, DWRITE_FONT_WEIGHT_MEDIUM).unwrap(),
         }
     }
 
@@ -177,6 +180,7 @@ impl Fonts {
             badge: font(10.0, 500.0, false),
             small_wrap: font(12.0, 400.0, true),
             body_wrap: font(13.0, 400.0, true),
+            tag: font(11.0, 500.0, false),
         }
     }
 }
@@ -304,16 +308,22 @@ pub fn title_button(
     icon: Icon,
     hover: bool,
 ) {
+    paint_title_button(&mut gfx::D2dCanvas::new(g, dc), t, r, icon, hover);
+}
+
+/// A 28 px title-band button (close, maximize): no fill until hovered, a 14 px muted icon.
+pub fn paint_title_button(
+    cv: &mut dyn Canvas,
+    t: &Theme,
+    r: (f32, f32, f32, f32),
+    icon: Icon,
+    hover: bool,
+) {
     if hover {
-        unsafe {
-            dc.FillRoundedRectangle(
-                &gfx::rrect(r.0, r.1, r.2, r.3, 14.0),
-                &gfx::brush(dc, t.button_hover),
-            )
-        };
+        cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 14.0), t.button_hover);
     }
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
-    draw_icon(g, dc, icon, cx, cy, 14.0, &gfx::brush(dc, t.muted));
+    paint_icon(cv, icon, cx, cy, 14.0, t.muted);
 }
 
 /// `paint_icon` on a Direct2D context, for the panels that still draw with Direct2D.

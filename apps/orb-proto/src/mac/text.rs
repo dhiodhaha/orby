@@ -109,6 +109,81 @@ pub fn line_height(f: &Font) -> f32 {
     f.line()
 }
 
+/// Where the baseline falls in a box `h` tall: the line is centred, as `draw` places it.
+pub fn baseline_in(_s: &str, f: &Font, h: f32) -> f32 {
+    (h - f.line()) / 2.0 + f.ascent
+}
+
+/// Names a font for caches: the Core Text font object and its size.
+pub fn font_key(f: &Font) -> (usize, u32) {
+    (
+        &*f.ct as *const objc2_core_text::CTFont as usize,
+        f.size.to_bits(),
+    )
+}
+
+/// How many lines `s` takes wrapped at `w`, breaking where `draw` breaks.
+fn wrapped_lines(s: &str, f: &Font, w: f32) -> usize {
+    if s.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let a = attributed(s, f);
+        let ts = CTTypesetter::with_attributed_string(&a);
+        let len = s.encode_utf16().count() as isize;
+        let (mut start, mut n) = (0isize, 0usize);
+        while start < len {
+            start += ts.suggest_line_break(start, w.max(1.0) as f64).max(1);
+            n += 1;
+        }
+        n
+    }
+}
+
+/// The height of `s` wrapped at `w`, rounded up to whole pixels.
+pub fn wrap_height(s: &str, f: &Font, w: f32) -> f32 {
+    (wrapped_lines(s, f, w).max(1) as f32 * f.line()).ceil()
+}
+
+/// One line with `spacing` px of tracking after each character, its baseline as `draw` puts
+/// it in a box `h` tall. Returns its width.
+pub fn draw_tracked(
+    ctx: &CGContext,
+    s: &str,
+    f: &Font,
+    x: f32,
+    y: f32,
+    h: f32,
+    spacing: f32,
+) -> f32 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    unsafe {
+        let text = CFString::from_str(s);
+        let kern = CFNumber::new_f64(spacing as f64);
+        let attrs: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(
+            &[
+                kCTFontAttributeName,
+                kCTForegroundColorFromContextAttributeName,
+                objc2_core_text::kCTKernAttributeName,
+            ],
+            &[
+                f.ct.as_ref(),
+                objc2_core_foundation::CFBoolean::new(true).as_ref(),
+                kern.as_ref(),
+            ],
+        );
+        let a = CFAttributedString::new(None, Some(&text), Some(attrs.as_ref()))
+            .expect("an attributed string");
+        let line = CTLine::with_attributed_string(&a);
+        let base = y + (h - f.line()) / 2.0 + f.ascent;
+        CGContext::set_text_position(Some(ctx), x as CGFloat, base as CGFloat);
+        line.draw(ctx);
+        line.typographic_bounds(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) as f32
+    }
+}
+
 /// Draws `s` into the box. The context must already be y-down with a flipped text matrix and the
 /// fill colour set: one line vertically centred, or (a wrapping font) lines from the top.
 pub fn draw(ctx: &CGContext, s: &str, f: &Font, x: f32, y: f32, w: f32, h: f32) {

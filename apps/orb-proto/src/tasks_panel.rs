@@ -3,7 +3,6 @@
 //! folders and lists), list header, the quick add field with token chips and the "understood"
 //! line, To do / Done tabs, rows, and the footer. Drawing and hit tests on a plain [`View`].
 
-use std::borrow::Cow;
 use std::ops::Range;
 
 use app_quickadd::TokenKind;
@@ -489,26 +488,12 @@ fn draw_field(
 // ---- drawing ----
 
 /// `s` when it fits `w`, else its longest start that fits with an ellipsis after it.
-fn fit(s: &str, w: f32, measure: impl Fn(&str) -> f32) -> Cow<'_, str> {
-    if measure(s) <= w {
-        return Cow::Borrowed(s);
-    }
-    let cut = |end: usize| format!("{}…", s[..end].trim_end());
-    let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
-    // Binary search for the widest start that fits: widths only grow with length.
-    let (mut lo, mut hi) = (0, ends.len());
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        if measure(&cut(ends[mid])) <= w {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    Cow::Owned(cut(ends.get(lo).copied().unwrap_or(0)))
+#[cfg(test)]
+fn fit(s: &str, w: f32, measure: impl Fn(&str) -> f32) -> std::borrow::Cow<'_, str> {
+    crate::canvas::ellipsize(s, w, measure)
 }
 
-/// One line of text, cut to `w` with an ellipsis.
+/// One line of text, cut to `w` with an ellipsis (`canvas::clipped_text` on Direct2D).
 pub(crate) fn clipped_text(
     g: &Shared,
     dc: &ID2D1DeviceContext,
@@ -520,21 +505,8 @@ pub(crate) fn clipped_text(
     h: f32,
     b: &ID2D1SolidColorBrush,
 ) {
-    let w = w.max(0.0);
-    let shown = fit(s, w, |t| g.text_width(t, fmt));
-    unsafe {
-        dc.PushAxisAlignedClip(
-            &D2D_RECT_F {
-                left: x,
-                top: y,
-                right: x + w + 2.0,
-                bottom: y + h,
-            },
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        )
-    };
-    text(dc, &shown, fmt, x, y, w + 400.0, h, b);
-    unsafe { dc.PopAxisAlignedClip() };
+    let c = unsafe { b.GetColor() };
+    crate::canvas::clipped_text(&mut D2dCanvas::new(g, dc), s, fmt, x, y, w, h, c);
 }
 
 fn side_icon(i: SideIcon) -> Icon {

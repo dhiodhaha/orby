@@ -53,6 +53,10 @@ pub struct DupeFile {
     pub path: PathBuf,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// What moving this copy would free at once, when the file system says (APFS: its blocks
+    /// that no clone and no snapshot shares, so a clone frees close to nothing). None on
+    /// Windows and before [`find_duplicates`].
+    pub frees: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,9 +127,20 @@ pub struct DupeGroup {
 }
 
 impl DupeGroup {
-    /// (n - 1) × size: what moving every copy but one would free.
+    /// What moving every copy but one would free: (n - 1) × size, or where each copy says what
+    /// it frees (APFS), all of that but the most any one copy frees (that one stays).
     pub fn reclaimable(&self) -> u64 {
-        self.size * (self.files.len() as u64).saturating_sub(1)
+        let frees: Option<Vec<u64>> = self.files.iter().map(|f| f.frees).collect();
+        match frees {
+            Some(v) if !v.is_empty() => v.iter().sum::<u64>() - v.iter().copied().max().unwrap_or(0),
+            _ => self.size * (self.files.len() as u64).saturating_sub(1),
+        }
+    }
+
+    /// Some copies share their blocks (APFS clones, or a snapshot holds them): moving one frees
+    /// far less than its size.
+    pub fn shares_space(&self) -> bool {
+        self.files.iter().any(|f| f.frees.is_some_and(|b| b < self.size / 2))
     }
 }
 
@@ -271,7 +286,7 @@ pub fn candidates(tree: &Tree, opts: &DupeOptions) -> Candidates {
                     }
                     NodeKind::File => {
                         if n.size() >= min && !n.system() && !n.not_local() && !n.reparse() {
-                            files.push(DupeFile { path: path.join(n.name()), size: n.size(), modified: n.modified() });
+                            files.push(DupeFile { path: path.join(n.name()), size: n.size(), modified: n.modified(), frees: None });
                         }
                     }
                     NodeKind::Link => {}
@@ -380,7 +395,7 @@ pub fn find_duplicates(c: &Candidates, opts: &DupeOptions, mut progress: impl Fn
         if ends.is_some() {
             report.from_cache += 1;
         }
-        let file = DupeFile { path: f.path.clone(), size: f.size, modified: filetime(p.written).or(f.modified) };
+        let file = DupeFile { path: f.path.clone(), size: f.size, modified: filetime(p.written).or(f.modified), frees: None };
         items.push(Item { file, written: p.written, ends, full });
     }
     items = regroup(items, |it| Some((it.file.size, [0; 32])));
@@ -491,6 +506,10 @@ pub fn find_duplicates(c: &Candidates, opts: &DupeOptions, mut progress: impl Fn
         .filter(|(_, v)| v.len() >= 2)
         .map(|((size, _), mut files)| {
             files.sort_by(|a, b| a.path.cmp(&b.path));
+            // Only the copies found identical are asked what they free (one call each, no read).
+            for f in &mut files {
+                f.frees = sys::frees(&f.path);
+            }
             DupeGroup { size, files }
         })
         .collect();
@@ -808,7 +827,7 @@ mod tests {
     use super::*;
 
     fn f(path: &str, size: u64) -> DupeFile {
-        DupeFile { path: PathBuf::from(path), size, modified: None }
+        DupeFile { path: PathBuf::from(path), size, modified: None, frees: None }
     }
 
     #[test]
@@ -826,6 +845,23 @@ mod tests {
     }
 
     #[test]
+    fn copies_that_share_their_blocks_free_only_what_is_their_own() {
+        let mut g = DupeGroup { size: 100, files: vec![f("a", 100), f("b", 100), f("c", 100)] };
+        // An APFS clone family: the original frees all, each clone nearly nothing.
+        for (file, frees) in g.files.iter_mut().zip([100, 4, 0]) {
+            file.frees = Some(frees);
+        }
+        assert_eq!(g.reclaimable(), 4, "the copy that frees the most stays");
+        assert!(g.shares_space());
+        // Plain copies say their full size each.
+        for file in &mut g.files {
+            file.frees = Some(100);
+        }
+        assert_eq!(g.reclaimable(), 200);
+        assert!(!g.shares_space());
+    }
+
+    #[test]
     fn the_cache_matches_only_the_same_size_and_write_time() {
         let mut c = Cache::default();
         let p = Path::new(r"C:\x\movie.mp4");
@@ -838,7 +874,7 @@ mod tests {
 
     fn aged(path: &Path, days_ago: u64) -> DupeFile {
         let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000 - days_ago * 86_400);
-        DupeFile { path: path.to_path_buf(), size: 1, modified: Some(t) }
+        DupeFile { path: path.to_path_buf(), size: 1, modified: Some(t), frees: None }
     }
 
     #[test]

@@ -51,6 +51,7 @@ fn main() {
             SkipReason::AccessDenied => "access denied".to_string(),
             SkipReason::Vanished => "vanished".to_string(),
             SkipReason::InCloud => "in the cloud, not downloaded".to_string(),
+            SkipReason::Protected => "left out (the system would ask first)".to_string(),
             SkipReason::Other(k) => format!("other: {k:?}"),
         };
         reasons.entry(key).or_default().push(&s.path);
@@ -126,6 +127,21 @@ fn duplicates(tree: &Tree, never: &AtomicBool) {
     println!("candidates  {} files in {} same-size groups, at most {} ({stage1:.2} s)", c.files.len(), c.groups, gb(c.possible));
     println!("groups      {}", report.groups.len());
     println!("reclaimable {} ({} bytes)", gb(report.reclaimable()), report.reclaimable());
+    // Before the file system said what each copy frees: (n - 1) x size per group.
+    let logical: u64 = report.groups.iter().map(|g| g.size * (g.files.len() as u64 - 1)).sum();
+    let shared: Vec<&app_disk::DupeGroup> = report.groups.iter().filter(|g| g.shares_space()).collect();
+    let shared_logical: u64 = shared.iter().map(|g| g.size * (g.files.len() as u64 - 1)).sum();
+    println!(
+        "by size     {} ({} bytes) if every copy owned its blocks",
+        gb(logical),
+        logical
+    );
+    println!(
+        "clones      {} groups share their blocks (APFS clones or a snapshot): {} by size, {} really freed",
+        shared.len(),
+        gb(shared_logical),
+        gb(shared.iter().map(|g| g.reclaimable()).sum())
+    );
     println!("bytes read  {} ({} bytes)", gb(report.bytes_read), report.bytes_read);
     println!("skipped     {}", report.skipped);
     println!("drive       {:?}, threads {}", report.drive, report.threads);

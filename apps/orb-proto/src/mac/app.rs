@@ -368,6 +368,40 @@ define_class!(
             });
         }
 
+        #[unsafe(method(openDisk:))]
+        fn open_disk(&self, _sender: Option<&AnyObject>) {
+            with_app(crate::disk::open);
+        }
+
+        #[unsafe(method(toggleLogin:))]
+        fn toggle_login(&self, _sender: Option<&AnyObject>) {
+            with_app(|a| a.toggle_login());
+        }
+
+        /// A Disk worker has news (performSelectorOnMainThread from its thread).
+        #[unsafe(method(diskWake:))]
+        fn disk_wake(&self, _sender: Option<&AnyObject>) {
+            let mut ran = false;
+            with_app(|a| {
+                ran = true;
+                crate::disk::on_msg(a);
+            });
+            if !ran {
+                // The app was busy (AppKit called back from inside a handler): the news waits
+                // for the next turn of the run loop instead of being lost.
+                let _: () = unsafe {
+                    msg_send![self, performSelector: sel!(diskWake:), withObject: None::<&AnyObject>, afterDelay: 0.02f64]
+                };
+            }
+        }
+
+        /// Scan a folder: the open panel runs here, with the app not borrowed.
+        #[unsafe(method(pickFolder:))]
+        fn pick_folder(&self, _sender: Option<&AnyObject>) {
+            let folder = super::disk_win::pick_folder();
+            with_app(|a| crate::disk::on_folder_picked(a, folder));
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
             with_app(|a| a.log("quit from the menu bar"));
@@ -399,7 +433,7 @@ struct Drag {
     moved: bool,
 }
 
-struct App {
+pub(crate) struct App {
     gpu: Option<Gpu>,
     orb_layer: Option<Retained<CAMetalLayer>>,
     orb: Win,
@@ -409,8 +443,9 @@ struct App {
     _status: Option<Retained<NSStatusItem>>,
     _menu_target: Retained<MenuTarget>,
     toggle_item: Option<Retained<NSMenuItem>>,
-    fonts: Fonts,
-    theme: Theme,
+    login_item: Option<Retained<NSMenuItem>>,
+    pub(crate) fonts: Fonts,
+    pub(crate) theme: Theme,
     scale: f32,
     log_path: PathBuf,
     started: Instant,
@@ -421,24 +456,29 @@ struct App {
     opacity: Spring,
     tucked: bool,
     tuck_at: Option<Instant>,
-    visible: bool,
+    pub(crate) visible: bool,
     drag: Option<Drag>,
     near: bool,
     orb_dirty: bool,
     // The dial.
-    dial_open: bool,
+    pub(crate) dial_open: bool,
     dial_reveal: Spring,
     dial_aim: Option<usize>,
     dial_keyboard: bool,
+    /// The More branch: open, its aimed child, its reveal, and when a steady aim opens it.
+    dial_branch: Option<usize>,
+    dial_child: Option<usize>,
+    branch_reveal: Spring,
+    branch_at: Option<Instant>,
     // The pill.
-    pill: Option<Pill>,
+    pub(crate) pill: Option<Pill>,
     pill_layout: PillLayout,
     pill_reveal: Spring,
     pill_until: Option<Instant>,
     pill_hover: PillPart,
-    pill_closing: bool,
+    pub(crate) pill_closing: bool,
     /// The pill on screen came from the queue (and goes back to it when it closes).
-    pill_queued: bool,
+    pub(crate) pill_queued: bool,
     // The Prayer panel.
     panel_open: bool,
     panel_hover: Option<panel::Hit>,
@@ -451,9 +491,14 @@ struct App {
     brightness: f32,
     sun_at: Instant,
     next_reminder: Option<(Instant, Prayer, i32)>,
-    queue: Queue,
+    pub(crate) queue: Queue,
     queue_wait: Option<Instant>,
     countdown_at: Option<Instant>,
+    // Disk: its state (shared with Windows), the 10 min low-space check, letting a scan go.
+    pub(crate) disk: crate::disk::Disk,
+    pub(crate) disk_check_at: Option<Instant>,
+    pub(crate) disk_check_every: Duration,
+    pub(crate) disk_release_at: Option<Instant>,
     // The run loop.
     timer: Option<Retained<NSTimer>>,
     last_frame: Instant,
@@ -465,7 +510,7 @@ thread_local! {
 
 /// Runs `f` on the app. An event that arrives while the app is busy (AppKit calling back from
 /// inside a handler) is dropped rather than re-entered.
-fn with_app(f: impl FnOnce(&mut App)) {
+pub(crate) fn with_app(f: impl FnOnce(&mut App)) {
     APP.with(|cell| {
         if let Ok(mut b) = cell.try_borrow_mut() {
             if let Some(a) = b.as_mut() {
@@ -476,7 +521,7 @@ fn with_app(f: impl FnOnce(&mut App)) {
     });
 }
 
-fn dark_mode() -> bool {
+pub(crate) fn dark_mode() -> bool {
     let d = NSUserDefaults::standardUserDefaults();
     d.stringForKey(&NSString::from_str("AppleInterfaceStyle"))
         .is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
@@ -609,9 +654,20 @@ const DIAL_ICONS: [Icon; 6] = [
     Icon::More,
 ];
 const PRAYER: usize = 2;
+const MORE: usize = 5;
+/// More's branch, in the Windows order.
+const MORE_KIDS: [(Icon, &str); 6] = [
+    (Icon::Download, "Downloads"),
+    (Icon::HardDrive, "Disk"),
+    (Icon::Grid, "History"),
+    (Icon::Bell, "Notices"),
+    (Icon::Gear, "Settings"),
+    (Icon::List, "All tasks"),
+];
+const MORE_DISK: usize = 1;
 
 impl App {
-    fn log(&self, line: &str) {
+    pub(crate) fn log(&self, line: &str) {
         let l = clock::local();
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -626,6 +682,42 @@ impl App {
         }
     }
 
+    /// The menu target, which lives as long as the app: workers wake the main thread through it.
+    pub(crate) fn menu_target_ptr(&self) -> usize {
+        Retained::as_ptr(&self._menu_target) as usize
+    }
+
+    /// Start at login (System Settings, General, Login Items): off until you turn it on.
+    fn toggle_login(&mut self) {
+        let on = super::login::enabled();
+        let r = super::login::set(!on);
+        let now = super::login::enabled();
+        self.log(&format!(
+            "start at login: {} -> {} ({})",
+            on,
+            now,
+            r.err().unwrap_or_else(|| "ok".into())
+        ));
+        self.sync_login_item();
+        if super::login::needs_approval() {
+            self.reply(Pill {
+                icon: Icon::Info,
+                dot: false,
+                title: "Start at login".into(),
+                value: "allow Orby in Login Items".into(),
+                action: None,
+                closable: true,
+                ttl_ms: 6000,
+            });
+        }
+    }
+
+    fn sync_login_item(&self) {
+        if let Some(item) = &self.login_item {
+            item.setState(if super::login::enabled() { 1 } else { 0 });
+        }
+    }
+
     fn now(&self) -> Now {
         Now {
             at: clock::now(),
@@ -633,7 +725,7 @@ impl App {
         }
     }
 
-    fn quiet(&self) -> Quiet {
+    pub(crate) fn quiet(&self) -> Quiet {
         Quiet {
             hidden: !self.visible,
             full_screen: false,
@@ -645,7 +737,7 @@ impl App {
 
     // ---- geometry ----
 
-    fn screen(&self) -> (NSRect, f32) {
+    pub(crate) fn screen(&self) -> (NSRect, f32) {
         let mtm = MainThreadMarker::new().expect("main thread");
         screen_at(
             mtm,
@@ -768,6 +860,13 @@ impl App {
             } else {
                 self.arm_tuck();
             }
+            // While a scan runs, coming close names it with a counting pill.
+            if near {
+                crate::disk::on_orb_near(self, true);
+            } else {
+                crate::disk::on_orb_near(self, false);
+                crate::disk::on_orb_gone(self);
+            }
         }
         if self.dial_open {
             self.aim(dx, -dy);
@@ -790,6 +889,8 @@ impl App {
                 name: DIAL_NAMES[i],
                 value: if i == PRAYER {
                     format!("{} {}", np.name(), pr::hhmm(nat))
+                } else if i == MORE {
+                    crate::disk::dial_value(self).unwrap_or_default()
                 } else {
                     String::new()
                 },
@@ -797,8 +898,40 @@ impl App {
             .collect()
     }
 
+    /// More's children, as on Windows: Downloads, Disk, History, Notices, Settings, All tasks.
+    /// Disk works on the Mac; the others say they are coming.
+    fn more_children(&self) -> Vec<ui::DialChild> {
+        MORE_KIDS
+            .iter()
+            .enumerate()
+            .map(|(j, (icon, name))| {
+                if j == MORE_DISK {
+                    crate::disk::dial_child(self)
+                } else {
+                    ui::DialChild {
+                        text: String::new(),
+                        icon: Some(*icon),
+                        name: (*name).into(),
+                        value: String::new(),
+                    }
+                }
+            })
+            .collect()
+    }
+
     fn render_dial(&mut self) {
         let items = self.dial_items();
+        let kids = if self.dial_branch.is_some() {
+            self.more_children()
+        } else {
+            Vec::new()
+        };
+        let branch = self.dial_branch.map(|parent| ui::DialBranch {
+            parent,
+            children: &kids,
+            aimed: self.dial_child,
+            reveal: self.branch_reveal.pos,
+        });
         let (t, f) = (self.theme, &self.fonts);
         let (aim, rv, mir, kb) = (
             self.dial_aim,
@@ -806,9 +939,61 @@ impl App {
             self.mirrored(),
             self.dial_keyboard,
         );
+        // Value tags step aside while the branch is out.
+        let tags = if self.dial_branch.is_some() { 0.0 } else { 1.0 };
         self.dial.paint(self.scale, |cv| {
-            ui::draw_dial(cv, &t, f, &items, aim, rv, mir, kb, None, None, 1.0);
+            ui::draw_dial(
+                cv,
+                &t,
+                f,
+                &items,
+                aim,
+                rv,
+                mir,
+                kb,
+                branch.as_ref(),
+                None,
+                tags,
+            );
         });
+    }
+
+    fn open_branch(&mut self, aim_default: bool) {
+        self.branch_at = None;
+        self.dial_aim = Some(MORE);
+        if self.dial_branch != Some(MORE) {
+            self.dial_branch = Some(MORE);
+            self.branch_reveal = Spring::new(0.0, 190.0, 26.0);
+            self.branch_reveal.target = 1.0;
+        }
+        self.dial_child = aim_default.then_some(MORE_DISK);
+        self.render_dial();
+    }
+
+    fn close_branch(&mut self) {
+        self.dial_branch = None;
+        self.dial_child = None;
+        self.branch_at = None;
+        self.render_dial();
+    }
+
+    fn pick_child(&mut self, j: usize) {
+        self.close_dial();
+        let name = MORE_KIDS.get(j).map_or("?", |k| k.1);
+        self.log(&format!("dial pick more child {j} ({name})"));
+        if j == MORE_DISK {
+            crate::disk::open(self);
+        } else {
+            self.reply(Pill {
+                icon: Icon::Info,
+                dot: false,
+                title: "Coming to Mac".into(),
+                value: name.into(),
+                action: None,
+                closable: true,
+                ttl_ms: 4000,
+            });
+        }
     }
 
     fn open_dial(&mut self, keyboard: bool) {
@@ -825,6 +1010,9 @@ impl App {
         self.dial_open = true;
         self.dial_keyboard = keyboard;
         self.dial_aim = if keyboard { Some(0) } else { None };
+        self.dial_branch = None;
+        self.dial_child = None;
+        self.branch_at = None;
         self.dial_reveal = Spring::new(0.0, 190.0, 26.0);
         self.dial_reveal.target = 1.0;
         self.place_dial();
@@ -837,11 +1025,14 @@ impl App {
         self.orb.panel.orderFrontRegardless();
     }
 
-    fn close_dial(&mut self) {
+    pub(crate) fn close_dial(&mut self) {
         if !self.dial_open {
             return;
         }
         self.dial_open = false;
+        self.dial_branch = None;
+        self.dial_child = None;
+        self.branch_at = None;
         self.dial_reveal.k = 480.0;
         self.dial_reveal.c = 40.0;
         self.dial_reveal.target = 0.0;
@@ -850,14 +1041,45 @@ impl App {
 
     fn aim(&mut self, dx: f32, dy: f32) {
         let a = ui::aim(dx, dy, self.mirrored(), 6);
+        if self.dial_branch.is_some() {
+            // Past the main band the pointer aims a child by direction.
+            let c = ui::aim_child(dx, dy, self.mirrored(), MORE, MORE_KIDS.len());
+            if c.is_some() {
+                if c != self.dial_child || self.dial_keyboard {
+                    self.dial_keyboard = false;
+                    self.dial_child = c;
+                    self.render_dial();
+                }
+                return;
+            }
+            if a.is_some() && a != Some(MORE) {
+                self.dial_branch = None;
+                self.dial_child = None;
+            } else {
+                if self.dial_child.is_some() {
+                    self.dial_child = None;
+                    self.render_dial();
+                }
+                return;
+            }
+        }
         if a != self.dial_aim || self.dial_keyboard {
             self.dial_keyboard = false;
             self.dial_aim = a;
+            // A steady aim on More opens its branch, as on Windows (120 ms).
+            self.branch_at = (a == Some(MORE)).then(|| Instant::now() + Duration::from_millis(120));
             self.render_dial();
         }
     }
 
     fn pick(&mut self, i: usize) {
+        if i == MORE {
+            // More has no panel: picking it fans out its children.
+            self.log("dial pick more");
+            let kb = self.dial_keyboard;
+            self.open_branch(kb);
+            return;
+        }
         self.close_dial();
         self.log(&format!("dial pick {}", DIAL_NAMES[i].to_lowercase()));
         if i == PRAYER {
@@ -893,7 +1115,25 @@ impl App {
         const ENTER: u16 = 76;
         const UP: u16 = 126;
         const DOWN: u16 = 125;
-        if self.dial_open {
+        if self.dial_open && self.dial_branch.is_some() {
+            let n = MORE_KIDS.len();
+            let c = self.dial_child.unwrap_or(MORE_DISK);
+            match code {
+                ESC => self.close_branch(),
+                RETURN | ENTER => self.pick_child(c),
+                UP => {
+                    self.dial_keyboard = true;
+                    self.dial_child = Some((c + n - 1) % n);
+                    self.render_dial();
+                }
+                DOWN => {
+                    self.dial_keyboard = true;
+                    self.dial_child = Some((c + 1) % n);
+                    self.render_dial();
+                }
+                _ => {}
+            }
+        } else if self.dial_open {
             let aim = self.dial_aim.unwrap_or(0);
             match code {
                 ESC => self.close_dial(),
@@ -958,7 +1198,7 @@ impl App {
         });
     }
 
-    fn show_pill(&mut self, p: Pill, queued: bool) {
+    pub(crate) fn show_pill(&mut self, p: Pill, queued: bool) {
         self.theme = ui::theme(dark_mode());
         self.pill_layout = ui::layout_pill(&self.fonts, &p);
         self.pill_win.resize(
@@ -987,12 +1227,12 @@ impl App {
     }
 
     /// An answer to something you just did: shows at once, never waits in the queue.
-    fn reply(&mut self, p: Pill) {
+    pub(crate) fn reply(&mut self, p: Pill) {
         self.queue.reply(self.now());
         self.show_pill(p, false);
     }
 
-    fn dismiss_pill(&mut self, by_you: bool) {
+    pub(crate) fn dismiss_pill(&mut self, by_you: bool) {
         if self.pill.is_none() || self.pill_closing {
             return;
         }
@@ -1011,7 +1251,19 @@ impl App {
         }
     }
 
-    fn post(&mut self, n: Notice) {
+    /// A pill's action button.
+    fn pill_action(&mut self, a: ui::PillAction) {
+        use ui::PillAction as A;
+        match a {
+            A::FindBigFolders(d) => crate::disk::find_big_folders(self, d),
+            A::OpenDisk => crate::disk::open(self),
+            A::UndoRecycle => crate::disk::undo(self),
+            A::RetryScan => crate::disk::retry_scan(self),
+            _ => self.log("pill action not on the Mac yet"),
+        }
+    }
+
+    pub(crate) fn post(&mut self, n: Notice) {
         let busy = self.pill.is_some() && !self.pill_closing;
         let title = n.pill.title.clone();
         let out = self
@@ -1207,7 +1459,7 @@ impl App {
         self.log("panel prayer");
     }
 
-    fn close_panel(&mut self) {
+    pub(crate) fn close_panel(&mut self) {
         if !self.panel_open {
             return;
         }
@@ -1258,9 +1510,10 @@ impl App {
             Kind::Orb => self.on_orb_mouse(ev, global),
             Kind::Dial => match ev {
                 Ev::Move | Ev::Drag => self.on_pointer(global),
-                Ev::Up => match self.dial_aim {
-                    Some(i) => self.pick(i),
-                    None => self.close_dial(),
+                Ev::Up => match (self.dial_child, self.dial_aim) {
+                    (Some(j), _) if self.dial_branch.is_some() => self.pick_child(j),
+                    (_, Some(i)) => self.pick(i),
+                    _ => self.close_dial(),
                 },
                 _ => {}
             },
@@ -1280,6 +1533,13 @@ impl App {
                     }
                     Ev::Up => match part {
                         PillPart::Close => self.dismiss_pill(true),
+                        PillPart::Action => {
+                            let action = self.pill.as_ref().and_then(|p| p.action.clone());
+                            self.dismiss_pill(true);
+                            if let Some((_, a)) = action {
+                                self.pill_action(a);
+                            }
+                        }
                         PillPart::Body => {
                             let prayer = self.pill.as_ref().is_some_and(|p| p.icon == Icon::Bell);
                             self.dismiss_pill(true);
@@ -1409,6 +1669,28 @@ impl App {
             "hide" => self.set_visible(false),
             "show" => self.set_visible(true),
             "pill" => self.pick(0),
+            "more" => {
+                self.open_dial(true);
+                self.pick(MORE);
+            }
+            "disk" => crate::disk::open(self),
+            "more-pick" => {
+                if self.dial_branch.is_some() {
+                    let j = self.dial_child.unwrap_or(MORE_DISK);
+                    self.pick_child(j);
+                }
+            }
+            "disk-close" => super::disk_win::close(self),
+            "disk-check" => crate::disk::check_space(self),
+            "disk-undo" => crate::disk::undo(self),
+            "disk-state" => {
+                let line = crate::disk::state_line(self);
+                self.log(&format!("disk state: {line}"));
+            }
+            "login" => self.log(&format!(
+                "start at login: {}",
+                if super::login::enabled() { "on" } else { "off" }
+            )),
             "windows" => {
                 for (name, w) in [
                     ("orb", &self.orb),
@@ -1429,6 +1711,58 @@ impl App {
                     ));
                 }
             }
+            _ if cmd.starts_with("dial-shot:") => {
+                let path = cmd["dial-shot:".len()..].to_string();
+                let items = self.dial_items();
+                let kids = if self.dial_branch.is_some() {
+                    self.more_children()
+                } else {
+                    Vec::new()
+                };
+                let branch = self.dial_branch.map(|parent| ui::DialBranch {
+                    parent,
+                    children: &kids,
+                    aimed: self.dial_child,
+                    reveal: 1.0,
+                });
+                let b = Bitmap::new(ui::DIAL_W, ui::DIAL_H, 2.0);
+                let tags = if branch.is_some() { 0.0 } else { 1.0 };
+                ui::draw_dial(
+                    &mut b.canvas(),
+                    &self.theme,
+                    &self.fonts,
+                    &items,
+                    self.dial_aim,
+                    1.0,
+                    self.mirrored(),
+                    self.dial_keyboard,
+                    branch.as_ref(),
+                    None,
+                    tags,
+                );
+                let p = std::path::Path::new(&path);
+                if let (Some(dir), Some(name)) = (p.parent(), p.file_stem()) {
+                    crate::snapshot::write(
+                        dir,
+                        &name.to_string_lossy(),
+                        b.pw as u32,
+                        b.ph as u32,
+                        b.rgba(),
+                    );
+                }
+            }
+            _ if cmd.starts_with("disk-shot:") => {
+                super::disk_win::shot(self, &cmd["disk-shot:".len()..]);
+            }
+            _ if cmd.starts_with("disk-bench:") => {
+                let n = cmd["disk-bench:".len()..].parse().unwrap_or(200);
+                super::disk_win::scroll_bench(self, n);
+            }
+            "disk-resources" => {
+                let rss = super::disk::resident_bytes() as f64 / 1_048_576.0;
+                self.log(&format!("resources: resident {rss:.1} MB"));
+            }
+            _ if cmd.starts_with("disk-") => crate::disk::test_command(self, cmd),
             _ => {
                 if let Some(off) = cmd
                     .strip_prefix("remind")
@@ -1450,6 +1784,8 @@ impl App {
             || (self.dial.shown && !self.dial_reveal.settled(0.002))
             || (self.pill_win.shown && !self.pill_reveal.settled(0.002))
             || (self.panel_open && crate::motion::active())
+            || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002))
+            || (self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty))
     }
 
     fn tick(&mut self) {
@@ -1495,6 +1831,20 @@ impl App {
         if now >= self.sun_at {
             self.refresh_day();
         }
+        if self.branch_at.is_some_and(|t| now >= t) {
+            self.branch_at = None;
+            if self.dial_open && self.dial_aim == Some(MORE) && self.dial_branch.is_none() {
+                self.open_branch(false);
+            }
+        }
+        if self.disk_check_at.is_some_and(|t| now >= t) {
+            self.disk_check_at = Some(now + self.disk_check_every);
+            crate::disk::on_timer(self);
+        }
+        if self.disk_release_at.is_some_and(|t| now >= t) {
+            self.disk_release_at = None;
+            crate::disk::on_release_timer(self);
+        }
 
         // Springs.
         let moving_x = !self.x.settled(0.3);
@@ -1530,6 +1880,13 @@ impl App {
         if self.panel_open {
             self.render_panel();
         }
+        if self.dial_branch.is_some() && !self.branch_reveal.settled(0.002) {
+            self.branch_reveal.step(dt);
+            self.render_dial();
+        }
+        if self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty) {
+            super::disk_win::render(self);
+        }
     }
 
     /// Sets the one timer to the next frame or the next deadline.
@@ -1545,6 +1902,9 @@ impl App {
                 self.countdown_at,
                 self.queue_wait,
                 Some(self.sun_at),
+                self.branch_at,
+                self.disk_check_at,
+                self.disk_release_at,
             ]
             .into_iter()
             .flatten()
@@ -1682,6 +2042,10 @@ pub fn run() {
     let toggle = menu_item(mtm, "Hide Orby", sel!(toggleOrb:), &target);
     menu.addItem(&toggle);
     menu.addItem(&menu_item(mtm, "Prayer", sel!(openPrayer:), &target));
+    menu.addItem(&menu_item(mtm, "Disk…", sel!(openDisk:), &target));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let login = menu_item(mtm, "Start at login", sel!(toggleLogin:), &target);
+    menu.addItem(&login);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&menu_item(mtm, "Quit Orby", sel!(quit:), &target));
     status.setMenu(Some(&menu));
@@ -1700,6 +2064,7 @@ pub fn run() {
         _status: Some(status),
         _menu_target: target,
         toggle_item: Some(toggle),
+        login_item: Some(login),
         fonts: Fonts::new(),
         theme: ui::theme(dark_mode()),
         scale,
@@ -1719,6 +2084,10 @@ pub fn run() {
         dial_reveal: Spring::new(0.0, 190.0, 26.0),
         dial_aim: None,
         dial_keyboard: false,
+        dial_branch: None,
+        dial_child: None,
+        branch_reveal: Spring::new(0.0, 190.0, 26.0),
+        branch_at: None,
         pill: None,
         pill_layout: PillLayout::default(),
         pill_reveal: Spring::new(0.0, 320.0, 17.0),
@@ -1739,6 +2108,10 @@ pub fn run() {
         queue: Queue::new(),
         queue_wait: None,
         countdown_at: None,
+        disk: crate::disk::Disk::load(),
+        disk_check_at: None,
+        disk_check_every: Duration::from_secs(600),
+        disk_release_at: None,
         timer: None,
         last_frame: Instant::now(),
     };
@@ -1762,6 +2135,13 @@ pub fn run() {
     } else {
         "shortcut Ctrl+Option+Space is taken"
     });
+    a.sync_login_item();
+    a.log(&format!(
+        "start at login: {}",
+        if super::login::enabled() { "on" } else { "off" }
+    ));
+    // The low-space check: now and every 10 min (a pill under 10% free).
+    crate::disk::start(&mut a);
     APP.with(|c| *c.borrow_mut() = Some(a));
 
     // The pointer anywhere: near the drop (slide out), aiming the dial, clicks elsewhere.

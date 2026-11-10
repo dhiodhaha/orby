@@ -25,11 +25,11 @@ pub use dupes::{
 };
 #[cfg(target_os = "macos")]
 pub use mac::{inside_package, is_package_name, MAC_PACKAGE_EXTENSIONS, MAC_SYSTEM_DIRS};
-pub use recycle::{has_recycle_bin, move_to_recycle_bin, recycle_bin_size, RecycleError, RecycleReport};
+pub use recycle::{has_recycle_bin, move_to_recycle_bin, put_back, recycle_bin_size, PutBackError, RecycleError, RecycleReport};
 pub use rules::{
     check_removal, is_unfinished_download, measure_rules, never_touch, recycle_rule_items, Group, Measured, Refusal, Rule, RuleEnv,
     RuleFound, RuleMeasure, Tier, NEVER_NAMES, NEVER_REMOVE_ROOTS, NEVER_TOUCH, RULES, UNFINISHED_DOWNLOAD,
 };
-pub use scan::{scan, Progress, ScanError, ScanOptions};
+pub use scan::{full_disk_access, protected_folders, scan, scan_waiting, Progress, ScanError, ScanOptions};
 pub use space::{drive_space, DriveSpace, LowSpaceWatch, LOW_SPACE_PERCENT, LOW_SPACE_STEP};
 pub use tree::{ChildShare, Node, NodeId, NodeKind, ScanStatus, SkipReason, Skipped, Tree};

@@ -22,24 +22,13 @@ use app_disk::{
 use app_downloads::{Ring, Tone};
 use app_habits::held::Priority;
 use serde::{Deserialize, Serialize};
-use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::*;
-use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::disk_model::{self as m, Rect, Removed, Row, Stamp, Summary};
 use crate::disk_panel::{self as dp, Card, Filter, Focus, Hit, Screen, Tab, View};
-use crate::disk_restore;
-use crate::disk_window::{self, Win};
-use crate::notices;
-use crate::pill::dismiss_pill;
+use crate::disk_sys::{self as sys, Win};
+use crate::notices_model::{Notice, Source as NoticeSource};
 use crate::ui::{self, Icon, Pill, PillAction};
-use crate::{
-    downloads, habits, log_line, memory_mb, orb, start_anim, store, App, TIMER_DISK,
-    TIMER_DISK_RELEASE, WM_APP_DISK,
-};
+use crate::App;
 
 /// The low-space check, as ORB_SPEC asks: every 10 minutes.
 const CHECK_MS: u32 = 10 * 60 * 1000;
@@ -49,7 +38,6 @@ const LIVE_EVERY: Duration = Duration::from_millis(150);
 const TOP_FILES: usize = 200;
 /// Downloads older than this are suggested (and marked Check first).
 const OLD_DAYS: u32 = 90;
-const DRIVE_FIXED: u32 = 3;
 pub const PICK_FOLDER: usize = 1;
 /// The low-space pill's cooldown kind in the notice queue.
 const LOW_SPACE: &str = "low-space";
@@ -222,7 +210,7 @@ impl Default for DupeRun {
 
 /// The hash cache, next to disk.json.
 fn dupes_cache() -> PathBuf {
-    store::data_dir().join("dupes-cache.json")
+    sys::data_dir().join("dupes-cache.json")
 }
 
 struct Confirm {
@@ -326,7 +314,7 @@ impl Fade {
         if (to - self.to).abs() < f32::EPSILON {
             return;
         }
-        let from = if downloads::reduced_motion() {
+        let from = if sys::reduced_motion() {
             to
         } else {
             self.value(now)
@@ -486,14 +474,21 @@ pub struct Disk {
 }
 
 fn data_file() -> PathBuf {
-    store::data_dir().join("disk.json")
+    sys::data_dir().join("disk.json")
 }
 
 impl Disk {
-    pub fn load(hwnd: HWND) -> Disk {
+    #[cfg(windows)]
+    pub fn load(hwnd: windows::Win32::Foundation::HWND) -> Disk {
         let mut d = Disk::load_from(data_file());
         d.win.hwnd = hwnd;
         d
+    }
+
+    /// The saved state (low-space pills shown, "Also find duplicate files"), nothing scanned.
+    #[cfg(not(windows))]
+    pub fn load() -> Disk {
+        Disk::load_from(data_file())
     }
 
     fn load_from(file: PathBuf) -> Disk {
@@ -593,25 +588,18 @@ impl Disk {
     }
 }
 
-/// Sends a report to the UI thread, posting WM_APP_DISK only when none is pending.
+/// Sends a report to the UI thread, waking it only when no wake is pending.
 #[derive(Clone)]
 struct Reporter {
     tx: Sender<Msg>,
     posted: Arc<AtomicBool>,
-    hwnd: isize,
+    waker: sys::Waker,
 }
 
 impl Reporter {
     fn send(&self, m: Msg) {
         if self.tx.send(m).is_ok() && !self.posted.swap(true, Ordering::AcqRel) {
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(self.hwnd as *mut _)),
-                    WM_APP_DISK,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
+            self.waker.wake();
         }
     }
 }
@@ -620,56 +608,22 @@ fn reporter(app: &App) -> Reporter {
     Reporter {
         tx: app.disk.tx.clone(),
         posted: Arc::clone(&app.disk.posted),
-        hwnd: app.hwnd.0 as isize,
+        waker: sys::waker(app),
     }
 }
 
 // ---- drives and the low-space pill ----
 
-fn fixed_drives() -> Vec<PathBuf> {
-    let mask = unsafe { GetLogicalDrives() };
-    (0..26u8)
-        .filter(|i| mask & (1 << i) != 0)
-        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
-        .filter(|p| unsafe { GetDriveTypeW(&HSTRING::from(p.as_os_str())) } == DRIVE_FIXED)
-        .collect()
-}
-
-/// "Windows", or "Local Disk" when the volume has no name.
-fn volume_label(root: &Path) -> String {
-    let mut name = [0u16; 261];
-    let ok = unsafe {
-        GetVolumeInformationW(
-            &HSTRING::from(root.as_os_str()),
-            Some(&mut name),
-            None,
-            None,
-            None,
-            None,
-        )
-    }
-    .is_ok();
-    let n = name.iter().position(|&c| c == 0).unwrap_or(0);
-    let s = String::from_utf16_lossy(&name[..n]);
-    if ok && !s.is_empty() {
-        s
-    } else {
-        "Local Disk".into()
-    }
-}
-
 /// At launch: the saved low-space state, the first check, and the 10 min timer.
 pub fn start(app: &mut App) {
-    unsafe {
-        SetTimer(Some(app.hwnd), TIMER_DISK, CHECK_MS, None);
-    }
+    sys::arm_check(app, CHECK_MS);
     let shown: Vec<String> = app
         .disk
         .watch
         .iter()
         .map(|(c, w)| format!("{c}: {w:?}"))
         .collect();
-    log_line(
+    sys::log(
         app,
         &format!("disk: low-space check every 10 min, saved {shown:?}"),
     );
@@ -682,7 +636,7 @@ pub fn on_timer(app: &mut App) {
 
 /// Reads each fixed drive and runs the pill rule on it.
 pub fn check_space(app: &mut App) {
-    let readings: Vec<(char, DriveSpace)> = fixed_drives()
+    let readings: Vec<(char, DriveSpace)> = sys::fixed_drives()
         .into_iter()
         .filter_map(|r| Some((m::drive_letter(&r)?, ad::drive_space(&r).ok()?)))
         .collect();
@@ -693,8 +647,8 @@ pub fn check_space(app: &mut App) {
 /// other drive that would fire is left for the next check, so pills never pile up. While the orb
 /// cannot show a pill the readings are not fed to the rule, so the pill comes later, not never.
 fn consider(app: &mut App, readings: &[(char, DriveSpace)]) {
-    if notices::quiet(app).holds() {
-        log_line(
+    if sys::quiet_holds(app) {
+        sys::log(
             app,
             &format!(
                 "disk: {} drive(s) not checked (orb hidden, full screen, focus or a pause)",
@@ -732,7 +686,7 @@ fn consider(app: &mut App, readings: &[(char, DriveSpace)]) {
         .collect();
     let Some((letter, space)) = readings.iter().find(|(c, _)| Some(*c) == pick).copied() else {
         if !low.is_empty() {
-            log_line(
+            sys::log(
                 app,
                 &format!(
                     "disk: low {low:?}, no pill (each was shown and has not dropped 5 more points)"
@@ -742,7 +696,7 @@ fn consider(app: &mut App, readings: &[(char, DriveSpace)]) {
         return;
     };
     let (title, value) = m::low_space_words(letter, space);
-    log_line(app, &format!("disk: low {low:?}, pill \"{title} {value}\""));
+    sys::log(app, &format!("disk: low {low:?}, pill \"{title} {value}\""));
     let p = Pill {
         icon: Icon::HardDrive,
         dot: false,
@@ -756,26 +710,27 @@ fn consider(app: &mut App, readings: &[(char, DriveSpace)]) {
         ttl_ms: 6000,
     };
     // "Disk space: once a day" (docs/design/notices.md): a second one waits out the day.
-    notices::post(
+    sys::post(
         app,
-        notices::Notice::new(notices::Source::Disk, Priority::Normal, p)
+        Notice::new(NoticeSource::Disk, Priority::Normal, p)
             .cooldown(LOW_SPACE, Duration::from_secs(86_400)),
     );
 }
 
 /// Test: the rule fed a made-up reading of C: with this much free. resh forgets the last C:
 /// pill first, as if free space had come back above 10%.
+#[cfg(windows)]
 pub fn test_low_space(app: &mut App, free_percent: f64, fresh: bool) {
     if fresh {
         app.disk.watch.insert('C', LowSpaceWatch::Armed);
-        notices::forget_cooldown(app, LOW_SPACE);
+        sys::forget_cooldown(app, LOW_SPACE);
     }
     let total = ad::drive_space(Path::new("C:\\")).map_or(476 << 30, |s| s.total);
     let space = DriveSpace {
         total,
         free: (total as f64 * free_percent / 100.0) as u64,
     };
-    log_line(app, &format!("disk: test reading C: {free_percent}% free"));
+    sys::log(app, &format!("disk: test reading C: {free_percent}% free"));
     consider(app, &[('C', space)]);
 }
 
@@ -783,7 +738,7 @@ pub fn test_low_space(app: &mut App, free_percent: f64, fresh: bool) {
 
 /// The low-space pill's action: scan the drive and show it scanning.
 pub fn find_big_folders(app: &mut App, letter: char) {
-    scan_path(app, PathBuf::from(format!("{letter}:\\")), true);
+    scan_path(app, sys::big_folders_root(letter), true);
     open(app);
 }
 
@@ -805,7 +760,12 @@ pub fn scan_path(app: &mut App, root: PathBuf, user: bool) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let mut last = Instant::now() - LIVE_EVERY;
-        let opts = ScanOptions::default();
+        // macOS without Full Disk Access: the folders it would stop to ask about are left out
+        // (and listed), so a scan never waits on a prompt. Nothing on Windows.
+        let opts = ScanOptions {
+            protected: ad::protected_folders(),
+            ..ScanOptions::default()
+        };
         let res = ad::scan(
             &r,
             &opts,
@@ -850,7 +810,7 @@ pub fn scan_path(app: &mut App, root: PathBuf, user: bool) {
         });
         rep.send(Msg::Scanned(id, res, took, dupes));
     });
-    log_line(app, &format!("disk: scanning {}", root.display()));
+    sys::log(app, &format!("disk: scanning {}", root.display()));
     stop_dupes(app);
     app.disk.dupes = Dupes {
         next_id: app.disk.dupes.next_id,
@@ -858,7 +818,7 @@ pub fn scan_path(app: &mut App, root: PathBuf, user: bool) {
     };
     app.disk.attention = false;
     let volume = if m::is_drive_root(&root) {
-        volume_label(&root)
+        sys::volume_label(&root)
     } else {
         String::new()
     };
@@ -895,7 +855,7 @@ pub fn scan_path(app: &mut App, root: PathBuf, user: bool) {
 fn stop(app: &mut App) {
     if let Scan::Running { cancel, .. } = &app.disk.scan {
         cancel.store(true, Ordering::Relaxed);
-        log_line(app, "disk: stop pressed");
+        sys::log(app, "disk: stop pressed");
     }
 }
 
@@ -905,7 +865,7 @@ fn scan_again(app: &mut App) {
         Scan::Failed { root, .. } | Scan::Running { root, .. } | Scan::Released { root } => {
             root.clone()
         }
-        Scan::Idle => PathBuf::from("C:\\"),
+        Scan::Idle => sys::default_root(),
     };
     scan_path(app, root, true);
 }
@@ -949,7 +909,7 @@ pub fn on_msg(app: &mut App) {
             Msg::Scanned(id, res, took, dupes) => {
                 let current = matches!(&app.disk.scan, Scan::Running { id: cur, .. } if *cur == id);
                 if let (true, Some((cands, kind))) = (current && res.is_ok(), dupes) {
-                    log_line(
+                    sys::log(
                         app,
                         &format!(
                             "disk: {} same-size groups, up to {} possible duplicates ({kind:?})",
@@ -982,7 +942,7 @@ pub fn on_msg(app: &mut App) {
             Msg::Dupes(id, report) => on_dupes(app, id, report),
             Msg::Suggestions(list, bin) => {
                 let total: u64 = list.iter().map(|s| s.total()).sum();
-                log_line(
+                sys::log(
                     app,
                     &format!("disk: safe to clean read, {} to review", m::size(total)),
                 );
@@ -1003,7 +963,7 @@ pub fn on_msg(app: &mut App) {
             }
             Msg::Rules(measured) => {
                 let list = m::CleanList::new(measured.found);
-                log_line(
+                sys::log(
                     app,
                     &format!(
                         "disk: cleaning rules measured, {} to review",
@@ -1040,7 +1000,7 @@ fn on_scanned(app: &mut App, id: u64, res: Result<Tree, ScanError>, took: Durati
         Ok(tree) => {
             let n = tree.node(tree.root());
             let status = tree.status();
-            log_line(
+            sys::log(
                 app,
                 &format!(
                     "disk: scanned {} in {:.2}s: {} files, {} folders, {} ({status:?}, {} skipped)",
@@ -1053,7 +1013,7 @@ fn on_scanned(app: &mut App, id: u64, res: Result<Tree, ScanError>, took: Durati
                 ),
             );
             let volume = if m::is_drive_root(&root) {
-                volume_label(&root)
+                sys::volume_label(&root)
             } else {
                 String::new()
             };
@@ -1098,11 +1058,11 @@ fn on_scanned(app: &mut App, id: u64, res: Result<Tree, ScanError>, took: Durati
                     closable: true,
                     ttl_ms: 6000,
                 };
-                notices::notify(app, notices::Source::Disk, p);
+                sys::notify(app, p);
             }
         }
         Err(error) => {
-            log_line(
+            sys::log(
                 app,
                 &format!("disk: scan of {} failed ({error})", root.display()),
             );
@@ -1121,13 +1081,13 @@ fn on_scanned(app: &mut App, id: u64, res: Result<Tree, ScanError>, took: Durati
                     closable: true,
                     ttl_ms: 8000,
                 };
-                notices::notify(app, notices::Source::Disk, p);
+                sys::notify(app, p);
             }
             app.disk.scan = Scan::Failed { root, error };
             app.disk.anim.veil = Fade::new(0.0);
         }
     }
-    orb::render_orb(app);
+    sys::render_orb(app);
 }
 
 // ---- duplicates ----
@@ -1157,7 +1117,7 @@ fn start_dupes(app: &mut App) {
         let report = ad::find_duplicates(&cands, &opts, |p| rep.send(Msg::DupeProgress(id, p)), &c);
         rep.send(Msg::Dupes(id, report));
     });
-    log_line(
+    sys::log(
         app,
         &format!(
             "disk: checking {} files for duplicates",
@@ -1175,7 +1135,7 @@ fn start_dupes(app: &mut App) {
 fn stop_dupes(app: &mut App) {
     if let DupeRun::Running { cancel, .. } = &app.disk.dupes.run {
         cancel.store(true, Ordering::Relaxed);
-        log_line(app, "disk: duplicate check stopped");
+        sys::log(app, "disk: duplicate check stopped");
     }
 }
 
@@ -1183,7 +1143,7 @@ fn on_dupes(app: &mut App, id: u64, report: ad::DupeReport) {
     if !matches!(&app.disk.dupes.run, DupeRun::Running { id: cur, .. } if *cur == id) {
         return;
     }
-    log_line(
+    sys::log(
         app,
         &format!(
             "disk: duplicates {}: {} groups, {} to reclaim, {} skipped, {} read, {} from the cache, {:?} with {} thread(s)",
@@ -1236,7 +1196,7 @@ fn open_dupes_place(app: &mut App) {
     app.disk.note = None;
     app.disk.dupes.first = 0;
     enter_rows(app);
-    log_line(app, "disk: duplicates");
+    sys::log(app, "disk: duplicates");
 }
 
 /// Tray 46: the Disk window on Duplicates (on the drive list when there is no scan yet).
@@ -1480,7 +1440,7 @@ fn dupe_groups(
             dp::DupeGroupView {
                 len,
                 name,
-                sub: m::dupe_group_words(len, s.reclaimable()),
+                sub: m::dupe_group_words(len, s.reclaimable(), s.shares_space()),
                 rows,
             }
         })
@@ -1515,12 +1475,12 @@ pub fn ring(app: &App) -> Option<Ring> {
 pub fn spinning(app: &App) -> bool {
     app.visible
         && ring(app) == Some(Ring::Reading)
-        && habits::ring(app).is_none()
-        && !downloads::reduced_motion()
+        && !sys::other_ring(app)
+        && !sys::reduced_motion()
 }
 
 pub fn spin_start(app: &App) -> f32 {
-    if downloads::reduced_motion() {
+    if sys::reduced_motion() {
         0.0
     } else {
         (app.disk.spin_from.elapsed().as_secs_f32() * 0.8).fract()
@@ -1542,18 +1502,18 @@ fn after(app: &mut App) {
     let r = ring(app);
     if ring_moved(app.disk.last_ring, r) {
         app.disk.last_ring = r;
-        orb::render_orb(app);
+        sys::render_orb(app);
         if spinning(app) {
-            start_anim(app);
+            sys::start_anim(app);
         }
     }
     if app.pill.as_ref().is_some_and(is_hover_pill) && !app.pill_closing {
         match hover_pill(app) {
-            Some(p) => notices::live(app, p),
-            None => dismiss_pill(app),
+            Some(p) => sys::live(app, p),
+            None => sys::dismiss_pill(app),
         }
     }
-    disk_window::refresh(app);
+    sys::window::refresh(app);
 }
 
 fn is_hover_pill(p: &Pill) -> bool {
@@ -1589,11 +1549,11 @@ pub fn on_orb_near(app: &mut App, close: bool) {
         app.disk.hover_named = false;
         return;
     }
-    if app.disk.hover_named || app.pill.is_some() || app.dial_open || habits::ring(app).is_some() {
+    if app.disk.hover_named || app.pill.is_some() || app.dial_open || sys::other_ring(app) {
         return;
     }
     if let Some(p) = hover_pill(app) {
-        notices::reply(app, p);
+        sys::reply(app, p);
         app.disk.hover_named = true;
     }
 }
@@ -1601,7 +1561,7 @@ pub fn on_orb_near(app: &mut App, close: bool) {
 pub fn on_orb_gone(app: &mut App) {
     app.disk.hover_named = false;
     if !app.pill_closing && app.pill.as_ref().is_some_and(is_hover_pill) {
-        dismiss_pill(app);
+        sys::dismiss_pill(app);
     }
 }
 
@@ -1616,9 +1576,12 @@ pub fn dial_child(app: &App) -> ui::DialChild {
             m::drive_percent(*s, live.on_disk, true).floor() as u64
         ),
         Scan::Running { .. } => "scanning".into(),
-        _ => ad::drive_space(Path::new("C:\\"))
-            .map(|s| format!("C: {} free", m::size_round(s.free)))
-            .unwrap_or_default(),
+        _ => {
+            let drive = sys::main_drive();
+            ad::drive_space(&drive)
+                .map(|s| format!("{} {} free", m::drive_label(&drive), m::size_round(s.free)))
+                .unwrap_or_default()
+        }
     };
     ui::DialChild {
         text: String::new(),
@@ -1677,14 +1640,14 @@ fn ask(
     }
     if !ad::has_recycle_bin(&items[0].0) {
         let drive = m::drive_label(&items[0].0);
-        log_line(
+        sys::log(
             app,
             &format!("disk: {drive} has no Recycle Bin, only Open in Explorer"),
         );
         app.disk.note = Some(Note::NoBin(drive, items[0].0.clone()));
         return;
     }
-    log_line(app, &format!("disk: confirm {} item(s)", items.len()));
+    sys::log(app, &format!("disk: confirm {} item(s)", items.len()));
     app.disk.confirm = Some(Confirm {
         items,
         lines,
@@ -1714,12 +1677,13 @@ fn confirm_move(app: &mut App) {
         .filter(|p| !rules.iter().any(|(_, q)| q == p) && !dupes.iter().any(|d| &d.path == p))
         .collect();
     app.disk.asked = c.items;
-    log_line(
+    sys::log(
         app,
         &format!(
-            "disk: moving {} item(s) and {} rule folder(s) to the Recycle Bin",
+            "disk: moving {} item(s) and {} rule folder(s) to {}",
             paths.len(),
-            rules.len()
+            rules.len(),
+            m::os::THE_BIN
         ),
     );
     let (rep, source) = (reporter(app), c.source);
@@ -1751,11 +1715,12 @@ fn on_recycled(app: &mut App, report: RecycleReport, since: SystemTime, source: 
         .iter()
         .map(|(p, e)| format!("{} ({e:?})", p.display()))
         .collect();
-    log_line(
+    sys::log(
         app,
         &format!(
-            "disk: moved {} to the Recycle Bin, {} stayed {failed:?}",
+            "disk: moved {} to {}, {} stayed {failed:?}",
             report.moved.len(),
+            m::os::THE_BIN,
             report.failed.len()
         ),
     );
@@ -1809,7 +1774,7 @@ fn on_recycled(app: &mut App, report: RecycleReport, since: SystemTime, source: 
     }
     if !window_shown(app) {
         let (title, value) = m::in_bin_words(all);
-        notices::reply(
+        sys::reply(
             app,
             Pill {
                 icon: Icon::Trash,
@@ -1862,7 +1827,7 @@ pub fn undo(app: &mut App) {
     let Some(last) = app.disk.last_move.take() else {
         return;
     };
-    let results = disk_restore::restore(&last.paths, last.since);
+    let results = sys::restore(&last.paths, last.since);
     let back: Vec<PathBuf> = results
         .iter()
         .filter(|(_, r)| r.is_ok())
@@ -1872,7 +1837,7 @@ pub fn undo(app: &mut App) {
         .iter()
         .filter_map(|(p, r)| r.err().map(|e| format!("{} ({e:?})", p.display())))
         .collect();
-    log_line(
+    sys::log(
         app,
         &format!(
             "disk: undo put back {}, {} stayed {stayed:?}",
@@ -1916,7 +1881,16 @@ fn clean_places() -> CleanPlaces {
             temp: vec![root.join("Temp")],
             browser_user_data: vec![root.join("Browser").join("User Data")],
         },
-        None => CleanPlaces::for_current_user(),
+        None => {
+            // Never a place macOS would stop to ask about (Downloads without Full Disk Access).
+            let protected = ad::protected_folders();
+            let mut p = CleanPlaces::for_current_user();
+            if p.downloads.as_ref().is_some_and(|d| protected.contains(d)) {
+                p.downloads = None;
+            }
+            p.temp.retain(|t| !protected.contains(t));
+            p
+        }
     }
 }
 
@@ -1970,12 +1944,12 @@ fn open_clean(app: &mut App) {
     app.disk.clean_first = 0;
     enter_rows(app);
     read_suggestions(app);
-    log_line(app, "disk: safe to clean");
+    sys::log(app, "disk: safe to clean");
 }
 
 /// Rows enter with the ripple (a new level, tab, list or filter).
 fn enter_rows(app: &mut App) {
-    app.disk.anim.ripple_at = (!downloads::reduced_motion()).then(Instant::now);
+    app.disk.anim.ripple_at = (!sys::reduced_motion()).then(Instant::now);
     app.disk
         .anim
         .rolls
@@ -2066,7 +2040,7 @@ fn open_review(app: &mut App, i: usize) {
     app.disk.note = None;
     let kind = s.kind;
     enter_rows(app);
-    log_line(app, &format!("disk: review {kind:?}"));
+    sys::log(app, &format!("disk: review {kind:?}"));
 }
 
 // ---- the window ----
@@ -2076,12 +2050,10 @@ fn window_shown(app: &App) -> bool {
 }
 
 pub fn open(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_DISK_RELEASE);
-    }
+    sys::disarm_release(app);
     if let Scan::Released { root } = &app.disk.scan {
         let root = root.clone();
-        log_line(app, "disk: scanning again, the last tree was let go");
+        sys::log(app, "disk: scanning again, the last tree was let go");
         scan_path(app, root, true);
     }
     if matches!(app.disk.scan, Scan::Done(_)) && !window_shown(app) {
@@ -2091,7 +2063,7 @@ pub fn open(app: &mut App) {
     }
     if app.disk.attention {
         app.disk.attention = false;
-        orb::render_orb(app);
+        sys::render_orb(app);
     }
     let offers_undo = match &app.disk.note {
         Some(Note::Moved(_)) => true,
@@ -2112,18 +2084,18 @@ pub fn open(app: &mut App) {
         to_start(app);
     }
     app.disk.kb = false;
-    disk_window::show(app);
+    sys::window::show(app);
 }
 
 /// Every way into the drive list goes through here, so the list is never stale or empty.
 fn to_start(app: &mut App) {
     app.disk.place = Place::Start;
-    app.disk.drives = fixed_drives()
+    app.disk.drives = sys::fixed_drives()
         .into_iter()
         .filter_map(|r| {
             ad::drive_space(&r)
                 .ok()
-                .map(|s| (r.clone(), volume_label(&r), s, ad::drive_kind(&r)))
+                .map(|s| (r.clone(), sys::volume_label(&r), s, ad::drive_kind(&r)))
         })
         .collect();
 }
@@ -2145,13 +2117,7 @@ fn level(app: &mut App) {
     if !matches!(app.disk.scan, Scan::Done(_)) {
         return;
     }
-    let map = dp::map_rect(
-        &app.g,
-        &app.fonts,
-        app.disk.win.w,
-        app.disk.win.room,
-        &cards(app),
-    );
+    let map = dp::map_rect(&app.fonts, app.disk.win.w, app.disk.win.room, &cards(app));
     let Scan::Done(d) = &app.disk.scan else {
         return;
     };
@@ -2323,17 +2289,7 @@ fn file_icon(name: &std::ffi::OsStr) -> Icon {
 }
 
 fn stamp(t: SystemTime) -> Stamp {
-    let secs = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let mo = store::local(secs);
-    let d = mo.date();
-    Stamp {
-        year: d.year(),
-        month: d.month(),
-        day: d.day(),
-        minute: mo.minute_of_day(),
-    }
+    sys::stamp(t)
 }
 
 fn now_stamp() -> Stamp {
@@ -2721,7 +2677,7 @@ fn live_results(app: &App, now: Instant) -> Option<dp::ResultsView> {
             }
         })
         .collect();
-    let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.w, app.disk.win.room, &[]);
+    let map = dp::map_rect(&app.fonts, app.disk.win.w, app.disk.win.room, &[]);
     let sizes: Vec<u64> = live.rows.iter().map(|r| r.size).collect();
     let skeleton = space.map_or(0, |s| s.used().saturating_sub(live.on_disk));
     let tiles = fit_tiles(&sizes, map, skeleton, &|_, _| Vec::new());
@@ -2950,7 +2906,7 @@ fn results_view(app: &App, now: Instant) -> Option<dp::ResultsView> {
 fn kind_words(kind: SuggestionKind) -> (&'static str, Icon) {
     match kind {
         SuggestionKind::OldDownloads => ("Downloads older than 90 days", Icon::Download),
-        SuggestionKind::TempFiles => ("Windows temp files", Icon::Layers),
+        SuggestionKind::TempFiles => (m::os::TEMP_FILES, Icon::Layers),
         SuggestionKind::BrowserCaches => ("Browser caches", Icon::Globe),
     }
 }
@@ -2970,12 +2926,8 @@ fn kind_body(s: &ad::Suggestion, all_files: bool) -> String {
             };
             format!("{what} from before {cutoff}. They're yours, so look first.")
         }
-        SuggestionKind::TempFiles => {
-            "Windows makes new ones when needed. Files in use are skipped.".into()
-        }
-        SuggestionKind::BrowserCaches => {
-            "Edge and Chrome load sites a bit slower for a day. You stay signed in.".into()
-        }
+        SuggestionKind::TempFiles => m::os::TEMP_BODY.into(),
+        SuggestionKind::BrowserCaches => m::os::BROWSER_BODY.into(),
     }
 }
 
@@ -3186,6 +3138,9 @@ fn review_view(app: &App) -> Option<dp::ReviewView> {
     })
 }
 
+/// The skipped-folders card's button on macOS: System Settings, Full Disk Access.
+const FULL_DISK_ACCESS: &str = "Open Settings";
+
 fn cards(app: &App) -> Vec<Card> {
     let mut out = Vec::new();
     let card = |icon, ember, title: String, body: String, button: Option<&str>| Card {
@@ -3210,8 +3165,41 @@ fn cards(app: &App) -> Vec<Card> {
                     out.push(card(Icon::Stop, false, at, format!("Showing the {} counted so far, so some folders look smaller than they are.", m::size(n.size())), Some("Scan again")));
                 }
                 let skipped = d.tree.skipped().len() as u64;
-                if skipped > 0 {
-                    out.push(card(Icon::Lock, false, format!("{} skipped", m::plural(skipped, "folder was", "folders were")), "Windows keeps them private, so what is in them is not counted. The scan went on past them.".into(), None));
+                // macOS: folders it would not list wait for Full Disk Access, which only you grant.
+                let denied = d
+                    .tree
+                    .skipped()
+                    .iter()
+                    .filter(|k| {
+                        matches!(
+                            k.reason,
+                            ad::SkipReason::AccessDenied | ad::SkipReason::Protected
+                        )
+                    })
+                    .count() as u64;
+                if !cfg!(windows) && denied > 0 {
+                    out.push(card(
+                        Icon::Lock,
+                        false,
+                        "Some folders need Full Disk Access".into(),
+                        format!(
+                            "{} skipped. {}",
+                            m::plural(skipped, "folder was", "folders were"),
+                            m::os::SKIPPED_BODY
+                        ),
+                        Some(FULL_DISK_ACCESS),
+                    ));
+                } else if skipped > 0 {
+                    out.push(card(
+                        Icon::Lock,
+                        false,
+                        format!(
+                            "{} skipped",
+                            m::plural(skipped, "folder was", "folders were")
+                        ),
+                        m::os::SKIPPED_BODY.into(),
+                        None,
+                    ));
                 }
             }
         }
@@ -3254,10 +3242,12 @@ fn cards(app: &App) -> Vec<Card> {
         Some(Note::NoBin(drive, _)) => out.push(card(
             Icon::Shield,
             false,
-            format!("{drive} has no Recycle Bin"),
-            "Files on this drive would be gone for good, so Orby only opens them in Explorer."
-                .into(),
-            Some("Open in Explorer"),
+            format!("{drive} has no {}", m::os::BIN),
+            format!(
+                "Files on this drive would be gone for good, so Orby only opens them in {}.",
+                m::os::VIEWER
+            ),
+            Some(m::os::OPEN_IN),
         )),
         Some(Note::Restored { back, stayed }) => {
             let body = if *stayed == 0 && *back == 1 {
@@ -3265,7 +3255,7 @@ fn cards(app: &App) -> Vec<Card> {
             } else if *stayed == 0 {
                 "They are back where they were.".into()
             } else {
-                format!("{} stayed in the Recycle Bin: something new is at its old place, or it is no longer there. Nothing was overwritten.", m::plural(*stayed as u64, "item", "items"))
+                format!("{} stayed in {}: something new is at its old place, or it is no longer there. Nothing was overwritten.", m::plural(*stayed as u64, "item", "items"), m::os::THE_BIN)
             };
             out.push(card(
                 Icon::Refresh,
@@ -3311,12 +3301,12 @@ fn confirm_view(app: &App) -> Option<dp::ConfirmView> {
         title: m::confirm_title(n),
         groups,
         note: if n == 1 {
-            "You can put it back from the Recycle Bin until it's emptied. Orby never empties it for you."
+            m::os::PUT_IT_BACK
         } else {
-            "You can put them back from the Recycle Bin until it's emptied. Orby never empties it for you."
+            m::os::PUT_THEM_BACK
         },
-        footer: format!("Moving {} to the Recycle Bin", dp::size_label(total)),
-        action: format!("Move {n} to Recycle Bin"),
+        footer: format!("Moving {} to {}", dp::size_label(total), m::os::THE_BIN),
+        action: format!("Move {n} to {}", m::os::BIN),
         on_move: c.on_move,
     })
 }
@@ -3324,7 +3314,7 @@ fn confirm_view(app: &App) -> Option<dp::ConfirmView> {
 /// The moving parts as this frame shows them.
 fn motion(app: &App, now: Instant) -> dp::Motion {
     let a = &app.disk.anim;
-    let calm = downloads::reduced_motion();
+    let calm = sys::reduced_motion();
     let dim = a.dim.value(now);
     let reflow_p = if calm {
         1.0
@@ -3384,7 +3374,7 @@ fn reflow_ease(app: &App, p: f32) -> f32 {
 fn screen_tiles(app: &App) -> Option<(Vec<dp::MapTile>, Vec<String>)> {
     match &app.disk.scan {
         Scan::Running { space, live, .. } if app.disk.place == Place::Scanning => {
-            let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.w, app.disk.win.room, &[]);
+            let map = dp::map_rect(&app.fonts, app.disk.win.w, app.disk.win.room, &[]);
             let sizes: Vec<u64> = live.rows.iter().map(|r| r.size).collect();
             let skeleton = space.map_or(0, |s| s.used().saturating_sub(live.on_disk));
             Some((
@@ -3415,7 +3405,7 @@ fn screen_tiles(app: &App) -> Option<(Vec<dp::MapTile>, Vec<String>)> {
 /// there is left alone, so redraws in between do not restart anything.
 fn sync_motion(app: &mut App) {
     let now = Instant::now();
-    let calm = downloads::reduced_motion();
+    let calm = sys::reduced_motion();
     // Tiles: a new layout starts a reflow from wherever each tile is drawn now.
     if let Some((tiles, names)) = screen_tiles(app) {
         let to: Vec<(String, Rect)> = tiles
@@ -3518,7 +3508,7 @@ fn sync_motion(app: &mut App) {
 pub fn animating(app: &App) -> bool {
     let now = Instant::now();
     let a = &app.disk.anim;
-    let calm = downloads::reduced_motion();
+    let calm = sys::reduced_motion();
     let scanning =
         matches!(app.disk.scan, Scan::Running { .. }) && app.disk.place == Place::Scanning;
     let veil_waits = matches!(app.disk.scan, Scan::Done(_)) && a.veil.to > 0.0;
@@ -3583,7 +3573,7 @@ pub fn view(app: &App) -> View {
                 .drives
                 .iter()
                 .map(|(r, label, s, kind)| dp::DriveRow {
-                    name: format!("{} {label}", m::drive_label(r)),
+                    name: m::drive_row_name(r, label),
                     free: format!(
                         "{} free of {}{}",
                         m::size_round(s.free),
@@ -3614,7 +3604,7 @@ pub fn view(app: &App) -> View {
 }
 
 pub fn size(app: &App) -> (f32, f32) {
-    dp::size(&app.g, &app.fonts, &view(app))
+    dp::size(&app.fonts, &view(app))
 }
 
 /// Before a draw: the results level for where the window is (it is computed once per place),
@@ -3625,42 +3615,21 @@ pub fn prepare(app: &mut App) {
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    dp::hit(&app.g, &app.fonts, &view(app), x, y)
+    dp::hit(&app.fonts, &view(app), x, y)
 }
 
 /// Data behind the window changed: rebuild the level and redraw.
 fn refresh(app: &mut App) {
     level(app);
-    disk_window::refresh(app);
+    sys::window::refresh(app);
 }
 
-fn shell(file: &str, params: Option<&str>) {
-    let params = params.map(HSTRING::from);
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            &HSTRING::from(file),
-            params
-                .as_ref()
-                .map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-    }
-}
-
-/// A folder opens; a file is shown selected in its folder.
 fn open_in_explorer(app: &mut App, p: &Path) {
-    log_line(app, &format!("disk: open in Explorer {}", p.display()));
-    if p.is_dir() {
-        shell(&p.to_string_lossy(), None);
-    } else {
-        shell(
-            "explorer.exe",
-            Some(&format!("/select,\"{}\"", p.display())),
-        );
-    }
+    sys::log(
+        app,
+        &format!("disk: show in the file viewer {}", p.display()),
+    );
+    sys::show_in_folder(p);
 }
 
 fn node_items(app: &App, ids: &[NodeId]) -> Vec<(PathBuf, u64)> {
@@ -3716,7 +3685,7 @@ fn up(app: &mut App) {
 }
 
 fn keep_visible(app: &mut App) {
-    let fit = dp::fit(&app.g, &app.fonts, &view(app));
+    let fit = dp::fit(&app.fonts, &view(app));
     if let Some(s) = app.disk.sel {
         if s < app.disk.first {
             app.disk.first = s;
@@ -4052,7 +4021,11 @@ fn card_action(app: &mut App, i: usize) {
         }
         Some("Scan again") | Some("Try again") => scan_again(app),
         Some("Undo") => undo(app),
-        Some("Open in Explorer") => {
+        Some(FULL_DISK_ACCESS) => {
+            sys::log(app, "disk: open Privacy & Security, Full Disk Access");
+            sys::open_privacy_settings();
+        }
+        Some(l) if l == m::os::OPEN_IN => {
             if let Some(Note::NoBin(_, p)) = &app.disk.note {
                 let p = p.clone();
                 open_in_explorer(app, &p);
@@ -4077,7 +4050,7 @@ pub fn click(app: &mut App, h: Hit) {
         Hit::Cancel => {
             app.disk.confirm = None;
             app.disk.merge_next = false;
-            log_line(app, "disk: confirm cancelled");
+            sys::log(app, "disk: confirm cancelled");
         }
         Hit::Move => confirm_move(app),
         Hit::Sheet => {}
@@ -4087,14 +4060,7 @@ pub fn click(app: &mut App, h: Hit) {
             }
         }
         // The picker belongs to the Disk window, so it opens over it.
-        Hit::ScanFolder => unsafe {
-            let _ = PostMessageW(
-                Some(app.disk.win.hwnd),
-                WM_APP_DISK,
-                WPARAM(PICK_FOLDER),
-                LPARAM(0),
-            );
-        },
+        Hit::ScanFolder => sys::pick_folder(app),
         Hit::OpenClean => open_clean(app),
         Hit::Stop => stop(app),
         Hit::ScanAgain => scan_again(app),
@@ -4178,12 +4144,12 @@ pub fn click(app: &mut App, h: Hit) {
         },
         Hit::CleanCheck(i) => toggle_clean(app, i),
         Hit::BinOpen => {
-            log_line(app, "disk: open the Recycle Bin");
-            shell("shell:RecycleBinFolder", None);
+            sys::log(app, "disk: open the Recycle Bin");
+            sys::open_bin();
         }
         Hit::Settings => {
-            log_line(app, "disk: open Storage settings");
-            shell("ms-settings:storagesense", None);
+            sys::log(app, "disk: open Storage settings");
+            sys::open_storage_settings();
         }
         Hit::ReviewFolder => {
             let p = app.disk.review.as_ref().and_then(|r| {
@@ -4197,11 +4163,11 @@ pub fn click(app: &mut App, h: Hit) {
         }
         Hit::Card(i) => card_action(app, i),
         Hit::Close => {
-            disk_window::close(app);
+            sys::window::close(app);
             return;
         }
         Hit::Max => {
-            crate::frame::toggle(app.disk.win.hwnd);
+            sys::toggle_max(app);
             return;
         }
         Hit::OpenDupes => open_dupes_place(app),
@@ -4233,7 +4199,7 @@ pub fn click(app: &mut App, h: Hit) {
 fn toggle_find_dupes(app: &mut App) {
     app.disk.find_dupes = !app.disk.find_dupes;
     app.disk.save();
-    log_line(
+    sys::log(
         app,
         &format!("disk: find duplicate files {}", app.disk.find_dupes),
     );
@@ -4256,9 +4222,20 @@ fn list_len(app: &App) -> usize {
     }
 }
 
+// The keys the window answers, as Windows' virtual-key codes (macOS maps its key codes to them).
+pub const VK_BACK: u16 = 0x08;
+pub const VK_TAB: u16 = 0x09;
+pub const VK_RETURN: u16 = 0x0D;
+pub const VK_SPACE: u16 = 0x20;
+pub const VK_LEFT: u16 = 0x25;
+pub const VK_UP: u16 = 0x26;
+pub const VK_RIGHT: u16 = 0x27;
+pub const VK_DOWN: u16 = 0x28;
+pub const VK_DELETE: u16 = 0x2E;
+
 /// WM_KEYDOWN in the Disk window (Esc goes to on_esc). Returns whether the key was used.
 pub fn on_keydown(app: &mut App, vk: u16) -> bool {
-    let key = VIRTUAL_KEY(vk);
+    let key = vk;
     if app.disk.confirm.is_some() {
         match key {
             VK_TAB | VK_LEFT | VK_RIGHT => {
@@ -4272,7 +4249,7 @@ pub fn on_keydown(app: &mut App, vk: u16) -> bool {
                 } else {
                     app.disk.confirm = None;
                     app.disk.merge_next = false;
-                    log_line(app, "disk: confirm cancelled");
+                    sys::log(app, "disk: confirm cancelled");
                 }
             }
             _ => return false,
@@ -4417,10 +4394,10 @@ pub fn on_keydown(app: &mut App, vk: u16) -> bool {
 pub fn on_esc(app: &mut App) {
     if app.disk.confirm.take().is_some() {
         app.disk.merge_next = false;
-        log_line(app, "disk: confirm cancelled");
+        sys::log(app, "disk: confirm cancelled");
         refresh(app);
     } else {
-        disk_window::close(app);
+        sys::window::close(app);
     }
 }
 
@@ -4428,8 +4405,8 @@ pub fn on_esc(app: &mut App) {
 pub fn on_wheel(app: &mut App, x: f32, y: f32, delta: i16) {
     level(app);
     let v = view(app);
-    let fit = dp::fit(&app.g, &app.fonts, &v);
-    let target = dp::scroll_target(&app.g, &app.fonts, &v, x, y);
+    let fit = dp::fit(&app.fonts, &v);
+    let target = dp::scroll_target(&app.fonts, &v, x, y);
     let step = if delta > 0 { -1i64 } else { 1 };
     match target {
         Some(dp::Scroll::Folders) => {
@@ -4471,7 +4448,7 @@ pub fn on_wheel(app: &mut App, x: f32, y: f32, delta: i16) {
         }
         None => return,
     }
-    disk_window::refresh_soon(app);
+    sys::window::refresh_soon(app);
 }
 
 /// A scan's tree takes about 130 bytes per file and folder (a whole drive is hundreds of MB), so it
@@ -4479,22 +4456,20 @@ pub fn on_wheel(app: &mut App, x: f32, y: f32, delta: i16) {
 const RELEASE_MS: u32 = 3 * 60 * 1000;
 
 pub fn on_release_timer(app: &mut App) {
-    unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_DISK_RELEASE);
-    }
+    sys::disarm_release(app);
     if window_shown(app) {
         return;
     }
     let Some(root) = app.disk.done().map(|d| d.tree.root_path().to_path_buf()) else {
         return;
     };
-    let (before, _) = memory_mb();
+    let (before, _) = sys::memory_mb();
     app.disk.scan = Scan::Released { root };
     app.disk.level = None;
     app.disk.removed = Removed::default();
     app.disk.checked.clear();
-    let (after, private) = memory_mb();
-    log_line(
+    let (after, private) = sys::memory_mb();
+    sys::log(
         app,
         &format!(
             "disk: let the scan tree go, ws {before:.1}MB -> {after:.1}MB (private {private:.1}MB)"
@@ -4518,9 +4493,7 @@ pub fn on_closed(app: &mut App) {
     app.disk.confirm = None;
     app.disk.kb = false;
     if app.disk.done().is_some() {
-        unsafe {
-            SetTimer(Some(app.hwnd), TIMER_DISK_RELEASE, RELEASE_MS, None);
-        }
+        sys::arm_release(app, RELEASE_MS);
     }
     // While the window was open its card carried Undo; the orb offers it once more on the way out.
     let moved = match &app.disk.note {
@@ -4533,7 +4506,7 @@ pub fn on_closed(app: &mut App) {
         if fresh && !last.offered {
             last.offered = true;
             let (title, value) = m::in_bin_words(last.paths.len().max(n));
-            notices::reply(
+            sys::reply(
                 app,
                 Pill {
                     icon: Icon::Trash,
@@ -4557,11 +4530,12 @@ pub fn on_closed(app: &mut App) {
 
 /// Tray: scan the folder or drive whose path is on the clipboard, in the background: the ring
 /// shows it, and the Scan done (or error) pill says when it ends.
+#[cfg(windows)]
 pub fn scan_clipboard(app: &mut App) {
     let text = crate::tasks::read_clipboard(app.hwnd).unwrap_or_default();
     let p = PathBuf::from(text.trim().trim_matches('"'));
     if p.as_os_str().is_empty() || !p.is_absolute() {
-        log_line(app, "disk: the clipboard holds no folder path");
+        sys::log(app, "disk: the clipboard holds no folder path");
         return;
     }
     scan_path(app, p, true);
@@ -4571,7 +4545,7 @@ pub fn scan_clipboard(app: &mut App) {
 pub fn on_folder_picked(app: &mut App, folder: Option<PathBuf>) {
     match folder {
         Some(f) => scan_path(app, f, true),
-        None => log_line(app, "disk: no folder picked"),
+        None => sys::log(app, "disk: no folder picked"),
     }
 }
 
@@ -4584,7 +4558,143 @@ pub fn shutdown(app: &mut App) {
     }
 }
 
-#[cfg(test)]
+/// One line about where the window is, for the log (the Mac's test commands).
+#[cfg_attr(windows, allow(dead_code))]
+pub fn state_line(app: &App) -> String {
+    let scan = match &app.disk.scan {
+        Scan::Idle => "idle".to_string(),
+        Scan::Running { root, live, .. } => format!(
+            "running {} ({} files so far, waiting on {:?})",
+            root.display(),
+            live.files,
+            ad::scan_waiting(Duration::from_secs(2))
+        ),
+        Scan::Done(d) => {
+            let n = d.tree.node(d.tree.root());
+            format!(
+                "done {} ({} files, {}, {} skipped)",
+                d.tree.root_path().display(),
+                n.files(),
+                m::size(n.size()),
+                d.tree.skipped().len()
+            )
+        }
+        Scan::Failed { root, error } => format!("failed {} ({error})", root.display()),
+        Scan::Released { root } => format!("released {}", root.display()),
+    };
+    let dupes = match &app.disk.dupes.run {
+        DupeRun::Idle { stopped } => format!(
+            "idle{} (up to {})",
+            if *stopped { ", stopped" } else { "" },
+            m::size(app.disk.dupes.cands.as_ref().map_or(0, |c| c.possible))
+        ),
+        DupeRun::Running { progress, .. } => format!("running {progress:?}"),
+        DupeRun::Done { list, skipped } => format!(
+            "{} groups, {} to reclaim, {} sharing space, {skipped} skipped",
+            list.shown().len(),
+            m::size(list.reclaimable()),
+            list.sets
+                .iter()
+                .filter(|s| s.shown() && s.shares_space())
+                .count()
+        ),
+    };
+    let v = view(app);
+    let screen = match &v.screen {
+        Screen::Start(d, _) => format!("start ({} places)", d.len()),
+        Screen::Results(r) => format!(
+            "results {:?}: {} rows, {} files, chip {:?} {:?}, big {:?} {:?}",
+            r.tab,
+            r.rows.len(),
+            r.files.len(),
+            r.chip,
+            r.chip_sub,
+            r.big,
+            r.of
+        ),
+        Screen::Clean(c) => format!("clean: {} groups, total {}", c.groups.len(), c.total),
+        Screen::Review(r) => format!("review {:?}: {} items", r.title, r.len),
+        Screen::Dupes(d) => format!("dupes: {} {}", d.total, d.sub),
+    };
+    format!(
+        "{screen}; scan {scan}; dupes {dupes}; selected {:?}; confirm {:?}; cards {:?}; window {:.0}x{:.0} open {}",
+        selection(app),
+        v.confirm.as_ref().map(|c| (&c.title, &c.action)),
+        v.cards.iter().map(|c| c.title.clone()).collect::<Vec<_>>(),
+        app.disk.win.w,
+        app.disk.win.room,
+        app.disk.win.open
+    )
+}
+
+/// Test commands (the Mac's `dev.dhio.orby.test` channel): `disk-scan:<path>`, `disk-tab:files`,
+/// `disk-file:<i>`, `disk-row:<i>`, `disk-dupes`, `disk-dupes-check`, `disk-dupe-pick:<g>,<r>`,
+/// `disk-clean`, `disk-back`, `disk-confirm`, `disk-cancel`, `disk-key:<vk>`,
+/// `disk-wheel:<x>,<y>,<delta>`, and `disk-move`, which only ever moves items under the
+/// temporary folder (a test's own files): anything else on the sheet is refused.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn test_command(app: &mut App, cmd: &str) {
+    let (name, arg) = cmd.split_once(':').unwrap_or((cmd, ""));
+    let nums: Vec<i64> = arg
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
+    let n = |i: usize| nums.get(i).copied().unwrap_or(0);
+    match name {
+        "disk-scan" => {
+            let p = PathBuf::from(arg);
+            if p.is_absolute() {
+                scan_path(app, p, true);
+                open(app);
+            }
+        }
+        "disk-tab" => click(
+            app,
+            Hit::Tab(match arg {
+                "files" => Tab::Files,
+                "types" => Tab::Types,
+                _ => Tab::Folders,
+            }),
+        ),
+        "disk-file" => click(app, Hit::File(n(0) as usize)),
+        "disk-row" => click(app, Hit::Row(n(0) as usize)),
+        "disk-rowcheck" => click(app, Hit::RowCheck(n(0) as usize)),
+        "disk-dupes" => click(app, Hit::OpenDupes),
+        "disk-dupes-check" => click(app, Hit::DupesCheck),
+        "disk-dupe-pick" => click(app, Hit::DupeCheck(n(0) as usize, n(1) as usize)),
+        "disk-clean" => click(app, Hit::OpenClean),
+        "disk-back" => click(app, Hit::Back),
+        "disk-drive" => click(app, Hit::ScanDrive(n(0) as usize)),
+        "disk-confirm" => click(app, Hit::SelRecycle),
+        "disk-cancel" => click(app, Hit::Cancel),
+        "disk-key" => {
+            on_keydown(app, n(0) as u16);
+        }
+        "disk-wheel" => on_wheel(app, n(0) as f32, n(1) as f32, n(2) as i16),
+        "disk-move" => {
+            let tmp = std::env::temp_dir();
+            let tmp = tmp.canonicalize().unwrap_or(tmp);
+            let ok = app.disk.confirm.as_ref().is_some_and(|c| {
+                !c.items.is_empty()
+                    && c.items.iter().all(|(p, _)| {
+                        p.canonicalize()
+                            .is_ok_and(|q| q.starts_with(&tmp) && q != tmp)
+                    })
+            });
+            if ok {
+                click(app, Hit::Move);
+            } else {
+                sys::log(
+                    app,
+                    "disk: test move refused (only items under the temporary folder)",
+                );
+            }
+        }
+        _ => sys::log(app, &format!("disk: unknown test command {cmd}")),
+    }
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
@@ -4667,6 +4777,7 @@ mod tests {
                             )),
                             size,
                             modified: Some(now - Duration::from_secs((g * 7 + k) as u64 * 3600)),
+                            frees: None,
                         })
                         .collect(),
                 }
@@ -4677,7 +4788,9 @@ mod tests {
 
     /// Milliseconds between WM_TIMERs of a `ms` thread timer, averaged over `n` ticks.
     fn timer_interval(ms: u32, n: u32) -> f64 {
-        use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, SetTimer, MSG, WM_TIMER};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetMessageW, KillTimer, SetTimer, MSG, WM_TIMER,
+        };
         unsafe {
             let id = SetTimer(None, 0, ms, None);
             let mut msg = MSG::default();
@@ -4805,15 +4918,21 @@ mod tests {
                 max: false,
                 motion: dp::Motion::default(),
             };
-            std::hint::black_box(dp::size(g, fonts, &v));
-            std::hint::black_box(dp::fit(g, fonts, &v));
-            std::hint::black_box(dp::hit(g, fonts, &v, 300.0, 400.0));
+            std::hint::black_box(dp::size(fonts, &v));
+            std::hint::black_box(dp::fit(fonts, &v));
+            std::hint::black_box(dp::hit(fonts, &v, 300.0, 400.0));
             let t1 = Instant::now();
             unsafe {
                 g.dc.SetTarget(&bmp);
                 g.dc.BeginDraw();
             }
-            dp::draw(g, &g.dc, theme, fonts, &v, Some(dp::Hit::DupeRow(1300, 1)));
+            dp::draw(
+                &mut crate::gfx::D2dCanvas::new(g, &g.dc),
+                theme,
+                fonts,
+                &v,
+                Some(dp::Hit::DupeRow(1300, 1)),
+            );
             unsafe {
                 let _ = g.dc.EndDraw(None, None);
                 g.dc.SetTarget(None);

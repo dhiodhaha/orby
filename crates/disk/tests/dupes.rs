@@ -84,8 +84,15 @@ fn identical_files_group_and_the_biggest_saving_comes_first() {
     assert!(!r.stopped);
     assert_eq!(r.skipped, 0);
     assert_eq!(names(&r), [vec!["movie.mp4", "movie copy.mp4", "movie (2).mp4"], vec!["notes.pdf", "notes.pdf"]]);
-    assert_eq!(r.groups[0].reclaimable(), 600_000);
-    assert_eq!(r.reclaimable(), 700_000);
+    if cfg!(target_os = "macos") {
+        // APFS says what each copy frees: its allocated blocks, whole 4 KB blocks.
+        let alloc = |n: u64| n.div_ceil(4096) * 4096;
+        assert_eq!(r.groups[0].reclaimable(), 2 * alloc(300_000));
+        assert_eq!(r.reclaimable(), 2 * alloc(300_000) + alloc(100_000));
+    } else {
+        assert_eq!(r.groups[0].reclaimable(), 600_000);
+        assert_eq!(r.reclaimable(), 700_000);
+    }
     assert!(r.groups[0].files.iter().all(|f| f.modified.is_some()), "each copy has its date");
     // The stages report in order, and never more bytes than they said they would read.
     let stages: Vec<DupeStage> = seen.iter().map(|p| p.stage).collect();
