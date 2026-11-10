@@ -254,6 +254,8 @@ impl Win {
         panel.setOpaque(false);
         panel.setBackgroundColor(Some(&NSColor::clearColor()));
         panel.setHasShadow(shadow);
+        // Floating first: it sets the floating level, which the level below then replaces.
+        panel.setFloatingPanel(true);
         panel.setLevel(level);
         panel.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -265,7 +267,6 @@ impl Win {
         unsafe { panel.setReleasedWhenClosed(false) };
         panel.setIgnoresMouseEvents(false);
         panel.setAcceptsMouseMovedEvents(true);
-        panel.setFloatingPanel(true);
         let view = OrbyView::new(mtm, kind, w, h);
         // The orb hosts its own Metal layer (set before wantsLayer); the others are layer-backed
         // and get a bitmap as contents.
@@ -1409,14 +1410,24 @@ impl App {
             "show" => self.set_visible(true),
             "pill" => self.pick(0),
             "windows" => {
-                let n = |w: &Win| w.panel.windowNumber();
-                self.log(&format!(
-                    "windows: orb {} dial {} pill {} panel {}",
-                    n(&self.orb),
-                    n(&self.dial),
-                    n(&self.pill_win),
-                    n(&self.panel_win)
-                ));
+                for (name, w) in [
+                    ("orb", &self.orb),
+                    ("dial", &self.dial),
+                    ("pill", &self.pill_win),
+                    ("panel", &self.panel_win),
+                ] {
+                    let f = w.panel.frame();
+                    self.log(&format!(
+                        "window {name} #{} visible {} level {} frame {:.0},{:.0} {:.0}x{:.0}",
+                        w.panel.windowNumber(),
+                        w.panel.isVisible(),
+                        w.panel.level(),
+                        f.origin.x,
+                        f.origin.y,
+                        f.size.width,
+                        f.size.height
+                    ));
+                }
             }
             _ => {
                 if let Some(off) = cmd
