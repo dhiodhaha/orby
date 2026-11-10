@@ -1,22 +1,19 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Settings window (frame "v6.2 · 22", 720 × 580: a sidebar of sections and the section's
 //! cards) and the first run (frame "v6.2 · 21", five steps in one small window). One painter
-//! walks the layout: with a device context it draws, without one it only records where each
-//! control is, so drawing, hit testing and Tab order can never disagree.
+//! walks the layout: with a canvas it draws, without one it only records where each control
+//! is, so drawing, hit testing and Tab order can never disagree.
 
-use windows::Win32::Graphics::Direct2D::Common::*;
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
+use std::cell::RefCell;
 
-use crate::gfx::*;
+use crate::canvas::{self, clipped_text, ellipse, pt, rgba, rrect, Canvas, Color, Font, Stroke};
 use crate::notices_model::Source;
 use crate::settings_model::{
     self as m, AtTimeSound, Capture, Locate, PrayerMethod, Section, Shortcut, Startup, Step,
     ThemeMode, CITIES,
 };
-use crate::tasks_panel::clipped_text;
 use crate::textfield::TextField;
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{paint_icon, with_alpha, Fonts, Icon, Theme};
 
 pub type Rect = (f32, f32, f32, f32);
 
@@ -120,10 +117,9 @@ pub struct View<'a> {
     pub focus: Option<Hit>,
 }
 
-/// Draws when it has a device context, and always records each control's rectangle.
+/// Draws when it has a canvas, and always records each control's rectangle.
 pub struct Painter<'a> {
-    g: &'a Shared,
-    dc: Option<&'a ID2D1DeviceContext>,
+    cv: Option<RefCell<&'a mut dyn Canvas>>,
     t: &'a Theme,
     f: &'a Fonts,
     hover: Option<Hit>,
@@ -134,92 +130,62 @@ pub struct Painter<'a> {
 }
 
 impl<'a> Painter<'a> {
-    fn col(&self, c: D2D1_COLOR_F) -> ID2D1SolidColorBrush {
-        brush(self.dc.expect("drawing"), c)
-    }
-
-    fn fill(&self, r: Rect, rad: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, rad), &brush(dc, c)) };
+    /// Runs `draw` on the canvas when there is one (layout passes have none).
+    fn draw(&self, draw: impl FnOnce(&mut dyn Canvas)) {
+        if let Some(cv) = &self.cv {
+            draw(&mut **cv.borrow_mut());
         }
     }
 
-    /// The T3 lip on a card or control (depth.rs).
+    fn fill(&self, r: Rect, rad: f32, c: Color) {
+        self.draw(|cv| cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, rad), c));
+    }
+
+    /// The T3 lip on a card or control (ui.rs).
     fn lip(&self, r: Rect, rad: f32, a: f32) {
-        if let Some(dc) = self.dc {
-            crate::depth::lip(self.g, dc, self.t, r.0, r.1, r.2, r.3, rad, a);
-        }
+        let t = self.t;
+        self.draw(|cv| crate::ui::lip(cv, t, r.0, r.1, r.2, r.3, rad, a));
     }
 
-    fn stroke(&self, r: Rect, rad: f32, c: D2D1_COLOR_F, w: f32) {
-        if let Some(dc) = self.dc {
-            unsafe {
-                dc.DrawRoundedRectangle(
-                    &rrect(
-                        r.0 + w / 2.0,
-                        r.1 + w / 2.0,
-                        r.2 - w / 2.0,
-                        r.3 - w / 2.0,
-                        rad,
-                    ),
-                    &brush(dc, c),
-                    w,
-                    None,
-                )
-            };
-        }
+    fn stroke(&self, r: Rect, rad: f32, c: Color, w: f32) {
+        self.draw(|cv| {
+            cv.stroke_rrect(
+                &rrect(
+                    r.0 + w / 2.0,
+                    r.1 + w / 2.0,
+                    r.2 - w / 2.0,
+                    r.3 - w / 2.0,
+                    rad,
+                ),
+                c,
+                w,
+                Stroke::Plain,
+            )
+        });
     }
 
-    fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            unsafe { dc.DrawLine(pt(x0, y0), pt(x1, y1), &brush(dc, c), 1.0, None) };
-        }
+    fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, c: Color) {
+        self.draw(|cv| cv.line(pt(x0, y0), pt(x1, y1), c, 1.0, Stroke::Plain));
     }
 
-    fn text(
-        &self,
-        s: &str,
-        fmt: &IDWriteTextFormat,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        c: D2D1_COLOR_F,
-    ) {
-        if let Some(dc) = self.dc {
-            clipped_text(self.g, dc, s, fmt, x, y, w, h, &self.col(c));
-        }
+    fn text(&self, s: &str, fmt: &Font, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        self.draw(|cv| clipped_text(cv, s, fmt, x, y, w, h, c));
     }
 
-    fn right(&self, s: &str, fmt: &IDWriteTextFormat, right: f32, y: f32, h: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            right_text(self.g, dc, s, fmt, right, y, h, &self.col(c));
-        }
+    fn right(&self, s: &str, fmt: &Font, right: f32, y: f32, h: f32, c: Color) {
+        self.draw(|cv| cv.right_text(s, fmt, right, y, h, c));
     }
 
-    fn wrap(
-        &self,
-        s: &str,
-        fmt: &IDWriteTextFormat,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        c: D2D1_COLOR_F,
-    ) {
-        if let Some(dc) = self.dc {
-            text(dc, s, fmt, x, y, w, h, &self.col(c));
-        }
+    fn wrap(&self, s: &str, fmt: &Font, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        self.draw(|cv| cv.text(s, fmt, x, y, w, h, c));
     }
 
-    fn icon(&self, i: Icon, cx: f32, cy: f32, size: f32, c: D2D1_COLOR_F) {
-        if let Some(dc) = self.dc {
-            draw_icon(self.g, dc, i, cx, cy, size, &self.col(c));
-        }
+    fn icon(&self, i: Icon, cx: f32, cy: f32, size: f32, c: Color) {
+        self.draw(|cv| paint_icon(cv, i, cx, cy, size, c));
     }
 
-    fn width(&self, s: &str, fmt: &IDWriteTextFormat) -> f32 {
-        self.g.text_width(s, fmt)
+    fn width(&self, s: &str, fmt: &Font) -> f32 {
+        canvas::text_width(s, fmt)
     }
 
     fn hit(&mut self, h: Hit, r: Rect) {
@@ -317,14 +283,7 @@ impl<'a> Painter<'a> {
         } else {
             t.surface
         };
-        if let Some(dc) = self.dc {
-            unsafe {
-                dc.FillEllipse(
-                    &ellipse(kx, cy, 7.0),
-                    &brush(dc, with_alpha(knob, a.max(0.8))),
-                )
-            };
-        }
+        self.draw(|cv| cv.fill_ellipse(&ellipse(kx, cy, 7.0), with_alpha(knob, a.max(0.8))));
         if enabled {
             self.ring(h, r, 10.0);
             self.hit(h, (r.0 - 6.0, r.1 - 6.0, r.2 + 4.0, r.3 + 6.0));
@@ -333,19 +292,17 @@ impl<'a> Painter<'a> {
 
     fn radio(&self, cx: f32, cy: f32, on: bool) {
         let t = *self.t;
-        if let Some(dc) = self.dc {
-            unsafe {
-                dc.DrawEllipse(
-                    &ellipse(cx, cy, 7.5),
-                    &brush(dc, if on { t.text } else { t.muted }),
-                    1.5,
-                    None,
-                );
-                if on {
-                    dc.FillEllipse(&ellipse(cx, cy, 4.0), &brush(dc, t.text));
-                }
+        self.draw(|cv| {
+            cv.stroke_ellipse(
+                &ellipse(cx, cy, 7.5),
+                if on { t.text } else { t.muted },
+                1.5,
+                Stroke::Plain,
+            );
+            if on {
+                cv.fill_ellipse(&ellipse(cx, cy, 4.0), t.text);
             }
-        }
+        });
     }
 
     /// Keycaps from `x`, vertically centred on `cy`. Returns the right edge.
@@ -443,15 +400,13 @@ impl<'a> Painter<'a> {
 }
 
 fn painter<'a>(
-    g: &'a Shared,
-    dc: Option<&'a ID2D1DeviceContext>,
+    cv: Option<&'a mut dyn Canvas>,
     t: &'a Theme,
     f: &'a Fonts,
     v: &View,
 ) -> Painter<'a> {
     Painter {
-        g,
-        dc,
+        cv: cv.map(RefCell::new),
         t,
         f,
         hover: v.hover,
@@ -470,8 +425,8 @@ pub fn size(screen: Screen) -> (f32, f32) {
 }
 
 /// Every control's rectangle, in Tab order; the content's height for scrolling.
-pub fn layout(g: &Shared, t: &Theme, f: &Fonts, v: &View) -> (Vec<(Hit, Rect)>, f32) {
-    let mut p = painter(g, None, t, f, v);
+pub fn layout(t: &Theme, f: &Fonts, v: &View) -> (Vec<(Hit, Rect)>, f32) {
+    let mut p = painter(None, t, f, v);
     let bottom = paint(&mut p, v);
     (p.hits, bottom)
 }
@@ -483,8 +438,8 @@ pub fn hit_at(hits: &[(Hit, Rect)], x: f32, y: f32) -> Option<Hit> {
         .map(|(h, _)| *h)
 }
 
-pub fn draw(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, v: &View) {
-    let mut p = painter(g, Some(dc), t, f, v);
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View) {
+    let mut p = painter(Some(cv), t, f, v);
     paint(&mut p, v);
 }
 
@@ -591,20 +546,11 @@ fn paint_settings(p: &mut Painter, v: &View, s: Section) -> f32 {
         return H;
     }
     let clip = (CONTENT_TOP, CONTENT_BOTTOM);
-    if let Some(dc) = p.dc {
-        unsafe {
-            dc.PushAxisAlignedClip(
-                &D2D_RECT_F {
-                    left: SIDE + 1.0,
-                    top: clip.0,
-                    right: W - 1.0,
-                    bottom: clip.1,
-                },
-                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-            )
-        };
-        unsafe { dc.SetTransform(&translate(0.0, -v.scroll)) };
-    }
+    // The window draws from an identity transform, so this is the old absolute translate.
+    p.draw(|cv| {
+        cv.push_clip(SIDE + 1.0, clip.0, W - 1.0, clip.1);
+        cv.push_translate(0.0, -v.scroll);
+    });
     // Hits are recorded in window coordinates, so shift them by the scroll as they land.
     let first = p.hits.len();
     p.clip = (clip.0 + v.scroll, clip.1 + v.scroll);
@@ -621,22 +567,11 @@ fn paint_settings(p: &mut Painter, v: &View, s: Section) -> f32 {
         r.1 -= v.scroll;
         r.3 -= v.scroll;
     }
-    if let Some(dc) = p.dc {
-        unsafe { dc.SetTransform(&translate(0.0, 0.0)) };
-        unsafe { dc.PopAxisAlignedClip() };
-    }
+    p.draw(|cv| {
+        cv.pop_translate();
+        cv.pop_clip();
+    });
     bottom
-}
-
-fn translate(x: f32, y: f32) -> windows_numerics::Matrix3x2 {
-    windows_numerics::Matrix3x2 {
-        M11: 1.0,
-        M12: 0.0,
-        M21: 0.0,
-        M22: 1.0,
-        M31: x,
-        M32: y,
-    }
 }
 
 fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
@@ -845,8 +780,8 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
 
 fn segmented(p: &mut Painter, right: f32, cy: f32, on: ThemeMode) {
     let t = *p.t;
-    let fmt = p.f.small_medium.clone();
-    let fmt = &fmt;
+    let f = p.f;
+    let fmt = &f.small_medium;
     let ws: Vec<f32> = ThemeMode::ALL
         .iter()
         .map(|m| p.width(m.name(), fmt) + 24.0)
@@ -1213,8 +1148,8 @@ fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
 
 fn sound_segmented(p: &mut Painter, right: f32, cy: f32, on: AtTimeSound) {
     let t = *p.t;
-    let fmt = p.f.small_medium.clone();
-    let fmt = &fmt;
+    let f = p.f;
+    let fmt = &f.small_medium;
     let ws: Vec<f32> = AtTimeSound::ALL
         .iter()
         .map(|s| p.width(s.name(), fmt) + 24.0)
@@ -1494,9 +1429,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
             let bx = (x0, 56.0, x1, 204.0);
             p.fill(bx, 12.0, t.raised);
             p.stroke(bx, 12.0, t.hair, 1.0);
-            if let Some(dc) = p.dc {
-                sphere(p.g, dc, t, (bx.0 + bx.2) / 2.0, (bx.1 + bx.3) / 2.0, 52.0);
-            }
+            p.draw(|cv| sphere(cv, t, (bx.0 + bx.2) / 2.0, (bx.1 + bx.3) / 2.0, 52.0));
             p.text(
                 "Welcome to Orby",
                 &p.f.heading,
@@ -1920,66 +1853,33 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
 }
 
 /// The welcome card's picture of the drop: a neutral chrome sphere (no colour, no gold).
-fn sphere(g: &Shared, dc: &ID2D1DeviceContext, t: Theme, cx: f32, cy: f32, r: f32) {
-    let _ = g;
+fn sphere(cv: &mut dyn Canvas, t: Theme, cx: f32, cy: f32, r: f32) {
     let stops = [
-        D2D1_GRADIENT_STOP {
-            position: 0.0,
-            color: rgba(0xFFFFFF, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 0.28,
-            color: rgba(0xD9D9DE, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 0.62,
-            color: rgba(0x4A4A52, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 0.86,
-            color: rgba(0x17171B, 1.0),
-        },
-        D2D1_GRADIENT_STOP {
-            position: 1.0,
-            color: rgba(0x8A8A92, 1.0),
-        },
+        (0.0, rgba(0xFFFFFF, 1.0)),
+        (0.28, rgba(0xD9D9DE, 1.0)),
+        (0.62, rgba(0x4A4A52, 1.0)),
+        (0.86, rgba(0x17171B, 1.0)),
+        (1.0, rgba(0x8A8A92, 1.0)),
     ];
-    unsafe {
-        let rt: &ID2D1RenderTarget = dc;
-        let Ok(coll) =
-            rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
-        else {
-            return;
-        };
-        let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-            center: pt(cx, cy),
-            gradientOriginOffset: pt(-r * 0.38, -r * 0.42),
-            radiusX: r,
-            radiusY: r,
-        };
-        let Ok(b) = dc.CreateRadialGradientBrush(&props, None, &coll) else {
-            return;
-        };
-        dc.FillEllipse(&ellipse(cx, cy, r), &b);
-        // The window's highlight and the floor's reflection, as on the drop.
-        dc.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: pt(cx + r * 0.42, cy - r * 0.5),
-                radiusX: r * 0.2,
-                radiusY: r * 0.12,
-            },
-            &brush(dc, rgba(0xFFFFFF, 0.92)),
-        );
-        dc.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: pt(cx - r * 0.5, cy + r * 0.62),
-                radiusX: r * 0.16,
-                radiusY: r * 0.1,
-            },
-            &brush(dc, rgba(0xFFFFFF, 0.55)),
-        );
-        dc.DrawEllipse(&ellipse(cx, cy, r - 0.5), &brush(dc, t.hair), 1.0, None);
-    }
+    cv.fill_radial(&ellipse(cx, cy, r), pt(-r * 0.38, -r * 0.42), &stops);
+    // The window's highlight and the floor's reflection, as on the drop.
+    cv.fill_ellipse(
+        &canvas::Ellipse {
+            point: pt(cx + r * 0.42, cy - r * 0.5),
+            rx: r * 0.2,
+            ry: r * 0.12,
+        },
+        rgba(0xFFFFFF, 0.92),
+    );
+    cv.fill_ellipse(
+        &canvas::Ellipse {
+            point: pt(cx - r * 0.5, cy + r * 0.62),
+            rx: r * 0.16,
+            ry: r * 0.1,
+        },
+        rgba(0xFFFFFF, 0.55),
+    );
+    cv.stroke_ellipse(&ellipse(cx, cy, r - 0.5), t.hair, 1.0, Stroke::Plain);
 }
 
 /// The city list's rows that fit, so the keyboard can keep the selection in view.
