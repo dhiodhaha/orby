@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-use app_core::prayer::{self as pr, Location, Prayer, Times};
+use app_core::prayer::{self as pr, Prayer, Times};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
@@ -432,6 +432,11 @@ define_class!(
             with_app(|a| a.toggle_login());
         }
 
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: Option<&AnyObject>) {
+            with_app(|a| crate::settings::open(a, crate::settings_model::Section::General));
+        }
+
         /// A Disk worker has news (performSelectorOnMainThread from its thread).
         #[unsafe(method(diskWake:))]
         fn disk_wake(&self, _sender: Option<&AnyObject>) {
@@ -549,8 +554,9 @@ pub(crate) struct App {
     pub(crate) panel_min: i64,
     /// A roll or ripple moved in the last frame (one more frame at rest after it).
     pub(crate) panel_moving: bool,
+    // Settings (settings.rs, shared with Windows): `settings.prefs` is what settings.json keeps.
+    pub(crate) settings: crate::settings::Settings,
     // Prayer.
-    pub(crate) prefs: Prefs,
     pub(crate) times: Times,
     pub(crate) tomorrow_subuh: u32,
     day: (i32, u32, u32),
@@ -693,29 +699,6 @@ fn tomorrow((y, m, d): (i32, u32, u32)) -> (i32, u32, u32) {
     }
 }
 
-fn compute_times(prefs: &Prefs, day: (i32, u32, u32)) -> (Times, u32) {
-    let (lat, lng) = prefs.place.coords();
-    let loc = Location {
-        lat,
-        lng,
-        tz: clock::local().offset as f64 / 3600.0,
-        elevation_m: 0.0,
-    };
-    let m = prefs.prayer_method.method();
-    let adj = prefs.prayer_adjust;
-    let t = pr::times(loc, m, day.0, day.1, day.2).adjusted(adj);
-    let n = tomorrow(day);
-    (t, pr::times(loc, m, n.0, n.1, n.2).adjusted(adj).subuh)
-}
-
-fn read_settings(dir: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read_to_string(dir.join("settings.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
-}
-
 impl App {
     pub(crate) fn log(&self, line: &str) {
         let l = clock::local();
@@ -749,6 +732,7 @@ impl App {
             r.err().unwrap_or_else(|| "ok".into())
         ));
         self.sync_login_item();
+        crate::settings::refresh_startup(self);
         if super::login::needs_approval() {
             self.reply(Pill {
                 icon: Icon::Info,
@@ -762,23 +746,22 @@ impl App {
         }
     }
 
-    fn sync_login_item(&self) {
+    /// The menu bar's Start at login checkmark shows the login item's state.
+    pub(crate) fn sync_login_item(&self) {
         if let Some(item) = &self.login_item {
             item.setState(if super::login::enabled() { 1 } else { 0 });
         }
     }
 
-    /// Writes one key of settings.json, keeping the others (write, then rename).
-    pub(crate) fn save_setting(&mut self, key: &str, value: serde_json::Value) {
-        let dir = clock::data_dir();
-        let mut map = read_settings(&dir);
-        map.insert(key.into(), value);
-        if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::Value::Object(map)) {
-            let path = dir.join("settings.json");
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+    /// A theme change: the drop, the dial and the pill draw again (the panel and the windows
+    /// redraw on their own, see `settings_sys::redraw_others`).
+    pub(crate) fn redraw_for_theme(&mut self) {
+        self.render_orb();
+        if self.dial.shown {
+            self.render_dial();
+        }
+        if self.pill.is_some() {
+            self.render_pill();
         }
     }
 
@@ -945,7 +928,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn render_dial(&mut self) {
+    pub(crate) fn render_dial(&mut self) {
         let items = menu::items(self);
         let kids = self.branch_children();
         let branch = self.dial_branch.map(|parent| ui::DialBranch {
@@ -1019,7 +1002,7 @@ impl App {
         self.close_panel();
         self.set_tucked(false);
         self.tuck_at = None;
-        self.theme = ui::theme(dark_mode());
+        self.theme = crate::settings::theme_now(&self.settings.prefs);
         self.dial_open = true;
         self.dial_keyboard = keyboard;
         self.dial_aim = if keyboard { Some(0) } else { None };
@@ -1099,6 +1082,11 @@ impl App {
     }
 
     fn on_shortcut(&mut self) {
+        // The first run's "try it" takes the press; the orb stays put.
+        if crate::settings::takes_shortcut(self) {
+            crate::settings::on_shortcut_pressed(self);
+            return;
+        }
         if !self.visible {
             self.set_visible(true);
             notices::on_user_visibility(self);
@@ -1218,7 +1206,7 @@ impl App {
         self.pill_win.place(x, top - INSET + ui::PILL_PAD);
     }
 
-    fn render_pill(&mut self) {
+    pub(crate) fn render_pill(&mut self) {
         let Some(p) = self.pill.clone() else { return };
         let (t, f, l) = (self.theme, &self.fonts, self.pill_layout);
         let (rv, grow_left, hover) = (
@@ -1245,7 +1233,7 @@ impl App {
     /// Shows a pill from the drop, or new words in the pill on screen (the reveal carries on).
     /// Only notices.rs (through `crate::pill`) calls this: every pill goes through the queue.
     pub(crate) fn show_pill(&mut self, p: Pill) {
-        self.theme = ui::theme(dark_mode());
+        self.theme = crate::settings::theme_now(&self.settings.prefs);
         self.pill_layout = ui::layout_pill(&self.fonts, &p);
         self.pill_win.resize(
             self.pill_layout.w + 2.0 * ui::PILL_PAD,
@@ -1332,6 +1320,11 @@ impl App {
                 self.dismiss_pill();
                 crate::disk::retry_scan(self);
             }
+            A::OpenSettings => {
+                self.dismiss_pill();
+                crate::settings::open(self, crate::settings_model::Section::General);
+            }
+            A::UndoShortcut => crate::settings::undo_shortcut(self),
             other => {
                 self.dismiss_pill();
                 self.log(&format!("pill action {other:?} is not on the Mac yet"));
@@ -1344,10 +1337,12 @@ impl App {
         let d = clock::today();
         if d != self.day {
             self.day = d;
-            (self.times, self.tomorrow_subuh) = compute_times(&self.prefs, d);
+            let prefs = &self.settings.prefs;
+            (self.times, self.tomorrow_subuh) =
+                crate::prayer::compute_times(prefs, prefs.place.coords(), d);
             self.log(&format!(
                 "times {}: Subuh {} Dzuhur {} Ashar {} Maghrib {} Isya {}",
-                self.prefs.place.short(),
+                self.settings.prefs.place.short(),
                 pr::hhmm(self.times.subuh),
                 pr::hhmm(self.times.dzuhur),
                 pr::hhmm(self.times.ashar),
@@ -1360,20 +1355,28 @@ impl App {
         self.orb_dirty = true;
     }
 
+    /// The place, method or adjustments changed: today's times again, and the drop's sun now.
+    pub(crate) fn recompute_times(&mut self) {
+        self.day = (0, 0, 0);
+        self.refresh_day();
+        self.render_orb();
+    }
+
     pub(crate) fn schedule_reminders(&mut self) {
         let now = clock::now_minutes();
-        self.next_reminder = reminder_events(&self.prefs, &self.times, self.tomorrow_subuh)
-            .into_iter()
-            .find(|e| e.0 > now + 1.0 / 60.0)
-            .map(|(at, p, off)| {
-                let secs = ((at - now) * 60.0).max(0.5);
-                self.log(&format!(
-                    "next reminder: {} {off:+} min, in {:.1} min",
-                    p.name(),
-                    at - now
-                ));
-                (Instant::now() + Duration::from_secs_f64(secs), p, off)
-            });
+        self.next_reminder =
+            reminder_events(&self.settings.prefs, &self.times, self.tomorrow_subuh)
+                .into_iter()
+                .find(|e| e.0 > now + 1.0 / 60.0)
+                .map(|(at, p, off)| {
+                    let secs = ((at - now) * 60.0).max(0.5);
+                    self.log(&format!(
+                        "next reminder: {} {off:+} min, in {:.1} min",
+                        p.name(),
+                        at - now
+                    ));
+                    (Instant::now() + Duration::from_secs_f64(secs), p, off)
+                });
     }
 
     fn prayer_moment(&self, p: Prayer) -> app_habits::Moment {
@@ -1425,6 +1428,12 @@ impl App {
                 ttl_ms: 10_000,
             };
             notices::post(self, notices::urgent(Source::Prayer, pill));
+            // Settings' At the time: Bunyi is the system's short sound (an adzan chosen on
+            // Windows plays as Bunyi here); never in full screen or while presenting.
+            let sound = crate::settings_model::os::shown_sound(self.settings.prefs.at_time_sound);
+            if sound != crate::settings_model::AtTimeSound::Silent && !notices::silent(self) {
+                crate::sys::play_notify_sound();
+            }
             self.set_tucked(false);
             habits::on_prayer_time(self, p.name());
         }
@@ -1641,6 +1650,63 @@ impl App {
                 "start at login: {}",
                 if super::login::enabled() { "on" } else { "off" }
             )),
+            "settings" => crate::settings::open(self, crate::settings_model::Section::General),
+            "settings-close" => crate::settings::close(self),
+            "settings-state" => {
+                let line = crate::settings::state_line(self);
+                let login = if super::login::enabled() {
+                    "on"
+                } else if super::login::needs_approval() {
+                    "waiting for approval"
+                } else {
+                    "off"
+                };
+                self.log(&format!("settings state: {line}, login item {login}"));
+            }
+            "first-run" => crate::settings::open_first_run(self),
+            "first-run-skip" => crate::settings::skip_first_run(self),
+            _ if cmd.starts_with("settings:") => {
+                let name = &cmd["settings:".len()..];
+                match crate::settings_model::Section::ALL
+                    .iter()
+                    .find(|s| s.name().eq_ignore_ascii_case(name))
+                {
+                    Some(s) => crate::settings::go_to(self, *s),
+                    None => self.log(&format!("settings: no section {name}")),
+                }
+            }
+            _ if cmd.starts_with("settings-click:") => {
+                let xy: Vec<f32> = cmd["settings-click:".len()..]
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                if let [x, y] = xy[..] {
+                    crate::settings::click_at(self, x, y);
+                }
+            }
+            _ if cmd.starts_with("settings-type:") => {
+                crate::settings::on_text(self, &cmd["settings-type:".len()..]);
+            }
+            _ if cmd.starts_with("settings-key:") => {
+                // A Windows virtual key (0x.. or decimal), pressed and let go; ",down" or ",up"
+                // for one half (a modifier held while the shortcut is chosen).
+                let arg = &cmd["settings-key:".len()..];
+                let (num, half) = arg.split_once(',').unwrap_or((arg, ""));
+                let k = num
+                    .strip_prefix("0x")
+                    .map_or_else(|| num.parse().ok(), |h| u16::from_str_radix(h, 16).ok());
+                if let Some(k) = k {
+                    if half != "up" {
+                        crate::settings::on_key(self, k, true, false);
+                    }
+                    if half != "down" {
+                        crate::settings::on_key(self, k, false, false);
+                    }
+                }
+            }
+            _ if cmd.starts_with("settings-shot:") => {
+                super::settings_win::shot(self, &cmd["settings-shot:".len()..]);
+            }
             "windows" => {
                 for (name, w) in [
                     ("orb", &self.orb),
@@ -1988,9 +2054,11 @@ pub fn run() {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     let dir = clock::data_dir();
-    let prefs = Prefs::from_map(&read_settings(&dir));
+    let settings = crate::settings::Settings::load(&dir, Default::default());
     let day = clock::today();
-    let (times, tomorrow_subuh) = compute_times(&prefs, day);
+    let (times, tomorrow_subuh) =
+        crate::prayer::compute_times(&settings.prefs, settings.prefs.place.coords(), day);
+    let theme = crate::settings::theme_now(&settings.prefs);
 
     // The drop's place: kept from the last run, else the right edge, a third down.
     let saved: serde_json::Value = std::fs::read_to_string(dir.join("mac-orb.json"))
@@ -2056,6 +2124,9 @@ pub fn run() {
     menu.addItem(&toggle);
     menu.addItem(&menu_item(mtm, "Prayer", sel!(openPrayer:), &target));
     menu.addItem(&menu_item(mtm, "Disk…", sel!(openDisk:), &target));
+    let settings_item = menu_item(mtm, "Settings…", sel!(openSettings:), &target);
+    settings_item.setKeyEquivalent(&NSString::from_str(","));
+    menu.addItem(&settings_item);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let login = menu_item(mtm, "Start at login", sel!(toggleLogin:), &target);
     menu.addItem(&login);
@@ -2079,7 +2150,7 @@ pub fn run() {
         toggle_item: Some(toggle),
         login_item: Some(login),
         fonts: Fonts::new(),
-        theme: ui::theme(dark_mode()),
+        theme,
         scale,
         log_path: dir.join("orb-proto.log"),
         started: Instant::now(),
@@ -2118,7 +2189,7 @@ pub fn run() {
         countdown_rolling: false,
         panel_dirty: true,
         panel_min: -1,
-        prefs,
+        settings,
         times,
         tomorrow_subuh,
         day,
@@ -2143,7 +2214,7 @@ pub fn run() {
     a.log(&format!(
         "start: Orby for macOS, {gpu_note}, scale {scale}, {} theme, place {}",
         if a.theme.dark { "dark" } else { "light" },
-        a.prefs.place.short()
+        a.settings.prefs.place.short()
     ));
     a.day = (0, 0, 0); // computes and logs today's times
     a.refresh_day();
@@ -2156,12 +2227,12 @@ pub fn run() {
     a.orb.show();
     a.render_orb();
     a.arm_tuck();
-    let hotkey = super::hotkey::register(|| with_app(|a| a.on_shortcut()));
-    a.log(if hotkey {
-        "shortcut Ctrl+Option+Space"
-    } else {
-        "shortcut Ctrl+Option+Space is taken"
-    });
+    // The shortcut (Carbon hot key) is registered by settings::start, which also shows the first
+    // run on a fresh data folder or starts the orb hidden, before any source can post.
+    if !super::hotkey::install(|| with_app(|a| a.on_shortcut())) {
+        a.log("shortcut: Carbon refused the handler");
+    }
+    crate::settings::start(&mut a);
     a.sync_login_item();
     a.log(&format!(
         "start at login: {}",
@@ -2220,6 +2291,20 @@ pub fn run() {
             notices::pump(a);
         });
     });
+    // Light and dark switched in System Settings: a theme that follows the system follows it.
+    let appearance = RcBlock::new(|_n: NonNull<NSNotification>| {
+        with_app(crate::settings::on_system_theme);
+    });
+    let _appearance = unsafe {
+        NSDistributedNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(&NSString::from_str(
+                "AppleInterfaceThemeChangedNotification",
+            )),
+            None,
+            Some(&NSOperationQueue::mainQueue()),
+            &appearance,
+        )
+    };
     let _wake = unsafe {
         NSWorkspace::sharedWorkspace()
             .notificationCenter()

@@ -1,5 +1,5 @@
 //! The Windows window modules the shared units call (`crate::pill`, `crate::orb`, `crate::dial`,
-//! `crate::prayer`, `crate::settings`, `crate::log_line`, `crate::start_anim`), with the same
+//! `crate::prayer`, `crate::log_line`, `crate::start_anim`), with the same
 //! paths and signatures, over the Mac `App`. Only what the shared units call is here; main.rs
 //! puts these modules at the crate root on macOS. The panel host is `mac::panels`.
 
@@ -86,14 +86,77 @@ pub mod dial {
 /// Prayer times and the Prayer panel's data (Windows: prayer.rs; its reminders and sounds stay
 /// in mac/app.rs until prayer.rs is shared).
 pub mod prayer {
-    use app_core::prayer::{self as pr, Prayer};
+    use app_core::prayer::{self as pr, Location, Prayer, Times};
     use app_core::qibla;
 
     use crate::canvas::Canvas;
     use crate::mac::clock;
     use crate::panels::{self, Kind};
+    use crate::settings_model::{Prefs, Section};
     use crate::ui::{info_pill, Icon};
-    use crate::{notices, panel, App};
+    use crate::{notices, panel, settings, App};
+
+    /// Today's date on the local clock.
+    pub fn today() -> (i32, u32, u32) {
+        clock::today()
+    }
+
+    fn tomorrow((y, m, d): (i32, u32, u32)) -> (i32, u32, u32) {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let days = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ][(m - 1) as usize];
+        if d < days {
+            (y, m, d + 1)
+        } else if m < 12 {
+            (y, m + 1, 1)
+        } else {
+            (y + 1, 1, 1)
+        }
+    }
+
+    /// Today's times and tomorrow's Subuh at a place, by the method in Settings with your minute
+    /// adjustments, on this Mac's own UTC offset.
+    pub fn compute_times(prefs: &Prefs, at: (f64, f64), day: (i32, u32, u32)) -> (Times, u32) {
+        let loc = Location {
+            lat: at.0,
+            lng: at.1,
+            tz: clock::local().offset as f64 / 3600.0,
+            elevation_m: 0.0,
+        };
+        let m = prefs.prayer_method.method();
+        let adj = prefs.prayer_adjust;
+        let t = pr::times(loc, m, day.0, day.1, day.2).adjusted(adj);
+        let n = tomorrow(day);
+        (t, pr::times(loc, m, n.0, n.1, n.2).adjusted(adj).subuh)
+    }
+
+    /// The place, the method or an adjustment changed in Settings: today's times, the
+    /// reminders, the drop's sun and the open panel.
+    pub fn apply_place(app: &mut App) {
+        app.recompute_times();
+        app.schedule_reminders();
+        panels::redraw(app);
+    }
+
+    /// The reminders changed: the next one is found again.
+    pub fn schedule_reminders(app: &mut App) {
+        app.schedule_reminders();
+    }
+
+    /// No adzan plays on the Mac yet.
+    pub fn stop_adzan(_app: &mut App) {}
 
     /// The next prayer, its time (minutes after midnight) and the minutes until it.
     pub fn next_prayer(app: &App) -> (Prayer, u32, f64) {
@@ -117,12 +180,12 @@ pub mod prayer {
 
     fn data(app: &App) -> Data {
         let (next, _, mins_left) = next_prayer(app);
-        let (lat, lng) = app.prefs.place.coords();
+        let (lat, lng) = app.settings.prefs.place.coords();
         let b = qibla::bearing(lat, lng);
         Data {
             next,
             mins_left,
-            place: app.prefs.place.short(),
+            place: app.settings.prefs.place.short(),
             qibla: format!("{:.0}° {}", b, qibla::compass(b)),
         }
     }
@@ -139,9 +202,9 @@ pub mod prayer {
             next: d.next,
             mins_left: d.mins_left,
             place: &d.place,
-            method: app.prefs.prayer_method.short(),
+            method: app.settings.prefs.prayer_method.short(),
             qibla: d.qibla.clone(),
-            reminders: app.prefs.prayer_reminders,
+            reminders: app.settings.prefs.prayer_reminders,
             hover,
             countdown_apart: apart,
         }
@@ -165,31 +228,27 @@ pub mod prayer {
         panel::draw_countdown(cv, &app.theme, &app.fonts, &view(app, &d, None, true));
     }
 
+    /// As Windows' prayer.rs: a chip flips the reminder (shared with Settings), Qibla says the
+    /// bearing in a pill, Reminders and Place open Settings on Prayer.
     pub fn panel_click(app: &mut App, hit: panel::Hit) {
         match hit {
-            panel::Hit::Chip(i) => {
-                app.prefs.prayer_reminders[i] = !app.prefs.prayer_reminders[i];
-                let on = app.prefs.prayer_reminders;
-                app.save_setting(
-                    "prayer_reminders",
-                    serde_json::to_value(on).unwrap_or_default(),
+            panel::Hit::Chip(i) => settings::toggle_reminder(app, i),
+            panel::Hit::Button(2) => {
+                let (lat, lng) = app.settings.prefs.place.coords();
+                let b = qibla::bearing(lat, lng);
+                let d = qibla::distance_km(lat, lng);
+                panels::close_panel(app);
+                let p = info_pill(
+                    Icon::Prayer,
+                    &format!("Qibla {:.0}° {}", b, qibla::compass(b)),
+                    &format!("{:.0} km to the Kaaba", d),
                 );
-                app.schedule_reminders();
-                panels::refresh(app);
+                notices::reply(app, p);
             }
-            panel::Hit::Button(i) => {
-                let what = ["Reminder settings", "Place", "Qibla"][i.min(2)];
-                notices::reply(app, info_pill(Icon::Info, "Coming to Mac", what));
+            panel::Hit::Button(_) => {
+                panels::close_panel(app);
+                settings::open(app, Section::Prayer);
             }
         }
     }
-}
-
-/// Settings (Windows: settings.rs). Only what notices.rs calls until settings.rs is shared; the
-/// settings stage deletes this module and its line in main.rs.
-pub mod settings {
-    use crate::App;
-
-    /// A mute changed: an open Settings window would show it (there is none on the Mac yet).
-    pub fn on_sources_changed(_app: &mut App) {}
 }

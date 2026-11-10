@@ -11,8 +11,9 @@
 use app_core::prayer as pr;
 
 use crate::panels::{self, Kind};
+use crate::settings_model::Section;
 use crate::ui::{DialChild, DialItem, Icon};
-use crate::{disk, habits, history, notices, prayer, App};
+use crate::{disk, habits, history, notices, prayer, settings, App};
 
 pub const TASKS: usize = 0;
 pub const TODAY: usize = 1;
@@ -87,7 +88,7 @@ pub fn children(app: &App, parent: usize) -> (Vec<DialChild>, usize) {
             kids.push(disk::dial_child(app));
             kids.push(history::dial_child(app));
             kids.push(notices::dial_child(app));
-            kids.push(pending::settings_child(app));
+            kids.push(settings::dial_child(app));
             kids.push(pending::all_tasks_child(app));
             (kids, default)
         }
@@ -116,7 +117,7 @@ pub fn pick_child(app: &mut App, parent: usize, j: usize) {
         _ if j == 1 => disk::open(app),
         _ if j == 2 => history::open(app, None),
         _ if j == 3 => notices::open_panel(app),
-        _ if j == 4 => pending::open_settings(app),
+        _ if j == 4 => settings::open(app, Section::General),
         _ if j == 5 => pending::open_all_tasks(app),
         _ => pending::open_downloads(app),
     }
@@ -125,9 +126,8 @@ pub fn pick_child(app: &mut App, parent: usize, j: usize) {
 /// Units not shared yet: the real ones on Windows.
 #[cfg(windows)]
 mod pending {
-    use crate::settings_model::Section;
     use crate::ui::DialChild;
-    use crate::{calendar, downloads, settings, tasks, tasks_window, App};
+    use crate::{calendar, downloads, tasks, tasks_window, App};
 
     pub fn tasks_value(app: &App) -> String {
         tasks::dial_value(app)
@@ -145,10 +145,6 @@ mod pending {
         downloads::dial_children(app)
     }
 
-    pub fn settings_child(app: &App) -> DialChild {
-        settings::dial_child(app)
-    }
-
     pub fn all_tasks_child(app: &App) -> DialChild {
         tasks_window::dial_child(app)
     }
@@ -163,10 +159,6 @@ mod pending {
 
     pub fn open_downloads(app: &mut App) {
         downloads::open(app);
-    }
-
-    pub fn open_settings(app: &mut App) {
-        settings::open(app, Section::General);
     }
 
     pub fn open_all_tasks(app: &mut App) {
@@ -211,10 +203,6 @@ mod pending {
         (vec![plain(Icon::Download, "Downloads")], 1)
     }
 
-    pub fn settings_child(_app: &App) -> DialChild {
-        plain(Icon::Gear, "Settings")
-    }
-
     pub fn all_tasks_child(_app: &App) -> DialChild {
         plain(Icon::List, "All tasks")
     }
@@ -229,10 +217,6 @@ mod pending {
 
     pub fn open_downloads(app: &mut App) {
         coming(app, "Downloads");
-    }
-
-    pub fn open_settings(app: &mut App) {
-        coming(app, "Settings");
     }
 
     pub fn open_all_tasks(app: &mut App) {

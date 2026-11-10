@@ -10,7 +10,8 @@
 //! - disk.rs / disk_win.rs: the Disk window and what Disk asks of the system (disk_sys)
 //! - login.rs: start at login (SMAppService)
 //! - sys.rs: what the shared units ask of the system (`crate::sys` on macOS)
-//! - shim.rs: `crate::pill`, `orb`, `dial`, `prayer`, `settings`, `log_line`, `start_anim` over the `App`
+//! - shim.rs: `crate::pill`, `orb`, `dial`, `prayer`, `log_line`, `start_anim` over the `App`
+//! - settings_win.rs: the Settings window and the first run, the shortcut, Open at login (settings_sys)
 //! - panels.rs: `crate::panels`, the panel host (Prayer, Focus, Drink, History, Notices)
 
 pub mod app;
@@ -23,6 +24,7 @@ pub mod input;
 pub mod login;
 pub mod metal;
 pub mod panels;
+pub mod settings_win;
 pub mod shim;
 pub mod sys;
 pub mod text;
