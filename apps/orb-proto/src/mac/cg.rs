@@ -1,14 +1,18 @@
 #![allow(clippy::too_many_arguments)]
-//! The `Canvas` on Core Graphics: a premultiplied sRGB bitmap in device pixels, with a y-down
+//! The `Canvas` on Core Graphics: a premultiplied BGRA bitmap in device pixels, with a y-down
 //! transform in logical pixels, so the shared drawing code runs unchanged. The bitmap becomes a
 //! layer's contents (a window) or a PNG (the snapshot mode).
+//!
+//! Colours are given in sRGB (as the Windows tokens are); the bitmap itself is in the window's
+//! colour space and the screen's native byte order, so Core Animation shows it without
+//! converting every pixel each frame.
 
 use std::ffi::c_void;
 
 use objc2_core_foundation::{CFRetained, CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    kCGColorSpaceSRGB, CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext,
-    CGImage, CGImageAlphaInfo, CGLineCap, CGLineJoin,
+    kCGColorSpaceSRGB, CGBitmapContextCreate, CGBitmapContextCreateImage, CGColor, CGColorSpace,
+    CGContext, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, CGLineCap, CGLineJoin,
 };
 
 use crate::canvas::{arc_center, Canvas, Color, Ellipse, Font, Path, RRect, Seg, Stroke, Vector2};
@@ -22,22 +26,28 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
+    /// In sRGB (snapshots).
     pub fn new(w: f32, h: f32, scale: f32) -> Bitmap {
+        let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })).expect("sRGB");
+        Bitmap::with_space(w, h, scale, &space)
+    }
+
+    /// In a window's colour space.
+    pub fn with_space(w: f32, h: f32, scale: f32, space: &CGColorSpace) -> Bitmap {
         let (pw, ph) = (
             ((w * scale).ceil() as usize).max(1),
             ((h * scale).ceil() as usize).max(1),
         );
         let mut data = vec![0u8; pw * ph * 4];
         let ctx = unsafe {
-            let space = CGColorSpace::with_name(Some(kCGColorSpaceSRGB)).expect("sRGB");
             CGBitmapContextCreate(
                 data.as_mut_ptr() as *mut c_void,
                 pw,
                 ph,
                 8,
                 pw * 4,
-                Some(&space),
-                CGImageAlphaInfo::PremultipliedLast.0, // RGBA, default byte order
+                Some(space),
+                CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0,
             )
             .expect("a bitmap context")
         };
@@ -73,7 +83,11 @@ impl Bitmap {
 
     /// The pixels, premultiplied RGBA rows.
     pub fn rgba(&self) -> Vec<u8> {
-        self.data.clone()
+        let mut v = self.data.clone();
+        for p in v.chunks_mut(4) {
+            p.swap(0, 2);
+        }
+        v
     }
 }
 
@@ -95,30 +109,27 @@ fn rect(l: f32, t: f32, r: f32, b: f32) -> CGRect {
     }
 }
 
+fn srgb(c: Color) -> CFRetained<CGColor> {
+    CGColor::new_srgb(
+        c.r as CGFloat,
+        c.g as CGFloat,
+        c.b as CGFloat,
+        c.a as CGFloat,
+    )
+}
+
 impl CgCanvas<'_> {
     fn c(&self) -> Option<&CGContext> {
         Some(self.ctx)
     }
 
     fn fill(&self, col: Color) {
-        CGContext::set_rgb_fill_color(
-            self.c(),
-            col.r as CGFloat,
-            col.g as CGFloat,
-            col.b as CGFloat,
-            col.a as CGFloat,
-        );
+        CGContext::set_fill_color_with_color(self.c(), Some(&srgb(col)));
     }
 
     fn stroke_style(&self, col: Color, w: f32, s: Stroke) {
         let c = self.c();
-        CGContext::set_rgb_stroke_color(
-            c,
-            col.r as CGFloat,
-            col.g as CGFloat,
-            col.b as CGFloat,
-            col.a as CGFloat,
-        );
+        CGContext::set_stroke_color_with_color(c, Some(&srgb(col)));
         CGContext::set_line_width(c, w as CGFloat);
         CGContext::set_miter_limit(c, 10.0);
         let round = matches!(s, Stroke::Round | Stroke::Dotted);

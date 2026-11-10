@@ -24,7 +24,8 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent,
     NSEventMask, NSImage, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusItem,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowCollectionBehavior, NSWorkspace, NSWindowStyleMask,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -320,7 +321,11 @@ impl Win {
 
     /// Draws with the shared Canvas into a bitmap that becomes the view's layer contents.
     fn paint(&self, scale: f32, draw: impl FnOnce(&mut dyn Canvas)) {
-        let b = Bitmap::new(self.w, self.h, scale);
+        let space = self.panel.colorSpace().and_then(|s| s.CGColorSpace());
+        let b = match &space {
+            Some(sp) => Bitmap::with_space(self.w, self.h, scale, sp),
+            None => Bitmap::new(self.w, self.h, scale),
+        };
         draw(&mut b.canvas());
         let Some(img) = b.image() else { return };
         let Some(layer) = self.view.layer() else {
@@ -1414,7 +1419,10 @@ impl App {
                 ));
             }
             _ => {
-                if let Some(off) = cmd.strip_prefix("remind").and_then(|o| o.parse::<i32>().ok()) {
+                if let Some(off) = cmd
+                    .strip_prefix("remind")
+                    .and_then(|o| o.parse::<i32>().ok())
+                {
                     let (np, _, _) =
                         pr::next(&self.times, clock::now_minutes(), self.tomorrow_subuh);
                     self.fire_reminder(np, off);
