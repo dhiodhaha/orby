@@ -1,4 +1,4 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Tasks panel (frame "v6.2 · 03"): sidebar (Inbox, Today, Upcoming, spaces with nested
 //! folders and lists), list header, the quick add field with token chips and the "understood"
 //! line, To do / Done tabs, rows, and the footer. Drawing and hit tests on a plain [`View`].
@@ -6,12 +6,10 @@
 use std::ops::Range;
 
 use app_quickadd::TokenKind;
-use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
-use windows::Win32::Graphics::Direct2D::*;
 
-use crate::gfx::*;
+use crate::canvas::{self, ellipse, line_to, path, pt, rrect, text_width, Canvas, Stroke};
 use crate::tasks_model::{SideIcon, SideItem, Tab};
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{paint_icon, with_alpha, Fonts, Icon, Theme};
 
 pub const W: f32 = 780.0;
 pub const H: f32 = 560.0;
@@ -182,14 +180,14 @@ fn tree_base(item: &SideItem) -> f32 {
 /// "All tasks", left of Share in the header.
 const ALL_RECT: Rect = (X1 - 84.0 - 8.0 - 100.0, 28.0, X1 - 84.0 - 8.0, 60.0);
 
-fn add_button(g: &Shared, f: &Fonts, v: &View) -> Rect {
-    let w = g.text_width(v.field.action, &f.title) + 28.0;
+fn add_button(f: &Fonts, v: &View) -> Rect {
+    let w = text_width(v.field.action, &f.title) + 28.0;
     (X1 - 4.0 - w, FIELD_T + 4.0, X1 - 4.0, FIELD_B - 4.0)
 }
 
-fn tab_rects(g: &Shared, f: &Fonts, v: &View) -> [(Tab, Rect); 2] {
-    let w1 = g.text_width("To do", &f.title) + g.text_width(&v.todo_n.to_string(), &f.body) + 30.0;
-    let w2 = g.text_width("Done", &f.title) + g.text_width(&v.done_n.to_string(), &f.body) + 30.0;
+fn tab_rects(f: &Fonts, v: &View) -> [(Tab, Rect); 2] {
+    let w1 = text_width("To do", &f.title) + text_width(&v.todo_n.to_string(), &f.body) + 30.0;
+    let w2 = text_width("Done", &f.title) + text_width(&v.done_n.to_string(), &f.body) + 30.0;
     [
         (Tab::Todo, (X0, TABS_Y, X0 + w1, TABS_Y + 28.0)),
         (
@@ -200,14 +198,14 @@ fn tab_rects(g: &Shared, f: &Fonts, v: &View) -> [(Tab, Rect); 2] {
 }
 
 /// The right lane of a task row: the delete button's rect (shown on hover).
-fn delete_rect(g: &Shared, f: &Fonts, due: &str, repeat: bool, top: f32, h: f32) -> Rect {
-    let due_w = g.text_width(due, &f.small) + if repeat { 16.0 } else { 0.0 };
+fn delete_rect(f: &Fonts, due: &str, repeat: bool, top: f32, h: f32) -> Rect {
+    let due_w = text_width(due, &f.small) + if repeat { 16.0 } else { 0.0 };
     let right = X1 - 38.0 - due_w - 10.0;
     let cy = top + h / 2.0;
     (right - 28.0, cy - 14.0, right, cy + 14.0)
 }
 
-fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
+fn layout(f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     let mut out = Vec::new();
     for (i, r) in side_layout(v) {
         let item = &v.side[i];
@@ -223,9 +221,9 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     out.push((Hit::NewList, (SIDE - 36.0, 124.0, SIDE - 12.0, 148.0)));
     out.push((Hit::Share, (X1 - 84.0, 28.0, X1, 60.0)));
     out.push((Hit::AllTasks, ALL_RECT));
-    out.push((Hit::Add, add_button(g, f, v)));
+    out.push((Hit::Add, add_button(f, v)));
     out.push((Hit::Field, (X0, FIELD_T, X1, FIELD_B)));
-    for (t, r) in tab_rects(g, f, v) {
+    for (t, r) in tab_rects(f, v) {
         out.push((Hit::Tab(t), r));
     }
     for (i, ((top, h), row)) in row_tops(v).into_iter().zip(&v.rows).enumerate() {
@@ -236,7 +234,7 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
         if let RowView::Task { due, repeat, .. } = row {
             let cy = top + h / 2.0;
             out.push((Hit::Check(i), (X0 + 4.0, cy - 14.0, X0 + 36.0, cy + 14.0)));
-            out.push((Hit::Delete(i), delete_rect(g, f, due, *repeat, top, h)));
+            out.push((Hit::Delete(i), delete_rect(f, due, *repeat, top, h)));
             out.push((
                 Hit::Row(i),
                 (X0, top.max(ROWS_T), X1, (top + h).min(ROWS_B)),
@@ -249,8 +247,8 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     out
 }
 
-pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
-    layout(g, f, v)
+pub fn hit(f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
+    layout(f, v)
         .into_iter()
         .find(|(_, r)| inside(r, x, y))
         .map(|(h, _)| h)
@@ -290,8 +288,8 @@ fn chip_icon(k: TokenKind) -> Icon {
     }
 }
 
-fn seg_width(g: &Shared, f: &Fonts, s: &str, chip: bool) -> f32 {
-    let w = g.text_width(s, &f.body);
+fn seg_width(f: &Fonts, s: &str, chip: bool) -> f32 {
+    let w = text_width(s, &f.body);
     if chip {
         w + CHIP_PAD * 2.0 + CHIP_ICON
     } else {
@@ -300,7 +298,7 @@ fn seg_width(g: &Shared, f: &Fonts, s: &str, chip: bool) -> f32 {
 }
 
 /// The caret's x for byte `b`, before horizontal scrolling, from the text's left edge.
-fn caret_x(g: &Shared, f: &Fonts, fv: &FieldView, b: usize) -> f32 {
+fn caret_x(f: &Fonts, fv: &FieldView, b: usize) -> f32 {
     let mut x = 0.0;
     for (r, k) in segments(fv) {
         let chip = k.is_some();
@@ -309,26 +307,26 @@ fn caret_x(g: &Shared, f: &Fonts, fv: &FieldView, b: usize) -> f32 {
         }
         if b < r.end || (b == r.end && !chip) {
             let lead = if chip { CHIP_PAD + CHIP_ICON } else { 0.0 };
-            return x + lead + g.text_width(&fv.text[r.start..b], &f.body);
+            return x + lead + text_width(&fv.text[r.start..b], &f.body);
         }
-        x += seg_width(g, f, &fv.text[r.clone()], chip);
+        x += seg_width(f, &fv.text[r.clone()], chip);
     }
     x
 }
 
-fn visible_w(g: &Shared, f: &Fonts, v: &View) -> f32 {
-    add_button(g, f, v).0 - 10.0 - TEXT_X
+fn visible_w(f: &Fonts, v: &View) -> f32 {
+    add_button(f, v).0 - 10.0 - TEXT_X
 }
 
 /// How far the text is scrolled left so the caret stays in view.
-fn field_scroll(g: &Shared, f: &Fonts, v: &View) -> f32 {
-    (caret_x(g, f, &v.field, v.field.caret) - visible_w(g, f, v) + 2.0).max(0.0)
+fn field_scroll(f: &Fonts, v: &View) -> f32 {
+    (caret_x(f, &v.field, v.field.caret) - visible_w(f, v) + 2.0).max(0.0)
 }
 
 /// The byte nearest to a click at panel x.
-pub fn field_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
+pub fn field_byte_at(f: &Fonts, v: &View, x: f32) -> usize {
     let fv = &v.field;
-    let local = x - TEXT_X + field_scroll(g, f, v);
+    let local = x - TEXT_X + field_scroll(f, v);
     let mut best = (0usize, f32::MAX);
     let bounds = fv
         .text
@@ -336,7 +334,7 @@ pub fn field_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
         .map(|(i, _)| i)
         .chain(std::iter::once(fv.text.len()));
     for b in bounds {
-        let d = (caret_x(g, f, fv, b) - local).abs();
+        let d = (caret_x(f, fv, b) - local).abs();
         if d < best.1 {
             best = (b, d);
         }
@@ -344,145 +342,111 @@ pub fn field_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
     best.0
 }
 
-fn draw_field(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_field(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let fv = &v.field;
     let cy = (FIELD_T + FIELD_B) / 2.0;
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    unsafe {
-        if fv.focused {
-            dc.DrawRoundedRectangle(
-                &rrect(X0 - 2.5, FIELD_T - 2.5, X1 + 2.5, FIELD_B + 2.5, 22.5),
-                &brush(dc, with_alpha(t.text, 0.10)),
-                4.0,
-                None,
-            );
-        }
-        dc.FillRoundedRectangle(
-            &rrect(X0, FIELD_T, X1, FIELD_B, 20.0),
-            &brush(dc, t.surface),
-        );
-        let edge = if fv.focused {
-            with_alpha(t.text, 0.35)
-        } else {
-            t.hair
-        };
-        dc.DrawRoundedRectangle(
-            &rrect(X0 + 0.5, FIELD_T + 0.5, X1 - 0.5, FIELD_B - 0.5, 19.5),
-            &brush(dc, edge),
-            1.0,
-            None,
+    let ink = t.text;
+    let muted = t.muted;
+    if fv.focused {
+        cv.stroke_rrect(
+            &rrect(X0 - 2.5, FIELD_T - 2.5, X1 + 2.5, FIELD_B + 2.5, 22.5),
+            with_alpha(t.text, 0.10),
+            4.0,
+            Stroke::Plain,
         );
     }
-    draw_icon(g, dc, Icon::Plus, X0 + 20.0, cy, 15.0, &muted);
+    cv.fill_rrect(&rrect(X0, FIELD_T, X1, FIELD_B, 20.0), t.surface);
+    let edge = if fv.focused {
+        with_alpha(t.text, 0.35)
+    } else {
+        t.hair
+    };
+    cv.stroke_rrect(
+        &rrect(X0 + 0.5, FIELD_T + 0.5, X1 - 0.5, FIELD_B - 0.5, 19.5),
+        edge,
+        1.0,
+        Stroke::Plain,
+    );
+    paint_icon(cv, Icon::Plus, X0 + 20.0, cy, 15.0, muted);
 
-    let add = add_button(g, f, v);
+    let add = add_button(f, v);
     let can_add = !fv.text.trim().is_empty();
     let add_fill = match (can_add, hover == Some(Hit::Add)) {
         (true, true) => with_alpha(t.text, 0.86),
         (true, false) => t.text,
         (false, _) => t.button,
     };
-    unsafe {
-        dc.FillRoundedRectangle(
-            &rrect(add.0, add.1, add.2, add.3, (add.3 - add.1) / 2.0),
-            &brush(dc, add_fill),
-        );
-    }
-    center_text(
-        g,
-        dc,
+    cv.fill_rrect(
+        &rrect(add.0, add.1, add.2, add.3, (add.3 - add.1) / 2.0),
+        add_fill,
+    );
+    cv.center_text(
         fv.action,
         &f.title,
         (add.0 + add.2) / 2.0,
         add.1,
         add.3 - add.1,
-        &brush(dc, if can_add { t.panel } else { t.muted }),
+        if can_add { t.panel } else { t.muted },
     );
 
-    let clip = D2D_RECT_F {
-        left: TEXT_X - 2.0,
-        top: FIELD_T + 2.0,
-        right: add.0 - 6.0,
-        bottom: FIELD_B - 2.0,
-    };
-    unsafe { dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
+    let clip_right = add.0 - 6.0;
+    cv.push_clip(TEXT_X - 2.0, FIELD_T + 2.0, clip_right, FIELD_B - 2.0);
     if fv.text.is_empty() {
-        text(
-            dc,
+        cv.text(
             &fv.placeholder,
             &f.body,
             TEXT_X,
             FIELD_T,
-            clip.right - TEXT_X,
+            clip_right - TEXT_X,
             FIELD_B - FIELD_T,
-            &muted,
+            muted,
         );
     }
-    let x0 = TEXT_X - field_scroll(g, f, v);
+    let x0 = TEXT_X - field_scroll(f, v);
     let sel = &fv.selection;
     if fv.focused && !sel.is_empty() {
-        let (a, b) = (caret_x(g, f, fv, sel.start), caret_x(g, f, fv, sel.end));
-        unsafe {
-            dc.FillRectangle(
-                &D2D_RECT_F {
-                    left: x0 + a,
-                    top: cy - 10.0,
-                    right: x0 + b,
-                    bottom: cy + 10.0,
-                },
-                &brush(dc, with_alpha(t.text, 0.16)),
-            );
-        }
+        let (a, b) = (caret_x(f, fv, sel.start), caret_x(f, fv, sel.end));
+        cv.fill_rect(
+            x0 + a,
+            cy - 10.0,
+            x0 + b,
+            cy + 10.0,
+            with_alpha(t.text, 0.16),
+        );
     }
     let mut x = x0;
     for (r, k) in segments(fv) {
         let s = &fv.text[r.clone()];
-        let w = seg_width(g, f, s, k.is_some());
+        let w = seg_width(f, s, k.is_some());
         match k {
             Some(kind) => {
-                unsafe {
-                    dc.FillRoundedRectangle(
-                        &rrect(x, cy - 12.0, x + w, cy + 12.0, 12.0),
-                        &brush(dc, t.chip),
-                    );
-                    dc.DrawRoundedRectangle(
-                        &rrect(x + 0.5, cy - 11.5, x + w - 0.5, cy + 11.5, 11.5),
-                        &brush(dc, t.hair),
-                        1.0,
-                        None,
-                    );
-                }
-                draw_icon(g, dc, chip_icon(kind), x + CHIP_PAD + 6.0, cy, 12.0, &muted);
-                text(
-                    dc,
+                cv.fill_rrect(&rrect(x, cy - 12.0, x + w, cy + 12.0, 12.0), t.chip);
+                cv.stroke_rrect(
+                    &rrect(x + 0.5, cy - 11.5, x + w - 0.5, cy + 11.5, 11.5),
+                    t.hair,
+                    1.0,
+                    Stroke::Plain,
+                );
+                paint_icon(cv, chip_icon(kind), x + CHIP_PAD + 6.0, cy, 12.0, muted);
+                cv.text(
                     s,
                     &f.title,
                     x + CHIP_PAD + CHIP_ICON,
                     FIELD_T,
                     w,
                     FIELD_B - FIELD_T,
-                    &ink,
+                    ink,
                 );
             }
-            None => text(dc, s, &f.body, x, FIELD_T, w + 2.0, FIELD_B - FIELD_T, &ink),
+            None => cv.text(s, &f.body, x, FIELD_T, w + 2.0, FIELD_B - FIELD_T, ink),
         }
         x += w;
     }
     if fv.focused {
-        let cx = (x0 + caret_x(g, f, fv, fv.caret)).round() + 0.5;
-        unsafe {
-            dc.DrawLine(pt(cx, cy - 9.0), pt(cx, cy + 9.0), &ink, 1.2, None);
-        }
+        let cx = (x0 + caret_x(f, fv, fv.caret)).round() + 0.5;
+        cv.line(pt(cx, cy - 9.0), pt(cx, cy + 9.0), ink, 1.2, Stroke::Plain);
     }
-    unsafe { dc.PopAxisAlignedClip() };
+    cv.pop_clip();
 }
 
 // ---- drawing ----
@@ -493,20 +457,31 @@ fn fit(s: &str, w: f32, measure: impl Fn(&str) -> f32) -> std::borrow::Cow<'_, s
     crate::canvas::ellipsize(s, w, measure)
 }
 
-/// One line of text, cut to `w` with an ellipsis (`canvas::clipped_text` on Direct2D).
+/// One line of text, cut to `w` with an ellipsis (`canvas::clipped_text` on Direct2D), for the
+/// panels that still draw with Direct2D.
+#[cfg(windows)]
 pub(crate) fn clipped_text(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    g: &crate::gfx::Shared,
+    dc: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
     s: &str,
     fmt: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     x: f32,
     y: f32,
     w: f32,
     h: f32,
-    b: &ID2D1SolidColorBrush,
+    b: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
 ) {
     let c = unsafe { b.GetColor() };
-    crate::canvas::clipped_text(&mut D2dCanvas::new(g, dc), s, fmt, x, y, w, h, c);
+    canvas::clipped_text(
+        &mut crate::gfx::D2dCanvas::new(g, dc),
+        s,
+        fmt,
+        x,
+        y,
+        w,
+        h,
+        c,
+    );
 }
 
 fn side_icon(i: SideIcon) -> Icon {
@@ -521,51 +496,31 @@ fn side_icon(i: SideIcon) -> Icon {
     }
 }
 
-fn draw_sidebar(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    text(dc, "Spaces", &f.small, 20.0, 126.0, 120.0, 20.0, &muted);
+fn draw_sidebar(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
+    let ink = t.text;
+    let muted = t.muted;
+    cv.text("Spaces", &f.small, 20.0, 126.0, 120.0, 20.0, muted);
     let nr = (SIDE - 36.0, 124.0, SIDE - 12.0, 148.0);
     if hover == Some(Hit::NewList) {
-        unsafe {
-            dc.FillEllipse(
-                &ellipse((nr.0 + nr.2) / 2.0, (nr.1 + nr.3) / 2.0, 12.0),
-                &brush(dc, t.button),
-            )
-        };
+        cv.fill_ellipse(
+            &ellipse((nr.0 + nr.2) / 2.0, (nr.1 + nr.3) / 2.0, 12.0),
+            t.button,
+        );
     }
-    draw_icon(
-        g,
-        dc,
+    paint_icon(
+        cv,
         Icon::Plus,
         (nr.0 + nr.2) / 2.0,
         (nr.1 + nr.3) / 2.0,
         13.0,
-        &muted,
+        muted,
     );
 
     let mut tree_clip = false;
     for (i, r) in side_layout(v) {
         let item = &v.side[i];
         if i >= 3 && !tree_clip {
-            unsafe {
-                dc.PushAxisAlignedClip(
-                    &D2D_RECT_F {
-                        left: 0.0,
-                        top: TREE_Y,
-                        right: SIDE,
-                        bottom: TREE_B,
-                    },
-                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                )
-            };
+            cv.push_clip(0.0, TREE_Y, SIDE, TREE_B);
             tree_clip = true;
         }
         let hov = matches!(hover, Some(Hit::Side(j)) | Some(Hit::Chevron(j)) if j == i);
@@ -577,7 +532,7 @@ fn draw_sidebar(
             None
         };
         if let Some(c) = fill {
-            unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 8.0), &brush(dc, c)) };
+            cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 8.0), c);
         }
         let cy = (r.1 + r.3) / 2.0;
         let name_fmt = if item.selected { &f.title } else { &f.body };
@@ -586,9 +541,8 @@ fn draw_sidebar(
         } else {
             let b = tree_base(item);
             if let Some(open) = item.chevron {
-                draw_icon(
-                    g,
-                    dc,
+                paint_icon(
+                    cv,
                     if open {
                         Icon::ChevronDown
                     } else {
@@ -597,21 +551,19 @@ fn draw_sidebar(
                     b + 8.0,
                     cy,
                     12.0,
-                    &muted,
+                    muted,
                 );
             }
             (b + 30.0, b + 46.0)
         };
         if matches!(item.icon, SideIcon::Private | SideIcon::Shared) {
-            unsafe {
-                dc.FillRoundedRectangle(
-                    &rrect(icon_x - 12.0, cy - 12.0, icon_x + 12.0, cy + 12.0, 7.0),
-                    &brush(dc, t.chip),
-                )
-            };
-            draw_icon(g, dc, side_icon(item.icon), icon_x, cy, 13.0, &ink);
+            cv.fill_rrect(
+                &rrect(icon_x - 12.0, cy - 12.0, icon_x + 12.0, cy + 12.0, 7.0),
+                t.chip,
+            );
+            paint_icon(cv, side_icon(item.icon), icon_x, cy, 13.0, ink);
         } else {
-            draw_icon(g, dc, side_icon(item.icon), icon_x, cy, 15.0, &ink);
+            paint_icon(cv, side_icon(item.icon), icon_x, cy, 15.0, ink);
         }
         let right = r.2 - 10.0;
         let note = if item.count > 0 {
@@ -622,11 +574,10 @@ fn draw_sidebar(
         let note_w = if note.is_empty() {
             0.0
         } else {
-            g.text_width(&note, &f.small)
+            text_width(&note, &f.small)
         };
-        clipped_text(
-            g,
-            dc,
+        canvas::clipped_text(
+            cv,
             &item.name,
             name_fmt,
             name_x
@@ -638,14 +589,14 @@ fn draw_sidebar(
             r.1,
             right - note_w - 8.0 - name_x,
             SIDE_ROW,
-            &ink,
+            ink,
         );
         if !note.is_empty() {
-            right_text(g, dc, &note, &f.small, right, r.1, SIDE_ROW, &muted);
+            cv.right_text(&note, &f.small, right, r.1, SIDE_ROW, muted);
         }
     }
     if tree_clip {
-        unsafe { dc.PopAxisAlignedClip() };
+        cv.pop_clip();
     }
     // A thin thumb says there is more of the tree to scroll to.
     let max = side_max_scroll(v.side.len());
@@ -653,88 +604,33 @@ fn draw_sidebar(
         let room = TREE_B - TREE_Y;
         let len = (room * room / (room + max)).max(24.0);
         let top = TREE_Y + (room - len) * (v.side_scroll / max).clamp(0.0, 1.0);
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(SIDE - 6.0, top, SIDE - 3.0, top + len, 1.5),
-                &brush(dc, t.track),
-            )
-        };
+        cv.fill_rrect(&rrect(SIDE - 6.0, top, SIDE - 3.0, top + len, 1.5), t.track);
     }
 
     let sy = H - 40.0;
-    draw_icon(g, dc, Icon::CloudOff, 26.0, sy + 12.0, 14.0, &muted);
-    text(dc, &v.sync, &f.small, 40.0, sy, SIDE - 50.0, 24.0, &muted);
+    paint_icon(cv, Icon::CloudOff, 26.0, sy + 12.0, 14.0, muted);
+    cv.text(&v.sync, &f.small, 40.0, sy, SIDE - 50.0, 24.0, muted);
 }
 
-fn avatar(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    who: Option<&str>,
-    cx: f32,
-    cy: f32,
-) {
-    unsafe {
-        match who {
-            Some(initial) => {
-                dc.FillEllipse(&ellipse(cx, cy, 10.0), &brush(dc, t.chip));
-                dc.DrawEllipse(&ellipse(cx, cy, 9.5), &brush(dc, t.hair), 1.0, None);
-                center_text(
-                    g,
-                    dc,
-                    initial,
-                    &f.small_medium,
-                    cx,
-                    cy - 10.0,
-                    20.0,
-                    &brush(dc, t.text),
-                );
-            }
-            None => dc.DrawEllipse(
-                &ellipse(cx, cy, 9.5),
-                &brush(dc, t.passed),
-                1.0,
-                &dashed_stroke(g),
-            ),
+fn avatar(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, who: Option<&str>, cx: f32, cy: f32) {
+    match who {
+        Some(initial) => {
+            cv.fill_ellipse(&ellipse(cx, cy, 10.0), t.chip);
+            cv.stroke_ellipse(&ellipse(cx, cy, 9.5), t.hair, 1.0, Stroke::Plain);
+            cv.center_text(initial, &f.small_medium, cx, cy - 10.0, 20.0, t.text);
         }
+        None => cv.stroke_ellipse(&ellipse(cx, cy, 9.5), t.passed, 1.0, Stroke::Dashed),
     }
 }
 
-fn draw_rows(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    unsafe {
-        dc.PushAxisAlignedClip(
-            &D2D_RECT_F {
-                left: X0 - 2.0,
-                top: ROWS_T,
-                right: X1 + 2.0,
-                bottom: ROWS_B,
-            },
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        )
-    };
+fn draw_rows(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
+    let ink = t.text;
+    let muted = t.muted;
+    cv.push_clip(X0 - 2.0, ROWS_T, X1 + 2.0, ROWS_B);
     if let Some((title, tip)) = &v.empty {
         let cy = ROWS_T + 70.0;
-        center_text(g, dc, title, &f.title, (X0 + X1) / 2.0, cy, 20.0, &ink);
-        center_text(
-            g,
-            dc,
-            tip,
-            &f.small,
-            (X0 + X1) / 2.0,
-            cy + 22.0,
-            18.0,
-            &muted,
-        );
+        cv.center_text(title, &f.title, (X0 + X1) / 2.0, cy, 20.0, ink);
+        cv.center_text(tip, &f.small, (X0 + X1) / 2.0, cy + 22.0, 18.0, muted);
     }
     for (i, ((top, h), row)) in row_tops(v).into_iter().zip(&v.rows).enumerate() {
         let top = top - v.scroll;
@@ -744,35 +640,23 @@ fn draw_rows(
         let cy = top + h / 2.0;
         match row {
             RowView::Prayer { name, time } => {
-                let nw = g.text_width(name, &f.title);
-                let tw = g.text_width(time, &f.small);
+                let nw = text_width(name, &f.title);
+                let tw = text_width(time, &f.small);
                 let total = nw + 6.0 + tw;
                 let mid = (X0 + X1) / 2.0;
                 let (l, r) = (mid - total / 2.0 - 10.0, mid + total / 2.0 + 10.0);
-                let rule = brush(dc, t.track);
-                unsafe {
-                    dc.DrawLine(pt(X0 + 8.0, cy), pt(l, cy), &rule, 1.0, &dashed_stroke(g));
-                    dc.DrawLine(pt(r, cy), pt(X1 - 8.0, cy), &rule, 1.0, &dashed_stroke(g));
-                }
-                text(
-                    dc,
-                    name,
-                    &f.title,
-                    mid - total / 2.0,
-                    top,
-                    nw + 2.0,
-                    h,
-                    &ink,
-                );
-                text(
-                    dc,
+                let rule = t.track;
+                cv.line(pt(X0 + 8.0, cy), pt(l, cy), rule, 1.0, Stroke::Dashed);
+                cv.line(pt(r, cy), pt(X1 - 8.0, cy), rule, 1.0, Stroke::Dashed);
+                cv.text(name, &f.title, mid - total / 2.0, top, nw + 2.0, h, ink);
+                cv.text(
                     time,
                     &f.small,
                     mid - total / 2.0 + nw + 6.0,
                     top,
                     tw + 2.0,
                     h,
-                    &muted,
+                    muted,
                 );
             }
             RowView::Task {
@@ -786,50 +670,42 @@ fn draw_rows(
             } => {
                 let hov = matches!(hover, Some(Hit::Row(j)) | Some(Hit::Check(j)) | Some(Hit::Delete(j)) if j == i);
                 if hov {
-                    unsafe {
-                        dc.FillRoundedRectangle(
-                            &rrect(X0, top, X1, top + h, 8.0),
-                            &brush(dc, t.raised),
-                        )
-                    };
+                    cv.fill_rrect(&rrect(X0, top, X1, top + h, 8.0), t.raised);
                 }
                 // The 18 px rounded checkbox; a done task is filled with a tick.
                 let (bx, by) = (X0 + 11.0, cy - 9.0);
                 let check_hover = hover == Some(Hit::Check(i));
-                unsafe {
-                    if *done {
-                        dc.FillRoundedRectangle(&rrect(bx, by, bx + 18.0, by + 18.0, 6.0), &ink);
-                        let tick = path(g, pt(bx + 4.5, by + 9.5), false, |k| {
-                            line_to(k, pt(bx + 7.8, by + 12.6));
-                            line_to(k, pt(bx + 13.5, by + 6.2));
-                        });
-                        dc.DrawGeometry(&tick, &brush(dc, t.panel), 1.8, &round_stroke(g));
-                    } else {
-                        let edge = if check_hover { t.text } else { t.passed };
-                        dc.DrawRoundedRectangle(
-                            &rrect(bx + 0.75, by + 0.75, bx + 17.25, by + 17.25, 5.5),
-                            &brush(dc, edge),
-                            1.5,
-                            None,
-                        );
-                    }
+                if *done {
+                    cv.fill_rrect(&rrect(bx, by, bx + 18.0, by + 18.0, 6.0), ink);
+                    let tick = path(pt(bx + 4.5, by + 9.5), false, |k| {
+                        line_to(k, pt(bx + 7.8, by + 12.6));
+                        line_to(k, pt(bx + 13.5, by + 6.2));
+                    });
+                    cv.stroke_path(&tick, t.panel, 1.8, Stroke::Round);
+                } else {
+                    let edge = if check_hover { t.text } else { t.passed };
+                    cv.stroke_rrect(
+                        &rrect(bx + 0.75, by + 0.75, bx + 17.25, by + 17.25, 5.5),
+                        edge,
+                        1.5,
+                        Stroke::Plain,
+                    );
                 }
                 let due_fmt = if *overdue { &f.small_medium } else { &f.small };
-                let due_w = g.text_width(due, due_fmt);
+                let due_w = text_width(due, due_fmt);
                 let due_right = X1 - 38.0;
                 let lane_left = due_right
                     - due_w
                     - if *repeat { 16.0 } else { 0.0 }
                     - if hov { 48.0 } else { 10.0 };
-                let title_ink = if *done { &muted } else { &ink };
+                let title_ink = if *done { muted } else { ink };
                 let (ty, th) = if sub.is_empty() {
                     (top, h)
                 } else {
                     (top + 6.0, 20.0)
                 };
-                clipped_text(
-                    g,
-                    dc,
+                canvas::clipped_text(
+                    cv,
                     title,
                     &f.body,
                     X0 + 42.0,
@@ -839,220 +715,180 @@ fn draw_rows(
                     title_ink,
                 );
                 if !sub.is_empty() {
-                    clipped_text(
-                        g,
-                        dc,
+                    canvas::clipped_text(
+                        cv,
                         sub,
                         &f.small,
                         X0 + 42.0,
                         top + 26.0,
                         lane_left - X0 - 50.0,
                         18.0,
-                        &muted,
+                        muted,
                     );
                 }
-                right_text(
-                    g,
-                    dc,
+                cv.right_text(
                     due,
                     due_fmt,
                     due_right,
                     top,
                     h,
-                    if *overdue { &ink } else { &muted },
+                    if *overdue { ink } else { muted },
                 );
                 if *repeat {
-                    draw_icon(
-                        g,
-                        dc,
-                        Icon::Repeat,
-                        due_right - due_w - 9.0,
-                        cy,
-                        11.0,
-                        &muted,
-                    );
+                    paint_icon(cv, Icon::Repeat, due_right - due_w - 9.0, cy, 11.0, muted);
                 }
-                avatar(g, dc, t, f, assignee.as_deref(), X1 - 16.0, cy);
+                avatar(cv, t, f, assignee.as_deref(), X1 - 16.0, cy);
                 if hov {
-                    let d = delete_rect(g, f, due, *repeat, top, h);
+                    let d = delete_rect(f, due, *repeat, top, h);
                     let dcx = (d.0 + d.2) / 2.0;
                     let fill = if hover == Some(Hit::Delete(i)) {
                         t.button_hover
                     } else {
                         t.button
                     };
-                    unsafe { dc.FillEllipse(&ellipse(dcx, cy, 14.0), &brush(dc, fill)) };
-                    draw_icon(g, dc, Icon::Close, dcx, cy, 13.0, &muted);
+                    cv.fill_ellipse(&ellipse(dcx, cy, 14.0), fill);
+                    paint_icon(cv, Icon::Close, dcx, cy, 13.0, muted);
                 }
             }
         }
     }
-    unsafe { dc.PopAxisAlignedClip() };
+    cv.pop_clip();
 }
 
-pub fn draw(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    let hair = brush(dc, t.hair);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, W, H, 20.0), &brush(dc, t.panel));
-        let side = brush(dc, with_alpha(t.raised, 0.6));
-        dc.PushAxisAlignedClip(
-            &D2D_RECT_F {
-                left: 0.0,
-                top: 0.0,
-                right: SIDE,
-                bottom: H,
-            },
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        );
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, W, H, 20.0), &side);
-        dc.PopAxisAlignedClip();
-        dc.DrawLine(pt(SIDE + 0.5, 0.0), pt(SIDE + 0.5, H), &hair, 1.0, None);
-        dc.DrawRoundedRectangle(&rrect(0.5, 0.5, W - 0.5, H - 0.5, 19.5), &hair, 1.0, None);
-    }
-    draw_sidebar(g, dc, t, f, v, hover);
-
-    text(
-        dc,
-        &v.crumb,
-        &f.small,
-        X0,
-        16.0,
-        X1 - X0 - 100.0,
-        18.0,
-        &muted,
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
+    let ink = t.text;
+    let muted = t.muted;
+    let hair = t.hair;
+    cv.fill_rrect(&rrect(0.0, 0.0, W, H, 20.0), t.panel);
+    let side = with_alpha(t.raised, 0.6);
+    cv.push_clip(0.0, 0.0, SIDE, H);
+    cv.fill_rrect(&rrect(0.0, 0.0, W, H, 20.0), side);
+    cv.pop_clip();
+    cv.line(
+        pt(SIDE + 0.5, 0.0),
+        pt(SIDE + 0.5, H),
+        hair,
+        1.0,
+        Stroke::Plain,
     );
-    clipped_text(
-        g,
-        dc,
+    cv.stroke_rrect(
+        &rrect(0.5, 0.5, W - 0.5, H - 0.5, 19.5),
+        hair,
+        1.0,
+        Stroke::Plain,
+    );
+    draw_sidebar(cv, t, f, v, hover);
+
+    cv.text(&v.crumb, &f.small, X0, 16.0, X1 - X0 - 100.0, 18.0, muted);
+    canvas::clipped_text(
+        cv,
         &v.title,
         &f.heading,
         X0,
         34.0,
         ALL_RECT.0 - X0 - 12.0,
         30.0,
-        &ink,
+        ink,
     );
     let sr = (X1 - 84.0, 28.0, X1, 60.0);
     for (r, h) in [(sr, Hit::Share), (ALL_RECT, Hit::AllTasks)] {
-        unsafe {
-            let fill = if hover == Some(h) {
-                t.button_hover
-            } else {
-                t.surface
-            };
-            dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 16.0), &brush(dc, fill));
-            dc.DrawRoundedRectangle(
-                &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 15.5),
-                &hair,
-                1.0,
-                None,
-            );
-        }
-        crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 16.0, 1.0);
+        let fill = if hover == Some(h) {
+            t.button_hover
+        } else {
+            t.surface
+        };
+        cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 16.0), fill);
+        cv.stroke_rrect(
+            &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 15.5),
+            hair,
+            1.0,
+            Stroke::Plain,
+        );
+        crate::ui::lip(cv, t, r.0, r.1, r.2, r.3, 16.0, 1.0);
     }
-    draw_icon(g, dc, Icon::Link, sr.0 + 22.0, 44.0, 14.0, &ink);
-    text(dc, "Share", &f.title, sr.0 + 34.0, sr.1, 50.0, 32.0, &ink);
+    paint_icon(cv, Icon::Link, sr.0 + 22.0, 44.0, 14.0, ink);
+    cv.text("Share", &f.title, sr.0 + 34.0, sr.1, 50.0, 32.0, ink);
     let ar = ALL_RECT;
-    draw_icon(g, dc, Icon::List, ar.0 + 22.0, 44.0, 14.0, &ink);
-    text(
-        dc,
-        "All tasks",
-        &f.title,
-        ar.0 + 34.0,
-        ar.1,
-        66.0,
-        32.0,
-        &ink,
-    );
+    paint_icon(cv, Icon::List, ar.0 + 22.0, 44.0, 14.0, ink);
+    cv.text("All tasks", &f.title, ar.0 + 34.0, ar.1, 66.0, 32.0, ink);
 
-    draw_field(g, dc, t, f, v, hover);
-    clipped_text(
-        g,
-        dc,
+    draw_field(cv, t, f, v, hover);
+    canvas::clipped_text(
+        cv,
         &v.understood,
         &f.small,
         X0 + 14.0,
         FIELD_B + 6.0,
         X1 - X0 - 28.0,
         18.0,
-        &muted,
+        muted,
     );
 
-    for (tab, r) in tab_rects(g, f, v) {
+    for (tab, r) in tab_rects(f, v) {
         let on = tab == v.tab;
         if on || hover == Some(Hit::Tab(tab)) {
-            unsafe {
-                dc.FillRoundedRectangle(
-                    &rrect(r.0, r.1, r.2, r.3, 14.0),
-                    &brush(dc, if on { t.chip } else { t.raised }),
-                )
-            };
+            cv.fill_rrect(
+                &rrect(r.0, r.1, r.2, r.3, 14.0),
+                if on { t.chip } else { t.raised },
+            );
         }
         let (label, n) = match tab {
             Tab::Todo => ("To do", v.todo_n),
             Tab::Done => ("Done", v.done_n),
         };
-        let lw = g.text_width(label, &f.title);
-        text(
-            dc,
+        let lw = text_width(label, &f.title);
+        cv.text(
             label,
             &f.title,
             r.0 + 12.0,
             r.1,
             lw + 2.0,
             28.0,
-            if on { &ink } else { &muted },
+            if on { ink } else { muted },
         );
-        text(
-            dc,
+        cv.text(
             &n.to_string(),
             &f.body,
             r.0 + 18.0 + lw,
             r.1,
             30.0,
             28.0,
-            &muted,
+            muted,
         );
     }
-    unsafe { dc.DrawLine(pt(X0, ROWS_T - 4.5), pt(X1, ROWS_T - 4.5), &hair, 1.0, None) };
+    cv.line(
+        pt(X0, ROWS_T - 4.5),
+        pt(X1, ROWS_T - 4.5),
+        hair,
+        1.0,
+        Stroke::Plain,
+    );
 
-    draw_rows(g, dc, t, f, v, hover);
+    draw_rows(cv, t, f, v, hover);
 
     if !v.footer.is_empty() {
-        unsafe { dc.DrawLine(pt(X0, ROWS_B + 0.5), pt(X1, ROWS_B + 0.5), &hair, 1.0, None) };
-        draw_icon(
-            g,
-            dc,
-            Icon::ChevronRight,
-            X0 + 6.0,
-            ROWS_B + 22.0,
-            12.0,
-            &muted,
+        cv.line(
+            pt(X0, ROWS_B + 0.5),
+            pt(X1, ROWS_B + 0.5),
+            hair,
+            1.0,
+            Stroke::Plain,
         );
+        paint_icon(cv, Icon::ChevronRight, X0 + 6.0, ROWS_B + 22.0, 12.0, muted);
         let fmt = if hover == Some(Hit::Footer) {
             &f.small_medium
         } else {
             &f.small
         };
-        clipped_text(
-            g,
-            dc,
+        canvas::clipped_text(
+            cv,
             &v.footer,
             fmt,
             X0 + 20.0,
             ROWS_B + 12.0,
             X1 - X0 - 20.0,
             20.0,
-            &muted,
+            muted,
         );
     }
 }

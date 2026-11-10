@@ -1,4 +1,4 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Tasks window: the title band, the add field and the line under it, every task grouped
 //! Today / Upcoming / No date / Done (folded), rows with a checkbox, an inline title edit, the due
 //! menu, and the Undo bar after a delete. Drawing and hit tests on a plain [`View`] that
@@ -6,14 +6,11 @@
 
 use std::ops::Range;
 
-use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-
-use crate::gfx::*;
+use crate::canvas::{
+    clipped_text, ellipse, line_to, path, pt, rrect, text_width, Canvas, Font, Stroke,
+};
 use crate::motion::{self, Roll};
-use crate::tasks_panel::clipped_text;
-use crate::ui::{draw_icon, text_num, title_button, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{lip, num_text, paint_icon, paint_title_button, with_alpha, Fonts, Icon, Theme};
 
 /// The window's logical width when it opens, and the least it can be resized to.
 pub const W: f32 = 600.0;
@@ -185,17 +182,6 @@ fn column(v: &View) -> (f32, View) {
     (off, View { w: cw, ..v.clone() })
 }
 
-fn translate(x: f32) -> windows_numerics::Matrix3x2 {
-    windows_numerics::Matrix3x2 {
-        M11: 1.0,
-        M12: 0.0,
-        M21: 0.0,
-        M22: 1.0,
-        M31: x,
-        M32: 0.0,
-    }
-}
-
 /// The right edge of the content: 20 px in from the column's right edge.
 fn x1(w: f32) -> f32 {
     w - X0
@@ -211,8 +197,8 @@ fn max_rect(w: f32) -> Rect {
     (c.0 - 4.0 - 28.0, c.1, c.0 - 4.0, c.3)
 }
 
-fn add_rect(g: &Shared, f: &Fonts, w: f32) -> Rect {
-    let bw = g.text_width("Add", &f.title) + 28.0;
+fn add_rect(f: &Fonts, w: f32) -> Rect {
+    let bw = text_width("Add", &f.title) + 28.0;
     let r = x1(w) - 4.0;
     (r - bw, FIELD_T + 4.0, r, FIELD_B - 4.0)
 }
@@ -229,9 +215,9 @@ fn undo_button(v: &View) -> Rect {
 
 /// The parts of a task row on screen at `top`: (due label's left edge, due button, delete
 /// button). The buttons sit just left of the due label.
-fn row_parts(g: &Shared, f: &Fonts, r: &RowV, top: f32, w: f32) -> (f32, Rect, Rect) {
+fn row_parts(f: &Fonts, r: &RowV, top: f32, w: f32) -> (f32, Rect, Rect) {
     let fmt = if r.overdue { &f.small_medium } else { &f.small };
-    let due_w = g.text_width(&r.due, fmt) + if r.repeat { 16.0 } else { 0.0 };
+    let due_w = text_width(&r.due, fmt) + if r.repeat { 16.0 } else { 0.0 };
     let lane = x1(w) - 12.0 - due_w;
     let cy = top + ROW / 2.0;
     let del = (lane - 10.0 - 28.0, cy - 14.0, lane - 10.0, cy + 14.0);
@@ -239,19 +225,19 @@ fn row_parts(g: &Shared, f: &Fonts, r: &RowV, top: f32, w: f32) -> (f32, Rect, R
     (lane, due, del)
 }
 
-fn edit_rect(g: &Shared, f: &Fonts, r: &RowV, top: f32, w: f32) -> Rect {
-    let (lane, _, _) = row_parts(g, f, r, top, w);
+fn edit_rect(f: &Fonts, r: &RowV, top: f32, w: f32) -> Rect {
+    let (lane, _, _) = row_parts(f, r, top, w);
     let cy = top + ROW / 2.0;
     (X0 + 34.0, cy - 15.0, lane - 10.0, cy + 15.0)
 }
 
-fn menu_rect(v: &View, m: &MenuV, g: &Shared, f: &Fonts) -> Option<Rect> {
+fn menu_rect(v: &View, m: &MenuV, f: &Fonts) -> Option<Rect> {
     let (top, _) = *item_tops(v).get(m.item)?;
     let ItemV::Task(r) = v.items.get(m.item)? else {
         return None;
     };
     let top = top - v.scroll;
-    let (_, due, _) = row_parts(g, f, r, top, v.w);
+    let (_, due, _) = row_parts(f, r, top, v.w);
     let mh = m.rows.len() as f32 * MENU_ROW + 12.0;
     let l = ((due.0 + due.2) / 2.0 - MENU_W / 2.0).clamp(X0, x1(v.w) - MENU_W);
     let below = top + ROW + 4.0;
@@ -279,7 +265,7 @@ fn visible(v: &View) -> Vec<(usize, f32, f32)> {
         .collect()
 }
 
-pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
+pub fn hit(f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
     if inside(&close_rect(v.w), x, y) {
         return Some(Hit::Close);
     }
@@ -293,7 +279,7 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
     let (v, x) = (&col, x - off);
     let x1 = x1(v.w);
     if let Some(m) = &v.menu {
-        if let Some(r) = menu_rect(v, m, g, f) {
+        if let Some(r) = menu_rect(v, m, f) {
             if inside(&r, x, y) {
                 return (0..m.rows.len())
                     .find(|k| inside(&menu_row(r, *k), x, y))
@@ -309,7 +295,7 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
             return None;
         }
     }
-    if inside(&add_rect(g, f, v.w), x, y) {
+    if inside(&add_rect(f, v.w), x, y) {
         return Some(Hit::Add);
     }
     if inside(&(X0, FIELD_T, x1, FIELD_B), x, y) {
@@ -327,9 +313,9 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
             ItemV::Header { .. } => None,
             ItemV::Task(r) => {
                 if v.editing.as_ref().is_some_and(|(e, _)| *e == i) {
-                    return inside(&edit_rect(g, f, r, top, v.w), x, y).then_some(Hit::Edit(i));
+                    return inside(&edit_rect(f, r, top, v.w), x, y).then_some(Hit::Edit(i));
                 }
-                let (_, due, del) = row_parts(g, f, r, top, v.w);
+                let (_, due, del) = row_parts(f, r, top, v.w);
                 if x < X0 + 36.0 {
                     Some(Hit::Check(i))
                 } else if inside(&del, x, y) {
@@ -347,16 +333,16 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
 
 // ---- text fields ----
 
-fn caret_x(g: &Shared, fmt: &IDWriteTextFormat, s: &str, b: usize) -> f32 {
-    g.text_width(&s[..b.min(s.len())], fmt)
+fn caret_x(fmt: &Font, s: &str, b: usize) -> f32 {
+    text_width(&s[..b.min(s.len())], fmt)
 }
 
 /// How far a field's text is scrolled left so the caret stays in view.
-fn text_scroll(g: &Shared, fmt: &IDWriteTextFormat, fv: &FieldV, room: f32) -> f32 {
-    (caret_x(g, fmt, &fv.text, fv.caret) - room + 2.0).max(0.0)
+fn text_scroll(fmt: &Font, fv: &FieldV, room: f32) -> f32 {
+    (caret_x(fmt, &fv.text, fv.caret) - room + 2.0).max(0.0)
 }
 
-fn byte_at(g: &Shared, fmt: &IDWriteTextFormat, fv: &FieldV, local: f32) -> usize {
+fn byte_at(fmt: &Font, fv: &FieldV, local: f32) -> usize {
     let bounds = fv
         .text
         .char_indices()
@@ -364,7 +350,7 @@ fn byte_at(g: &Shared, fmt: &IDWriteTextFormat, fv: &FieldV, local: f32) -> usiz
         .chain(std::iter::once(fv.text.len()));
     let mut best = (0usize, f32::MAX);
     for b in bounds {
-        let d = (caret_x(g, fmt, &fv.text, b) - local).abs();
+        let d = (caret_x(fmt, &fv.text, b) - local).abs();
         if d < best.1 {
             best = (b, d);
         }
@@ -373,16 +359,16 @@ fn byte_at(g: &Shared, fmt: &IDWriteTextFormat, fv: &FieldV, local: f32) -> usiz
 }
 
 /// The add field's byte nearest a click at window x.
-pub fn field_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
+pub fn field_byte_at(f: &Fonts, v: &View, x: f32) -> usize {
     let (off, col) = column(v);
     let (v, x) = (&col, x - off);
-    let room = add_rect(g, f, v.w).0 - 10.0 - TEXT_X;
-    let local = x - TEXT_X + text_scroll(g, &f.body, &v.field, room);
-    byte_at(g, &f.body, &v.field, local)
+    let room = add_rect(f, v.w).0 - 10.0 - TEXT_X;
+    let local = x - TEXT_X + text_scroll(&f.body, &v.field, room);
+    byte_at(&f.body, &v.field, local)
 }
 
 /// The inline edit's byte nearest a click at window x.
-pub fn edit_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
+pub fn edit_byte_at(f: &Fonts, v: &View, x: f32) -> usize {
     let (off, col) = column(v);
     let (v, x) = (&col, x - off);
     let Some((i, fv)) = &v.editing else { return 0 };
@@ -390,16 +376,15 @@ pub fn edit_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
     else {
         return 0;
     };
-    let er = edit_rect(g, f, r, top - v.scroll, v.w);
+    let er = edit_rect(f, r, top - v.scroll, v.w);
     let room = er.2 - er.0 - 20.0;
-    let local = x - er.0 - 10.0 + text_scroll(g, &f.body, fv, room);
-    byte_at(g, &f.body, fv, local)
+    let local = x - er.0 - 10.0 + text_scroll(&f.body, fv, room);
+    byte_at(&f.body, fv, local)
 }
 
 /// One line of editable text in `clip`, starting at `x0`, with its selection and caret.
 fn draw_text_line(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     fv: &FieldV,
@@ -409,122 +394,84 @@ fn draw_text_line(
 ) {
     let (top, bottom) = (clip.1, clip.3);
     let cy = (top + bottom) / 2.0;
-    let ink = brush(dc, t.text);
-    unsafe {
-        dc.PushAxisAlignedClip(
-            &D2D_RECT_F {
-                left: clip.0,
-                top,
-                right: clip.2,
-                bottom,
-            },
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        )
-    };
+    let ink = t.text;
+    cv.push_clip(clip.0, top, clip.2, bottom);
     if fv.text.is_empty() && !placeholder.is_empty() {
-        text(
-            dc,
+        cv.text(
             placeholder,
             &f.body,
             x0,
             top,
             clip.2 - x0,
             bottom - top,
-            &brush(dc, t.muted),
+            t.muted,
         );
     }
-    let x = x0 - text_scroll(g, &f.body, fv, clip.2 - x0 - 2.0);
+    let x = x0 - text_scroll(&f.body, fv, clip.2 - x0 - 2.0);
     let sel = &fv.selection;
     if fv.focused && !sel.is_empty() {
         let (a, b) = (
-            caret_x(g, &f.body, &fv.text, sel.start),
-            caret_x(g, &f.body, &fv.text, sel.end),
+            caret_x(&f.body, &fv.text, sel.start),
+            caret_x(&f.body, &fv.text, sel.end),
         );
-        unsafe {
-            dc.FillRectangle(
-                &D2D_RECT_F {
-                    left: x + a,
-                    top: cy - 10.0,
-                    right: x + b,
-                    bottom: cy + 10.0,
-                },
-                &brush(dc, with_alpha(t.text, 0.16)),
-            );
-        }
+        cv.fill_rect(x + a, cy - 10.0, x + b, cy + 10.0, with_alpha(t.text, 0.16));
     }
-    let w = g.text_width(&fv.text, &f.body);
-    text(dc, &fv.text, &f.body, x, top, w + 4.0, bottom - top, &ink);
+    let w = text_width(&fv.text, &f.body);
+    cv.text(&fv.text, &f.body, x, top, w + 4.0, bottom - top, ink);
     if fv.focused {
-        let cx = (x + caret_x(g, &f.body, &fv.text, fv.caret)).round() + 0.5;
-        unsafe { dc.DrawLine(pt(cx, cy - 9.0), pt(cx, cy + 9.0), &ink, 1.2, None) };
+        let cx = (x + caret_x(&f.body, &fv.text, fv.caret)).round() + 0.5;
+        cv.line(pt(cx, cy - 9.0), pt(cx, cy + 9.0), ink, 1.2, Stroke::Plain);
     }
-    unsafe { dc.PopAxisAlignedClip() };
+    cv.pop_clip();
 }
 
-fn draw_field(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_field(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let fv = &v.field;
     let x1 = x1(v.w);
     let cy = (FIELD_T + FIELD_B) / 2.0;
-    unsafe {
-        if fv.focused {
-            dc.DrawRoundedRectangle(
-                &rrect(X0 - 2.5, FIELD_T - 2.5, x1 + 2.5, FIELD_B + 2.5, 22.5),
-                &brush(dc, with_alpha(t.text, 0.10)),
-                4.0,
-                None,
-            );
-        }
-        dc.FillRoundedRectangle(
-            &rrect(X0, FIELD_T, x1, FIELD_B, 20.0),
-            &brush(dc, t.surface),
-        );
-        let edge = if fv.focused {
-            with_alpha(t.text, 0.35)
-        } else {
-            t.hair
-        };
-        dc.DrawRoundedRectangle(
-            &rrect(X0 + 0.5, FIELD_T + 0.5, x1 - 0.5, FIELD_B - 0.5, 19.5),
-            &brush(dc, edge),
-            1.0,
-            None,
+    if fv.focused {
+        cv.stroke_rrect(
+            &rrect(X0 - 2.5, FIELD_T - 2.5, x1 + 2.5, FIELD_B + 2.5, 22.5),
+            with_alpha(t.text, 0.10),
+            4.0,
+            Stroke::Plain,
         );
     }
-    crate::depth::lip(g, dc, t, X0, FIELD_T, x1, FIELD_B, 20.0, 1.0);
-    draw_icon(g, dc, Icon::Plus, X0 + 20.0, cy, 15.0, &brush(dc, t.muted));
-    let add = add_rect(g, f, v.w);
+    cv.fill_rrect(&rrect(X0, FIELD_T, x1, FIELD_B, 20.0), t.surface);
+    let edge = if fv.focused {
+        with_alpha(t.text, 0.35)
+    } else {
+        t.hair
+    };
+    cv.stroke_rrect(
+        &rrect(X0 + 0.5, FIELD_T + 0.5, x1 - 0.5, FIELD_B - 0.5, 19.5),
+        edge,
+        1.0,
+        Stroke::Plain,
+    );
+    lip(cv, t, X0, FIELD_T, x1, FIELD_B, 20.0, 1.0);
+    paint_icon(cv, Icon::Plus, X0 + 20.0, cy, 15.0, t.muted);
+    let add = add_rect(f, v.w);
     let can = !fv.text.trim().is_empty();
     let fill = match (can, hover == Some(Hit::Add)) {
         (true, true) => with_alpha(t.text, 0.86),
         (true, false) => t.text,
         (false, _) => t.button,
     };
-    unsafe {
-        dc.FillRoundedRectangle(
-            &rrect(add.0, add.1, add.2, add.3, (add.3 - add.1) / 2.0),
-            &brush(dc, fill),
-        )
-    };
-    center_text(
-        g,
-        dc,
+    cv.fill_rrect(
+        &rrect(add.0, add.1, add.2, add.3, (add.3 - add.1) / 2.0),
+        fill,
+    );
+    cv.center_text(
         "Add",
         &f.title,
         (add.0 + add.2) / 2.0,
         add.1,
         add.3 - add.1,
-        &brush(dc, if can { t.panel } else { t.muted }),
+        if can { t.panel } else { t.muted },
     );
     draw_text_line(
-        g,
-        dc,
+        cv,
         t,
         f,
         fv,
@@ -537,8 +484,7 @@ fn draw_field(
 // ---- the list ----
 
 fn draw_header(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     it: &ItemV,
@@ -557,39 +503,35 @@ fn draw_header(
     else {
         return;
     };
-    let muted = brush(dc, t.muted);
+    let muted = t.muted;
     if !first {
-        unsafe {
-            dc.DrawLine(
-                pt(X0, top + 6.5),
-                pt(x1, top + 6.5),
-                &brush(dc, t.hair),
-                1.0,
-                None,
-            )
-        };
+        cv.line(
+            pt(X0, top + 6.5),
+            pt(x1, top + 6.5),
+            t.hair,
+            1.0,
+            Stroke::Plain,
+        );
     }
     let r = (X0, top + 8.0, x1, top + HEAD);
     if hovered {
-        unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 8.0), &brush(dc, t.raised)) };
+        cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 8.0), t.raised);
     }
     if ring {
-        focus_ring(dc, t, r, 8.0);
+        focus_ring(cv, t, r, 8.0);
     }
-    text(
-        dc,
+    cv.text(
         name,
         &f.small_medium,
         X0 + 12.0,
         r.1,
         200.0,
         r.3 - r.1,
-        &brush(dc, t.text),
+        t.text,
     );
     let right = if let Some(open) = fold {
-        draw_icon(
-            g,
-            dc,
+        paint_icon(
+            cv,
             if *open {
                 Icon::ChevronDown
             } else {
@@ -598,15 +540,14 @@ fn draw_header(
             x1 - 18.0,
             (r.1 + r.3) / 2.0,
             12.0,
-            &muted,
+            muted,
         );
         x1 - 32.0
     } else {
         x1 - 12.0
     };
-    motion::rolling_text_right(
-        g,
-        dc,
+    motion::roll_text_right(
+        cv,
         key,
         &count.to_string(),
         Roll::Slow,
@@ -614,38 +555,28 @@ fn draw_header(
         right,
         r.1,
         r.3 - r.1,
-        &muted,
+        muted,
     );
 }
 
-fn focus_ring(dc: &ID2D1DeviceContext, t: &Theme, r: Rect, radius: f32) {
-    unsafe {
-        dc.DrawRoundedRectangle(
-            &rrect(r.0 - 1.0, r.1 - 1.0, r.2 + 1.0, r.3 + 1.0, radius + 1.0),
-            &brush(dc, t.text),
-            2.0,
-            None,
-        )
-    };
+fn focus_ring(cv: &mut dyn Canvas, t: &Theme, r: Rect, radius: f32) {
+    cv.stroke_rrect(
+        &rrect(r.0 - 1.0, r.1 - 1.0, r.2 + 1.0, r.3 + 1.0, radius + 1.0),
+        t.text,
+        2.0,
+        Stroke::Plain,
+    );
 }
 
-fn round_button(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    r: Rect,
-    icon: Icon,
-    hovered: bool,
-) {
+fn round_button(cv: &mut dyn Canvas, t: &Theme, r: Rect, icon: Icon, hovered: bool) {
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
     let fill = if hovered { t.button_hover } else { t.button };
-    unsafe { dc.FillEllipse(&ellipse(cx, cy, 14.0), &brush(dc, fill)) };
-    draw_icon(g, dc, icon, cx, cy, 13.0, &brush(dc, t.muted));
+    cv.fill_ellipse(&ellipse(cx, cy, 14.0), fill);
+    paint_icon(cv, icon, cx, cy, 13.0, t.muted);
 }
 
 fn draw_task(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     v: &View,
@@ -654,8 +585,8 @@ fn draw_task(
     top: f32,
     hover: Option<Hit>,
 ) {
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
+    let ink = t.text;
+    let muted = t.muted;
     let x1 = x1(v.w);
     let cy = top + ROW / 2.0;
     let editing = v
@@ -668,66 +599,57 @@ fn draw_task(
     let ring = v.ring == Some(i);
     let lit = (hov || ring || menu_here) && editing.is_none();
     if hov || menu_here {
-        unsafe {
-            dc.FillRoundedRectangle(&rrect(X0, top, x1, top + ROW, 8.0), &brush(dc, t.raised))
-        };
+        cv.fill_rrect(&rrect(X0, top, x1, top + ROW, 8.0), t.raised);
     }
     if ring {
-        focus_ring(dc, t, (X0, top, x1, top + ROW), 8.0);
+        focus_ring(cv, t, (X0, top, x1, top + ROW), 8.0);
     }
     // The 18 px rounded checkbox; a done task is filled with a tick.
     let (bx, by) = (X0 + 11.0, cy - 9.0);
-    unsafe {
-        if r.done {
-            dc.FillRoundedRectangle(&rrect(bx, by, bx + 18.0, by + 18.0, 6.0), &ink);
-            let tick = path(g, pt(bx + 4.5, by + 9.5), false, |k| {
-                line_to(k, pt(bx + 7.8, by + 12.6));
-                line_to(k, pt(bx + 13.5, by + 6.2));
-            });
-            dc.DrawGeometry(&tick, &brush(dc, t.panel), 1.8, &round_stroke(g));
+    if r.done {
+        cv.fill_rrect(&rrect(bx, by, bx + 18.0, by + 18.0, 6.0), ink);
+        let tick = path(pt(bx + 4.5, by + 9.5), false, |k| {
+            line_to(k, pt(bx + 7.8, by + 12.6));
+            line_to(k, pt(bx + 13.5, by + 6.2));
+        });
+        cv.stroke_path(&tick, t.panel, 1.8, Stroke::Round);
+    } else {
+        let edge = if hover == Some(Hit::Check(i)) {
+            t.text
         } else {
-            let edge = if hover == Some(Hit::Check(i)) {
-                t.text
-            } else {
-                t.passed
-            };
-            dc.DrawRoundedRectangle(
-                &rrect(bx + 0.75, by + 0.75, bx + 17.25, by + 17.25, 5.5),
-                &brush(dc, edge),
-                1.5,
-                None,
-            );
-        }
+            t.passed
+        };
+        cv.stroke_rrect(
+            &rrect(bx + 0.75, by + 0.75, bx + 17.25, by + 17.25, 5.5),
+            edge,
+            1.5,
+            Stroke::Plain,
+        );
     }
-    let (lane, due_b, del_b) = row_parts(g, f, r, top, v.w);
+    let (lane, due_b, del_b) = row_parts(f, r, top, v.w);
     let due_fmt = if r.overdue { &f.small_medium } else { &f.small };
-    right_text(
-        g,
-        dc,
+    cv.right_text(
         &r.due,
         due_fmt,
         x1 - 12.0,
         top,
         ROW,
-        if r.overdue { &ink } else { &muted },
+        if r.overdue { ink } else { muted },
     );
     if r.repeat {
-        draw_icon(g, dc, Icon::Repeat, lane + 7.0, cy, 11.0, &muted);
+        paint_icon(cv, Icon::Repeat, lane + 7.0, cy, 11.0, muted);
     }
     if let Some(fv) = editing {
-        let er = edit_rect(g, f, r, top, v.w);
-        unsafe {
-            dc.FillRoundedRectangle(&rrect(er.0, er.1, er.2, er.3, 15.0), &brush(dc, t.surface));
-            dc.DrawRoundedRectangle(
-                &rrect(er.0 + 0.5, er.1 + 0.5, er.2 - 0.5, er.3 - 0.5, 14.5),
-                &brush(dc, with_alpha(t.text, 0.35)),
-                1.0,
-                None,
-            );
-        }
+        let er = edit_rect(f, r, top, v.w);
+        cv.fill_rrect(&rrect(er.0, er.1, er.2, er.3, 15.0), t.surface);
+        cv.stroke_rrect(
+            &rrect(er.0 + 0.5, er.1 + 0.5, er.2 - 0.5, er.3 - 0.5, 14.5),
+            with_alpha(t.text, 0.35),
+            1.0,
+            Stroke::Plain,
+        );
         draw_text_line(
-            g,
-            dc,
+            cv,
             t,
             f,
             fv,
@@ -742,65 +664,54 @@ fn draw_task(
     let list_w = if r.list.is_empty() {
         0.0
     } else {
-        (g.text_width(&r.list, &f.small) + 2.0).min(room * 0.4)
+        (text_width(&r.list, &f.small) + 2.0).min(room * 0.4)
     };
     let title_room = room - if list_w > 0.0 { list_w + 10.0 } else { 0.0 };
-    let title_w = g.text_width(&r.title, &f.body).min(title_room);
+    let title_w = text_width(&r.title, &f.body).min(title_room);
     clipped_text(
-        g,
-        dc,
+        cv,
         &r.title,
         &f.body,
         X0 + 42.0,
         top,
         title_room,
         ROW,
-        if r.done { &muted } else { &ink },
+        if r.done { muted } else { ink },
     );
     if list_w > 0.0 {
         clipped_text(
-            g,
-            dc,
+            cv,
             &r.list,
             &f.small,
             X0 + 42.0 + title_w + 10.0,
             top,
             list_w,
             ROW,
-            &muted,
+            muted,
         );
     }
     if lit {
         if !r.done {
-            round_button(g, dc, t, due_b, Icon::Today, hover == Some(Hit::Due(i)));
+            round_button(cv, t, due_b, Icon::Today, hover == Some(Hit::Due(i)));
         }
-        round_button(g, dc, t, del_b, Icon::Trash, hover == Some(Hit::Delete(i)));
+        round_button(cv, t, del_b, Icon::Trash, hover == Some(Hit::Delete(i)));
     }
 }
 
-fn draw_menu(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_menu(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let Some(m) = &v.menu else { return };
-    let Some(r) = menu_rect(v, m, g, f) else {
+    let Some(r) = menu_rect(v, m, f) else {
         return;
     };
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 12.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(
-            &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 11.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
-    crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 12.0, 1.0);
-    let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
+    cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 12.0), t.panel);
+    cv.stroke_rrect(
+        &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 11.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
+    lip(cv, t, r.0, r.1, r.2, r.3, 12.0, 1.0);
+    let (ink, muted) = (t.text, t.muted);
     for (k, (label, date)) in m.rows.iter().enumerate() {
         let rr = menu_row(r, k);
         let lit = match hover {
@@ -808,95 +719,78 @@ fn draw_menu(
             _ => m.sel == k,
         };
         if lit {
-            unsafe {
-                dc.FillRoundedRectangle(&rrect(rr.0, rr.1, rr.2, rr.3, 8.0), &brush(dc, t.raised))
-            };
+            cv.fill_rrect(&rrect(rr.0, rr.1, rr.2, rr.3, 8.0), t.raised);
         }
-        text(dc, label, &f.body, rr.0 + 10.0, rr.1, 140.0, MENU_ROW, &ink);
+        cv.text(label, &f.body, rr.0 + 10.0, rr.1, 140.0, MENU_ROW, ink);
         if !date.is_empty() {
-            text_num(g, dc, date, &f.small, rr.2 - 10.0, rr.1, MENU_ROW, &muted);
+            num_text(cv, date, &f.small, rr.2 - 10.0, rr.1, MENU_ROW, muted);
         }
     }
 }
 
-fn draw_undo(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_undo(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let Some(title) = &v.undo else { return };
     let r = undo_rect(v);
     let cy = (r.1 + r.3) / 2.0;
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 12.0), &brush(dc, t.surface));
-        dc.DrawRoundedRectangle(
-            &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 11.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-        dc.FillRoundedRectangle(
-            &rrect(r.0 + 12.0, cy - 12.0, r.0 + 36.0, cy + 12.0, 7.0),
-            &brush(dc, t.chip),
-        );
-    }
-    crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, 12.0, 1.0);
-    let ink = brush(dc, t.text);
-    draw_icon(g, dc, Icon::Trash, r.0 + 24.0, cy, 13.0, &ink);
+    cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 12.0), t.surface);
+    cv.stroke_rrect(
+        &rrect(r.0 + 0.5, r.1 + 0.5, r.2 - 0.5, r.3 - 0.5, 11.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
+    cv.fill_rrect(
+        &rrect(r.0 + 12.0, cy - 12.0, r.0 + 36.0, cy + 12.0, 7.0),
+        t.chip,
+    );
+    lip(cv, t, r.0, r.1, r.2, r.3, 12.0, 1.0);
+    let ink = t.text;
+    paint_icon(cv, Icon::Trash, r.0 + 24.0, cy, 13.0, ink);
     let label = "Deleted";
-    let lw = g.text_width(label, &f.title);
-    text(dc, label, &f.title, r.0 + 46.0, r.1, lw + 2.0, UNDO_H, &ink);
+    let lw = text_width(label, &f.title);
+    cv.text(label, &f.title, r.0 + 46.0, r.1, lw + 2.0, UNDO_H, ink);
     let b = undo_button(v);
     clipped_text(
-        g,
-        dc,
+        cv,
         title,
         &f.body,
         r.0 + 46.0 + lw + 8.0,
         r.1,
         b.0 - 12.0 - (r.0 + 46.0 + lw + 8.0),
         UNDO_H,
-        &brush(dc, t.muted),
+        t.muted,
     );
     let fill = if hover == Some(Hit::Undo) {
         t.button_hover
     } else {
         t.button
     };
-    unsafe { dc.FillRoundedRectangle(&rrect(b.0, b.1, b.2, b.3, 16.0), &brush(dc, fill)) };
-    crate::depth::lip(g, dc, t, b.0, b.1, b.2, b.3, 16.0, 1.0);
-    center_text(g, dc, "Undo", &f.title, (b.0 + b.2) / 2.0, b.1, 32.0, &ink);
+    cv.fill_rrect(&rrect(b.0, b.1, b.2, b.3, 16.0), fill);
+    lip(cv, t, b.0, b.1, b.2, b.3, 16.0, 1.0);
+    cv.center_text("Undo", &f.title, (b.0 + b.2) / 2.0, b.1, 32.0, ink);
 }
 
 /// The whole window: its card and lip, the title band, the field, the list, the menu and the
 /// Undo bar.
-pub fn draw(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
-    let (ink, muted, hair) = (brush(dc, t.text), brush(dc, t.muted), brush(dc, t.hair));
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
+    let (ink, muted, hair) = (t.text, t.muted, t.hair);
     let w = v.w;
     // A maximized window has square corners (it has no rounded region then either).
     let rad = if v.max { 0.0 } else { 16.0 };
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, w, v.h, rad), &brush(dc, t.panel));
-        if !v.max {
-            dc.DrawRoundedRectangle(&rrect(0.5, 0.5, w - 0.5, v.h - 0.5, 15.5), &hair, 1.0, None);
-        }
+    cv.fill_rrect(&rrect(0.0, 0.0, w, v.h, rad), t.panel);
+    if !v.max {
+        cv.stroke_rrect(
+            &rrect(0.5, 0.5, w - 0.5, v.h - 0.5, 15.5),
+            hair,
+            1.0,
+            Stroke::Plain,
+        );
     }
     // The title band: "Tasks", how many are open, the close button.
-    let tw = g.text_width("Tasks", &f.title);
-    text(dc, "Tasks", &f.title, 16.0, 0.0, tw + 2.0, TOP, &ink);
-    motion::rolling_text(
-        g,
-        dc,
+    let tw = text_width("Tasks", &f.title);
+    cv.text("Tasks", &f.title, 16.0, 0.0, tw + 2.0, TOP, ink);
+    motion::roll_text(
+        cv,
         "tasks.win.open",
         &format!("{} open", v.open_n),
         Roll::Slow,
@@ -904,73 +798,52 @@ pub fn draw(
         16.0 + tw + 8.0,
         0.0,
         TOP,
-        &muted,
+        muted,
     );
     let max_icon = if v.max { Icon::Restore } else { Icon::Maximize };
-    title_button(g, dc, t, max_rect(w), max_icon, hover == Some(Hit::Max));
-    title_button(
-        g,
-        dc,
-        t,
-        close_rect(w),
-        Icon::Close,
-        hover == Some(Hit::Close),
-    );
+    paint_title_button(cv, t, max_rect(w), max_icon, hover == Some(Hit::Max));
+    paint_title_button(cv, t, close_rect(w), Icon::Close, hover == Some(Hit::Close));
     let inset = if v.max { 0.0 } else { 1.0 };
-    unsafe {
-        dc.DrawLine(
-            pt(inset, TOP - 0.5),
-            pt(w - inset, TOP - 0.5),
-            &hair,
-            1.0,
-            None,
-        )
-    };
+    cv.line(
+        pt(inset, TOP - 0.5),
+        pt(w - inset, TOP - 0.5),
+        hair,
+        1.0,
+        Stroke::Plain,
+    );
 
     // Everything below the title band draws in the content column.
     let win_w = w;
     let (off, col) = column(v);
     let v = &col;
     let (w, x1) = (v.w, self::x1(v.w));
-    unsafe { dc.SetTransform(&translate(off)) };
+    cv.push_translate(off, 0.0);
 
-    draw_field(g, dc, t, f, v, hover);
+    draw_field(cv, t, f, v, hover);
     clipped_text(
-        g,
-        dc,
+        cv,
         &v.line,
         &f.small,
         X0 + 14.0,
         FIELD_B + 6.0,
         x1 - X0 - 28.0,
         18.0,
-        &muted,
+        muted,
     );
 
     let bottom = list_bottom(v.h, v.undo.is_some());
-    unsafe {
-        dc.PushAxisAlignedClip(
-            &D2D_RECT_F {
-                left: X0 - 4.0,
-                top: LIST_T,
-                right: x1 + 4.0,
-                bottom,
-            },
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        )
-    };
+    cv.push_clip(X0 - 4.0, LIST_T, x1 + 4.0, bottom);
     if let Some((title, tip)) = &v.empty {
         let cy = LIST_T + 80.0;
-        center_text(g, dc, title, &f.panel_title, w / 2.0, cy, 20.0, &ink);
-        center_text(g, dc, tip, &f.small, w / 2.0, cy + 22.0, 18.0, &muted);
+        cv.center_text(title, &f.panel_title, w / 2.0, cy, 20.0, ink);
+        cv.center_text(tip, &f.small, w / 2.0, cy + 22.0, 18.0, muted);
     }
     // Rows ripple in from the top of what shows, on open.
     for (k, (i, top, _)) in visible(v).into_iter().enumerate() {
-        motion::with_row(dc, motion::ripple_row("tasks.win", k), || {
+        motion::row(cv, motion::ripple_row("tasks.win", k), |cv| {
             match &v.items[i] {
                 it @ ItemV::Header { .. } => draw_header(
-                    g,
-                    dc,
+                    cv,
                     t,
                     f,
                     it,
@@ -980,28 +853,23 @@ pub fn draw(
                     v.ring == Some(i),
                     x1,
                 ),
-                ItemV::Task(r) => draw_task(g, dc, t, f, v, i, r, top, hover),
+                ItemV::Task(r) => draw_task(cv, t, f, v, i, r, top, hover),
             }
         });
     }
-    unsafe { dc.PopAxisAlignedClip() };
+    cv.pop_clip();
     let max = max_scroll(v);
     if max > 0.0 {
         let room = bottom - LIST_T;
         let len = (room * room / (room + max)).max(24.0);
         let top = LIST_T + (room - len) * (v.scroll / max).clamp(0.0, 1.0);
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(w - 9.0, top, w - 6.0, top + len, 1.5),
-                &brush(dc, t.track),
-            )
-        };
+        cv.fill_rrect(&rrect(w - 9.0, top, w - 6.0, top + len, 1.5), t.track);
     }
-    draw_menu(g, dc, t, f, v, hover);
-    draw_undo(g, dc, t, f, v, hover);
-    unsafe { dc.SetTransform(&translate(0.0)) };
+    draw_menu(cv, t, f, v, hover);
+    draw_undo(cv, t, f, v, hover);
+    cv.pop_translate();
     if !v.max {
-        crate::depth::lip(g, dc, t, 0.0, 0.0, win_w, v.h, 16.0, 1.0);
+        lip(cv, t, 0.0, 0.0, win_w, v.h, 16.0, 1.0);
     }
 }
 

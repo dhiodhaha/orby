@@ -303,19 +303,6 @@ impl Icon {
     }
 }
 
-#[cfg(windows)]
-/// A 28 px title-band button (close, maximize): no fill until hovered, a 14 px muted icon.
-pub fn title_button(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    r: (f32, f32, f32, f32),
-    icon: Icon,
-    hover: bool,
-) {
-    paint_title_button(&mut gfx::D2dCanvas::new(g, dc), t, r, icon, hover);
-}
-
 /// A 28 px title-band button (close, maximize): no fill until hovered, a 14 px muted icon.
 pub fn paint_title_button(
     cv: &mut dyn Canvas,

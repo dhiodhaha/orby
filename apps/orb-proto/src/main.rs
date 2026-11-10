@@ -54,6 +54,11 @@ mod panel;
 mod png;
 mod settings_model;
 mod snapshot;
+mod tasks_model;
+mod tasks_panel;
+mod tasks_scenes;
+mod tasks_window_panel;
+mod textfield;
 mod ui;
 
 // Windows: Direct2D, DirectComposition and Win32 windows.
@@ -116,15 +121,7 @@ mod store;
 #[cfg(windows)]
 mod tasks;
 #[cfg(windows)]
-mod tasks_model;
-#[cfg(windows)]
-mod tasks_panel;
-#[cfg(windows)]
 mod tasks_window;
-#[cfg(windows)]
-mod tasks_window_panel;
-#[cfg(windows)]
-mod textfield;
 #[cfg(windows)]
 mod today_model;
 #[cfg(windows)]
