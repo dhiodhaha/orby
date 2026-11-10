@@ -75,20 +75,12 @@ fn log(app: &App) -> Log {
 }
 
 /// A task's title while it is still in the store.
-#[cfg(windows)]
 fn task_title(app: &App, id: &str) -> Option<String> {
     app.tasks
         .snap
         .tasks
         .get(&app_store::TaskId(id.to_string()))
         .map(|t| t.title.clone())
-}
-
-/// The Mac has no task store until tasks.rs is shared (the tasks stage drops this cfg pair):
-/// the session shows its task id.
-#[cfg(not(windows))]
-fn task_title(_app: &App, _id: &str) -> Option<String> {
-    None
 }
 
 fn ask(app: &App) -> Ask {

@@ -4532,7 +4532,7 @@ pub fn on_closed(app: &mut App) {
 /// shows it, and the Scan done (or error) pill says when it ends.
 #[cfg(windows)]
 pub fn scan_clipboard(app: &mut App) {
-    let text = crate::tasks::read_clipboard(app.hwnd).unwrap_or_default();
+    let text = crate::sys::read_clipboard(app).unwrap_or_default();
     let p = PathBuf::from(text.trim().trim_matches('"'));
     if p.as_os_str().is_empty() || !p.is_absolute() {
         sys::log(app, "disk: the clipboard holds no folder path");

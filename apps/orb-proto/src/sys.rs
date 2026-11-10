@@ -1,5 +1,6 @@
-//! What the shared units (notices.rs, habits.rs, history.rs, store.rs, and next tasks.rs,
-//! calendar.rs, settings.rs) ask of the system they run on. They call only these (plus the
+//! What the shared units (notices.rs, habits.rs, history.rs, store.rs, tasks.rs,
+//! tasks_window.rs, calendar.rs, and next settings.rs) ask of the system they run on. They call
+//! only these (plus the
 //! window modules `crate::panels`, `crate::pill`, `crate::orb`, `crate::dial`, `crate::prayer`,
 //! which macOS provides as shims over its `App`), so the same logic runs on Windows (here, over
 //! Win32 and the existing window modules) and on macOS (`mac::sys`).
@@ -24,7 +25,6 @@ pub(crate) use imp::*;
 /// The named timers of the shared units. Windows: one SetTimer id each, on the orb window
 /// (the panel's on the panel window). macOS: a deadline each on the `App`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[allow(dead_code)] // Tasks, CalCue and CalRead are armed once tasks.rs and calendar.rs use sys.
 pub enum Timer {
     /// tasks.rs: the next due pill or overdue change.
     Tasks,
@@ -38,7 +38,9 @@ pub enum Timer {
     CalRead,
     /// notices.rs: the queue's next change.
     Notices,
-    /// The open panel's tick (the countdowns, Today's minute, History's midnight).
+    /// The open panel's tick (the countdowns, Today's minute, History's midnight). Windows'
+    /// panels.rs keeps its own TIMER_PANEL; the Mac's panel host arms this one.
+    #[cfg_attr(windows, allow(dead_code))]
     Panel,
 }
 
@@ -75,7 +77,6 @@ pub(crate) fn moment(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Moment
 }
 
 /// Unix milliseconds now (the store's stamps).
-#[allow(dead_code)] // tasks.rs reads it once shared
 pub fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -99,13 +100,15 @@ mod imp {
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount, GetTickCount64};
     use windows::Win32::System::Time::{
         SystemTimeToTzSpecificLocalTime, TzSpecificLocalTimeToSystemTime,
     };
     use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_SHIFT,
+        GetDoubleClickTime, GetKeyState, GetLastInputInfo, LASTINPUTINFO, VK_CONTROL, VK_SHIFT,
     };
     use windows::Win32::UI::Input::{
         RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE,
@@ -263,21 +266,74 @@ mod imp {
     }
 
     /// Ctrl is held (GetKeyState).
-    #[allow(dead_code)] // tasks.rs and settings.rs read it once shared
     pub fn ctrl_down() -> bool {
         unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
+    }
+
+    /// The longest gap between the two clicks of a double click (GetDoubleClickTime).
+    pub fn double_click_ms() -> u128 {
+        unsafe { GetDoubleClickTime() as u128 }
+    }
+
+    /// The panel window has the keyboard (it is the foreground window).
+    pub fn panel_is_key(app: &App) -> bool {
+        unsafe { GetForegroundWindow() == app.panel_hwnd }
     }
 
     // ---- the system ----
 
     /// The clipboard's text (CF_UNICODETEXT), up to 4096 characters.
-    #[allow(dead_code)] // tasks.rs and calendar.rs read it once shared
     pub fn read_clipboard(app: &App) -> Option<String> {
-        crate::tasks::read_clipboard(app.hwnd)
+        clipboard_text(app.hwnd)
+    }
+
+    /// The clipboard's text, opened for `owner`.
+    fn clipboard_text(owner: HWND) -> Option<String> {
+        unsafe {
+            if OpenClipboard(Some(owner)).is_err() {
+                return None;
+            }
+            let mut out = None;
+            if let Ok(h) = GetClipboardData(13) {
+                let hg = HGLOBAL(h.0);
+                let p = GlobalLock(hg) as *const u16;
+                if !p.is_null() {
+                    let mut n = 0;
+                    while *p.add(n) != 0 && n < 4096 {
+                        n += 1;
+                    }
+                    out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
+                    let _ = GlobalUnlock(hg);
+                }
+            }
+            let _ = CloseClipboard();
+            out
+        }
+    }
+
+    /// Wakes the UI thread from a worker when a calendar read is done: WM_APP_CAL on the orb
+    /// window, which calls `calendar::on_read_done`.
+    #[derive(Clone, Copy)]
+    pub struct CalWaker(isize);
+
+    impl CalWaker {
+        pub fn wake(&self) {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.0 as *mut _)),
+                    crate::WM_APP_CAL,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    pub fn cal_waker(app: &App) -> CalWaker {
+        CalWaker(app.hwnd.0 as isize)
     }
 
     /// Opens a link or file with its default app (ShellExecuteW "open").
-    #[allow(dead_code)] // calendar.rs and settings.rs open links once shared
     pub fn open_url(url: &str) {
         unsafe {
             ShellExecuteW(

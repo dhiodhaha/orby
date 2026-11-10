@@ -140,6 +140,16 @@ pub fn ctrl_down() -> bool {
     input::mods().ctrl || flags().contains(NSEventModifierFlags::Command)
 }
 
+/// The longest gap between the two clicks of a double click (the system's setting).
+pub fn double_click_ms() -> u128 {
+    (NSEvent::doubleClickInterval() * 1000.0).max(0.0) as u128
+}
+
+/// The panel window has the keyboard (it is the key window).
+pub fn panel_is_key(app: &App) -> bool {
+    app.panel_win.is_key()
+}
+
 /// macOS key codes as the Windows virtual keys the shared units read.
 pub fn vk_from_mac(code: u16) -> Option<u16> {
     Some(match code {
@@ -174,6 +184,30 @@ pub fn read_clipboard(_app: &App) -> Option<String> {
 /// Puts text on the pasteboard.
 pub fn write_clipboard(s: &str) {
     input::copy_text(s);
+}
+
+/// Wakes the main thread from a worker when a calendar read is done: `calWake:` on the menu
+/// target (performSelectorOnMainThread), which calls `calendar::on_read_done`.
+#[derive(Clone, Copy)]
+pub struct CalWaker(usize);
+
+// SAFETY: the pointer is only used for performSelectorOnMainThread, which may be sent from any
+// thread, and the object it names lives as long as the app.
+unsafe impl Send for CalWaker {}
+
+impl CalWaker {
+    pub fn wake(&self) {
+        let obj = self.0 as *const objc2::runtime::AnyObject;
+        // SAFETY: see above; the selector is defined on the target's class (mac/app.rs).
+        unsafe {
+            let obj: &objc2::runtime::AnyObject = &*obj;
+            let _: () = msg_send![obj, performSelectorOnMainThread: objc2::sel!(calWake:), withObject: None::<&objc2::runtime::AnyObject>, waitUntilDone: false];
+        }
+    }
+}
+
+pub fn cal_waker(app: &App) -> CalWaker {
+    CalWaker(app.menu_target_ptr())
 }
 
 /// Opens a link with its default app (NSWorkspace).

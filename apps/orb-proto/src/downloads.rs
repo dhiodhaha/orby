@@ -40,8 +40,7 @@ use crate::panels::{self, Kind};
 use crate::pill::dismiss_pill;
 use crate::ui::{self, Icon, Pill, PillAction};
 use crate::{
-    habits, log_line, px, start_anim, store, tasks, with_app, App, MSG_MOUSELEAVE, TIMER_PILL,
-    WM_APP_DL,
+    habits, log_line, px, start_anim, store, with_app, App, MSG_MOUSELEAVE, TIMER_PILL, WM_APP_DL,
 };
 
 const GITHUB: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
@@ -315,7 +314,7 @@ pub fn start(app: &mut App) {
 
 /// WM_CLIPBOARDUPDATE: the text is read only to match a media link; nothing is fetched.
 pub fn on_clipboard(app: &mut App) {
-    let Some(text) = tasks::read_clipboard(app.hwnd) else {
+    let Some(text) = crate::sys::read_clipboard(app) else {
         return;
     };
     let text = text.trim().to_string();
@@ -1037,7 +1036,7 @@ fn done_path(app: &App, id: JobId) -> Option<PathBuf> {
 
 /// Paste in the panel, or tray "Paste a link into Downloads".
 pub fn paste(app: &mut App) {
-    let text = tasks::read_clipboard(app.hwnd).unwrap_or_default();
+    let text = crate::sys::read_clipboard(app).unwrap_or_default();
     match dm::paste_verdict(&text) {
         Ok(link) => {
             app.dl.field = Field::Empty;

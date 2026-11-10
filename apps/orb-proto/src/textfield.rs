@@ -9,6 +9,9 @@ pub struct TextField {
     anchor: usize,
     /// A UTF-16 high surrogate waiting for its pair (WM_CHAR sends them one at a time).
     pending_high: Option<u16>,
+    /// An input method's text being composed, shown in place until it is committed (macOS
+    /// marked text; Windows never sets it).
+    marked: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,6 +76,28 @@ impl TextField {
         self.text.replace_range(sel.clone(), &clean);
         self.caret = sel.start + clean.len();
         self.anchor = self.caret;
+    }
+
+    /// The selected text.
+    #[cfg_attr(windows, allow(dead_code))] // the Mac's Cmd+C and Cmd+X
+    pub fn selected_text(&self) -> &str {
+        &self.text[self.selection()]
+    }
+
+    /// An input method's composition: `s` takes the place of the text composed so far (at
+    /// first, of the selection) and the caret follows it; an empty `s` takes it away, before
+    /// the committed text arrives through `insert`.
+    #[cfg_attr(windows, allow(dead_code))] // macOS marked text
+    pub fn compose(&mut self, s: &str) {
+        if let Some(r) = self.marked.take() {
+            self.anchor = r.start;
+            self.caret = r.end.min(self.text.len());
+        }
+        let start = self.selection().start;
+        self.insert(s);
+        if !s.is_empty() {
+            self.marked = Some(start..self.caret);
+        }
     }
 
     /// One UTF-16 unit from WM_CHAR. Returns whether the text changed.
@@ -244,6 +269,22 @@ mod tests {
         let mut f = TextField::default();
         f.insert("beli\r\ngalon\tbesok");
         assert_eq!(f.text(), "beli galon besok");
+    }
+
+    #[test]
+    fn a_composition_shows_in_place_then_gives_way_to_the_commit() {
+        let mut f = typed("beli  besok");
+        f.place("beli ".len(), false);
+        f.compose("k");
+        f.compose("ka");
+        assert_eq!(f.text(), "beli ka besok");
+        assert_eq!(f.caret(), "beli ka".len());
+        f.compose("");
+        assert_eq!(f.text(), "beli  besok");
+        f.insert("kopi");
+        assert_eq!(f.text(), "beli kopi besok");
+        f.select_all();
+        assert_eq!(f.selected_text(), "beli kopi besok");
     }
 
     #[test]

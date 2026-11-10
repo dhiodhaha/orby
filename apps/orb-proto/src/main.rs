@@ -42,6 +42,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 // Shared by both systems.
+mod calendar;
 mod canvas;
 mod dial_menu;
 mod disk;
@@ -70,9 +71,11 @@ mod settings_scenes;
 mod snapshot;
 mod store;
 mod sys;
+mod tasks;
 mod tasks_model;
 mod tasks_panel;
 mod tasks_scenes;
+mod tasks_window;
 mod tasks_window_panel;
 mod textfield;
 mod today_model;
@@ -81,8 +84,6 @@ mod today_scenes;
 mod ui;
 
 // Windows: Direct2D, DirectComposition and Win32 windows.
-#[cfg(windows)]
-mod calendar;
 #[cfg(windows)]
 mod depth;
 #[cfg(windows)]
@@ -113,10 +114,6 @@ mod pill;
 mod prayer;
 #[cfg(windows)]
 mod settings;
-#[cfg(windows)]
-mod tasks;
-#[cfg(windows)]
-mod tasks_window;
 #[cfg(windows)]
 mod tray;
 
