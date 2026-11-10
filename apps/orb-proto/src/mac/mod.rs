@@ -16,6 +16,7 @@ pub mod clock;
 pub mod disk;
 pub mod disk_win;
 pub mod hotkey;
+pub mod input;
 pub mod login;
 pub mod metal;
 pub mod text;
