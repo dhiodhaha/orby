@@ -287,7 +287,7 @@ pub fn show(app: &mut App) {
     if app.disk.win.window.is_none() {
         make(app, mtm);
     }
-    app.theme = crate::ui::theme(super::app::dark_mode());
+    app.theme = crate::settings::theme_now(&app.settings.prefs);
     if !app.disk.win.open {
         app.disk.win.open = true;
         app.disk.win.hover = None;

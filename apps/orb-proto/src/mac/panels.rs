@@ -208,7 +208,7 @@ pub fn open_panel(app: &mut App, kind: Kind) {
         let old = app.panel_kind;
         leave(app, old);
     }
-    app.theme = crate::ui::theme(crate::mac::app::dark_mode());
+    app.theme = crate::settings::theme_now(&app.settings.prefs);
     if kind == Kind::Prayer {
         app.refresh_day();
     }

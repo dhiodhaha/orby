@@ -29,40 +29,7 @@ use crate::today_panel::{self as tp, Card, Hit, Line, View};
 use crate::ui::{Icon, Pill, PillAction};
 use crate::{log_line, prayer, store, tasks, App};
 
-#[cfg(windows)]
 use crate::settings;
-
-/// settings.json's read and write as Windows' settings.rs does them (read, change, write, then
-/// rename; other keys kept). The Mac has no settings.rs yet: when it is shared, this module
-/// goes and the `use crate::settings` above loses its cfg.
-#[cfg(not(windows))]
-mod settings {
-    use std::path::Path;
-
-    use serde_json::{Map, Value};
-
-    const SETTINGS: &str = "settings.json";
-
-    pub fn read_map(dir: &Path) -> Map<String, Value> {
-        std::fs::read_to_string(dir.join(SETTINGS))
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default()
-    }
-
-    pub fn update_map(dir: &Path, f: impl FnOnce(&mut Map<String, Value>)) {
-        let mut s = read_map(dir);
-        f(&mut s);
-        if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(s)) {
-            let path = dir.join(SETTINGS);
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
-        }
-    }
-}
 
 const READ_EVERY_MS: u32 = 10 * 60 * 1000;
 const CACHE: &str = "calendar-cache.ics";

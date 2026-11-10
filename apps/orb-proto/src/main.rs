@@ -31,7 +31,8 @@
 //! - notices.rs: the notice queue every pill goes through, quiet times, the badge count and the
 //!   Notices panel (notices_model.rs decides, notices_panel.rs draws)
 //! - settings.rs: the Settings window and the first run, settings.json, the shortcut, start with
-//!   Windows, Windows location (settings_model.rs decides, settings_panel.rs draws)
+//!   Windows, Windows location (settings_model.rs decides, settings_panel.rs draws; shared, over
+//!   settings_sys.rs: settings_window.rs here, mac/settings_win.rs on the Mac)
 //! - hook.rs: the low-level mouse hook
 //! - tray.rs: the tray icon and menu commands
 //!
@@ -65,9 +66,11 @@ mod notices_model;
 mod notices_panel;
 mod panel;
 mod png;
+mod settings;
 mod settings_model;
 mod settings_panel;
 mod settings_scenes;
+mod settings_sys;
 mod snapshot;
 mod store;
 mod sys;
@@ -113,7 +116,7 @@ mod pill;
 #[cfg(windows)]
 mod prayer;
 #[cfg(windows)]
-mod settings;
+mod settings_window;
 #[cfg(windows)]
 mod tray;
 
@@ -132,7 +135,7 @@ pub(crate) use mac::shim::{log_line, start_anim};
 #[cfg(target_os = "macos")]
 use mac::{
     panels,
-    shim::{dial, orb, pill, prayer, settings},
+    shim::{dial, orb, pill, prayer},
 };
 
 #[cfg(target_os = "macos")]

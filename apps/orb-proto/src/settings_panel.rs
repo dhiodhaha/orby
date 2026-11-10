@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use crate::canvas::{self, clipped_text, ellipse, pt, rgba, rrect, Canvas, Color, Font, Stroke};
 use crate::notices_model::Source;
 use crate::settings_model::{
-    self as m, AtTimeSound, Capture, Locate, PrayerMethod, Section, Shortcut, Startup, Step,
+    self as m, os, AtTimeSound, Capture, Locate, PrayerMethod, Section, Shortcut, Startup, Step,
     ThemeMode, CITIES,
 };
 use crate::textfield::TextField;
@@ -499,7 +499,7 @@ fn paint_settings(p: &mut Painter, v: &View, s: Section) -> f32 {
         y += 34.0;
     }
     p.text(
-        "On this PC only · sync is off",
+        &format!("On this {} only · sync is off", os::W.device),
         &p.f.small,
         20.0,
         H - 36.0,
@@ -578,13 +578,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
     let t = *p.t;
     let mut y = p.group(top, "Startup");
     let c = p.card(y, &[56.0, 56.0]);
-    p.row_words(
-        y,
-        56.0,
-        "Start with Windows",
-        "Opens quietly as the orb when you sign in",
-        50.0,
-    );
+    p.row_words(y, 56.0, os::W.start, os::W.start_sub, 50.0);
     p.toggle(
         X1 - 14.0,
         y + 28.0,
@@ -592,7 +586,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
         true,
         Hit::StartWithWindows,
     );
-    let sc = v.prefs.shortcut.label();
+    let sc = v.prefs.shortcut.shown();
     p.row_words(
         y + 56.0,
         56.0,
@@ -612,8 +606,8 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
         y = p.problem(
             y,
             "Couldn't add to startup",
-            "Windows blocked it. Allow Orby there.",
-            Some(("Startup apps", Hit::StartupApps)),
+            os::W.blocked,
+            Some((os::W.startup_apps, Hit::StartupApps)),
         ) + 8.0;
     }
 
@@ -647,7 +641,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
                 true,
                 Some(Hit::ChangeShortcut),
             );
-            let parts = v.prefs.shortcut.parts();
+            let parts = v.prefs.shortcut.shown_parts();
             let cw = p.caps_width(&parts);
             p.caps(&parts, left - 10.0 - cw, y + 28.0);
             y = c + 8.0;
@@ -709,7 +703,7 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
                 t.muted,
             );
             let by = y + 128.0;
-            let reset = format!("Reset to {}", Shortcut::DEFAULT.label());
+            let reset = format!("Reset to {}", Shortcut::DEFAULT.shown());
             let rw = p.width(&reset, &p.f.small_medium) + 26.0;
             p.button(
                 (X0 + 14.0, by - 14.0, X0 + 14.0 + rw, by + 14.0),
@@ -733,14 +727,14 @@ fn general(p: &mut Painter, v: &View, top: f32) -> f32 {
     if let Some(s) = v.taken {
         y = p.problem(
             y,
-            &format!("Couldn't use {}", s.label()),
+            &format!("Couldn't use {}", s.shown()),
             "Another app already uses it.",
             Some(("Pick another", Hit::PickAnother)),
         ) + 8.0;
     } else if !v.hotkey_ok && v.capture.is_none() {
         y = p.problem(
             y,
-            &format!("Couldn't use {}", v.prefs.shortcut.label()),
+            &format!("Couldn't use {}", v.prefs.shortcut.shown()),
             "Another app already uses it.",
             Some(("Pick another", Hit::ChangeShortcut)),
         ) + 8.0;
@@ -823,6 +817,40 @@ fn city_words(city: Option<&str>, chosen: bool) -> String {
         .unwrap_or_else(|| "Any kabupaten or kota".into())
 }
 
+/// The location row where the system gives no fix yet (the Mac): a dim radio, no hit.
+fn place_row_disabled(p: &mut Painter, x0: f32, x1: f32, y: f32, row: f32, compact: bool) {
+    let t = *p.t;
+    let mid = y + row / 2.0;
+    let dim = with_alpha(t.text, 0.4);
+    p.draw(|cv| {
+        cv.stroke_ellipse(
+            &ellipse(x0 + 18.0, mid, 7.5),
+            with_alpha(t.muted, 0.5),
+            1.5,
+            Stroke::Plain,
+        );
+    });
+    let w = x1 - x0 - 46.0;
+    p.text(
+        "Location",
+        if compact { &p.f.body } else { &p.f.title },
+        x0 + 36.0,
+        mid - 17.0,
+        w,
+        17.0,
+        dim,
+    );
+    p.text(
+        "Not on the Mac yet. Pick a city.",
+        &p.f.small,
+        x0 + 36.0,
+        mid + 1.0,
+        w,
+        16.0,
+        with_alpha(t.muted, 0.8),
+    );
+}
+
 /// The two place choices: Windows location and a city (the Prayer section and the first run).
 fn place_rows(
     p: &mut Painter,
@@ -851,6 +879,12 @@ fn place_rows(
     let mut y = top;
     for (h, title, sub, on) in rows {
         let r = (x0, y, x1, y + row);
+        if h == Hit::PlaceWindows && !os::W.location {
+            // No location fix on this system yet: the row stays, quiet and out of reach.
+            place_row_disabled(p, x0, x1, y, row, compact);
+            y += row;
+            continue;
+        }
         if on && compact {
             p.fill(r, 8.0, t.button);
         } else if p.hovered(h) {
@@ -1090,7 +1124,7 @@ fn adjust_row(p: &mut Painter, v: &View, top: f32) {
 
 /// Diam, Bunyi or Adzan, and the adzan files.
 fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
-    let adzan = v.prefs.at_time_sound == AtTimeSound::Adzan;
+    let adzan = os::shown_sound(v.prefs.at_time_sound) == AtTimeSound::Adzan;
     let rows: &[f32] = if adzan { &[56.0, 56.0, 56.0] } else { &[56.0] };
     let c = p.card(top, rows);
     p.row_words(
@@ -1100,7 +1134,12 @@ fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
         "Silent in full screen and while presenting",
         250.0,
     );
-    sound_segmented(p, X1 - 12.0, top + 28.0, v.prefs.at_time_sound);
+    sound_segmented(
+        p,
+        X1 - 12.0,
+        top + 28.0,
+        os::shown_sound(v.prefs.at_time_sound),
+    );
     if adzan {
         let y = top + 56.0;
         let main = v
@@ -1108,7 +1147,7 @@ fn at_time_rows(p: &mut Painter, v: &View, top: f32) -> f32 {
             .adzan_file
             .as_deref()
             .map(m::file_name)
-            .unwrap_or_else(|| "Choose an mp3 or wav on this PC".into());
+            .unwrap_or_else(|| format!("Choose an mp3 or wav on this {}", os::W.device));
         p.row_words(y, 56.0, "Adzan", &main, 120.0);
         p.button_at(
             X1 - 12.0,
@@ -1150,7 +1189,7 @@ fn sound_segmented(p: &mut Painter, right: f32, cy: f32, on: AtTimeSound) {
     let t = *p.t;
     let f = p.f;
     let fmt = &f.small_medium;
-    let ws: Vec<f32> = AtTimeSound::ALL
+    let ws: Vec<f32> = os::sounds()
         .iter()
         .map(|s| p.width(s.name(), fmt) + 24.0)
         .collect();
@@ -1158,7 +1197,7 @@ fn sound_segmented(p: &mut Painter, right: f32, cy: f32, on: AtTimeSound) {
     let r = (right - total, cy - 16.0, right, cy + 16.0);
     p.fill(r, 10.0, t.button);
     let mut x = r.0 + 4.0;
-    for (s, w) in AtTimeSound::ALL.iter().zip(ws) {
+    for (s, w) in os::sounds().iter().zip(ws) {
         let ir = (x, r.1 + 4.0, x + w, r.3 - 4.0);
         let h = Hit::AtTime(*s);
         if *s == on {
@@ -1242,7 +1281,7 @@ fn account(p: &mut Painter, top: f32) -> f32 {
         t.text,
     );
     p.text(
-        "Everything works on this PC, offline.",
+        &format!("Everything works on this {}, offline.", os::W.device),
         &p.f.small,
         X0 + 58.0,
         top + 33.0,
@@ -1252,7 +1291,7 @@ fn account(p: &mut Painter, top: f32) -> f32 {
     );
     p.button_at(X1 - 14.0, top + 32.0, "Sign in", false, false, None);
     let y = c + 12.0;
-    p.wrap("Sync, family spaces and signed-in devices come in a later version. Nothing leaves this PC until then.", &p.f.small_wrap, X0, y, X1 - X0, 40.0, t.muted);
+    p.wrap(&format!("Sync, family spaces and signed-in devices come in a later version. Nothing leaves this {} until then.", os::W.device), &p.f.small_wrap, X0, y, X1 - X0, 40.0, t.muted);
     y + 44.0
 }
 
@@ -1261,8 +1300,9 @@ fn about(p: &mut Painter, v: &View, top: f32) -> f32 {
     p.text("Orby", &p.f.big, X0, top, 300.0, 36.0, t.text);
     p.text(
         &format!(
-            "Version {} · orb prototype for Windows",
-            env!("CARGO_PKG_VERSION")
+            "Version {} · orb prototype for {}",
+            env!("CARGO_PKG_VERSION"),
+            os::W.os
         ),
         &p.f.small,
         X0,
@@ -1282,13 +1322,20 @@ fn about(p: &mut Painter, v: &View, top: f32) -> f32 {
         true,
         Some(Hit::OpenData),
     );
-    p.row_words(y + 56.0, 56.0, "Sync", "Off. Nothing leaves this PC.", 0.0);
+    p.row_words(
+        y + 56.0,
+        56.0,
+        "Sync",
+        &format!("Off. Nothing leaves this {}.", os::W.device),
+        0.0,
+    );
     p.row_words(
         y + 112.0,
         56.0,
         "Prayer times",
         &format!(
-            "Worked out on this PC with the {} method",
+            "Worked out on this {} with the {} method",
+            os::W.device,
             v.prefs.prayer_method.name()
         ),
         0.0,
@@ -1475,7 +1522,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 t.text,
             );
             p.text(
-                "Worked out on this PC, offline.",
+                &format!("Worked out on this {}, offline.", os::W.device),
                 &p.f.body,
                 x0,
                 80.0,
@@ -1540,7 +1587,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                     let (parts, whole) = c.caps();
                     (parts, if whole { None } else { Some("press a key") })
                 }
-                None => (v.prefs.shortcut.parts(), None),
+                None => (v.prefs.shortcut.shown_parts(), None),
             };
             let pw = prompt.map_or(0.0, |s| p.width(s, &p.f.small) + 10.0);
             let cw = if parts.is_empty() {
@@ -1583,7 +1630,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                     Some(Hit::CaptureSave),
                 );
             } else if taken.is_some() {
-                let use_label = v.suggestion.map(|s| format!("Use {}", s.label()));
+                let use_label = v.suggestion.map(|s| format!("Use {}", s.shown()));
                 let pick_w = p.width("Pick another", &p.f.small_medium) + 26.0;
                 let total = pick_w
                     + use_label
@@ -1624,7 +1671,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 p.icon(Icon::Alert, x0 + 11.0, y + 11.0, 13.0, t.ember);
                 let w = x1 - x0 - 30.0;
                 p.text(
-                    &format!("Couldn't use {}", s.label()),
+                    &format!("Couldn't use {}", s.shown()),
                     &p.f.title,
                     x0 + 30.0,
                     y - 2.0,
@@ -1660,7 +1707,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                     );
                 } else {
                     p.text(
-                        &format!("Try it: press {}", v.prefs.shortcut.label()),
+                        &format!("Try it: press {}", v.prefs.shortcut.shown()),
                         &p.f.small,
                         x0 + 32.0,
                         y,
@@ -1671,17 +1718,9 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 }
             }
             p.line(x0, 258.0, x1, 258.0, t.hair);
+            p.text(os::W.start, &p.f.title, x0, 268.0, 190.0, 18.0, t.text);
             p.text(
-                "Start with Windows",
-                &p.f.title,
-                x0,
-                268.0,
-                190.0,
-                18.0,
-                t.text,
-            );
-            p.text(
-                "Opens quietly when you sign in",
+                os::W.first_run_start_sub,
                 &p.f.small,
                 x0,
                 286.0,
@@ -1734,7 +1773,10 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 t.muted,
             );
             p.wrap(
-                "Share task spaces with family and keep your PCs in step.",
+                &format!(
+                    "Share task spaces with family and keep your {}s in step.",
+                    os::W.device
+                ),
                 &p.f.small_wrap,
                 x0,
                 84.0,
@@ -1779,7 +1821,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 false,
                 None,
             );
-            p.wrap("Sync is off in this version. Skip it and everything still works on this PC, offline.", &p.f.small_wrap, x0, 272.0, x1 - x0, 50.0, t.muted);
+            p.wrap(&format!("Sync is off in this version. Skip it and everything still works on this {}, offline.", os::W.device), &p.f.small_wrap, x0, 272.0, x1 - x0, 50.0, t.muted);
             p.button_at(x1, by, "Skip for now", false, true, Some(Hit::Next));
             p.button_at(
                 x0 + p.width("Back", &p.f.small_medium) + 26.0,
@@ -1802,7 +1844,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 (Icon::Pin, place, "Kemenag RI".to_string()),
                 (
                     Icon::Keyboard,
-                    v.prefs.shortcut.label(),
+                    v.prefs.shortcut.shown(),
                     "show or hide".to_string(),
                 ),
                 (
@@ -1829,15 +1871,7 @@ fn paint_first_run(p: &mut Painter, v: &View, step: Step) {
                 );
             }
             if v.fr_start {
-                p.text(
-                    "Starts with Windows.",
-                    &p.f.small,
-                    x0,
-                    214.0,
-                    x1 - x0,
-                    18.0,
-                    t.muted,
-                );
+                p.text(os::W.started, &p.f.small, x0, 214.0, x1 - x0, 18.0, t.muted);
             }
             p.button_at(x1, by, "Finish", true, true, Some(Hit::Finish));
             p.button_at(

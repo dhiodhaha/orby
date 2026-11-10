@@ -366,7 +366,7 @@ unsafe extern "system" fn orb_proc(
             return LRESULT(0);
         }
         WM_APP_PRAYER => {
-            if let Some(owner) = with_app(|app| app.settings.hwnd) {
+            if let Some(owner) = with_app(|app| app.settings.win.hwnd) {
                 let subuh = wparam.0 == 1;
                 let path = prayer::pick_adzan_file(owner, subuh);
                 with_app(|app| settings::on_adzan_picked(app, subuh, path));
@@ -535,7 +535,7 @@ fn run() -> windows::core::Result<()> {
         register_class(hinst, w!("OrbDial"), Some(dial::dial_proc));
         register_class(hinst, w!("OrbPanel"), Some(panels::panel_proc));
         register_class(hinst, w!("OrbMenu"), Some(downloads::menu_proc));
-        register_class(hinst, w!("OrbSettings"), Some(settings::settings_proc));
+        register_class(hinst, w!("OrbSettings"), Some(settings_window::settings_proc));
         register_class(hinst, w!("OrbDisk"), Some(disk_window::disk_proc));
         register_class(hinst, w!("OrbTasks"), Some(tasks_window::tasks_proc));
         step("orb window");
@@ -546,10 +546,10 @@ fn run() -> windows::core::Result<()> {
         let dial_hwnd = make_window(hinst, w!("OrbDial"), w!("Orby menu"))?;
         let panel_hwnd = make_window(hinst, w!("OrbPanel"), w!("Orby panel"))?;
         let menu_hwnd = make_window(hinst, w!("OrbMenu"), w!("Orby menu"))?;
-        let settings_hwnd = settings::make_window(hinst)?;
+        let settings_hwnd = settings_window::make_window(hinst)?;
         let disk_hwnd = disk_window::make_window(hinst)?;
         let tasks_hwnd = tasks_window::make_window(hinst)?;
-        let settings = settings::Settings::load(&store::data_dir(), settings_hwnd);
+        let settings = settings::Settings::load(&store::data_dir(), settings_window::Win::new(settings_hwnd));
         let day = prayer::today();
         let (times, tomorrow_subuh) =
             prayer::compute_times(&settings.prefs, settings.prefs.place.coords(), day);

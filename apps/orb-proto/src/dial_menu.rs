@@ -4,15 +4,16 @@
 //! each pick. The windows (dial.rs on Windows, the Mac `App`'s dial) own aiming, keys, springs
 //! and closing; they call `items`, `children`, `pick` and `pick_child` here.
 //!
-//! Units that are not shared yet (Downloads, Settings) are reached through `pending`: on Windows
+//! Units that are not shared yet (Downloads) are reached through `pending`: on Windows
 //! the real unit, on macOS a plain child and a quiet "Coming to Mac" pill. Each later stage
-//! moves its unit out of `pending` and calls it directly (Tasks, Today and All tasks are out).
+//! moves its unit out of `pending` and calls it directly (Tasks, Today, All tasks and Settings are out).
 
 use app_core::prayer as pr;
 
 use crate::panels::{self, Kind};
+use crate::settings_model::Section;
 use crate::ui::{DialChild, DialItem, Icon};
-use crate::{calendar, disk, habits, history, notices, prayer, tasks, tasks_window, App};
+use crate::{calendar, disk, habits, history, notices, prayer, settings, tasks, tasks_window, App};
 
 pub const TASKS: usize = 0;
 pub const TODAY: usize = 1;
@@ -87,7 +88,7 @@ pub fn children(app: &App, parent: usize) -> (Vec<DialChild>, usize) {
             kids.push(disk::dial_child(app));
             kids.push(history::dial_child(app));
             kids.push(notices::dial_child(app));
-            kids.push(pending::settings_child(app));
+            kids.push(settings::dial_child(app));
             kids.push(tasks_window::dial_child(app));
             (kids, default)
         }
@@ -116,7 +117,7 @@ pub fn pick_child(app: &mut App, parent: usize, j: usize) {
         _ if j == 1 => disk::open(app),
         _ if j == 2 => history::open(app, None),
         _ if j == 3 => notices::open_panel(app),
-        _ if j == 4 => pending::open_settings(app),
+        _ if j == 4 => settings::open(app, Section::General),
         _ if j == 5 => tasks_window::show(app),
         _ => pending::open_downloads(app),
     }
@@ -125,9 +126,8 @@ pub fn pick_child(app: &mut App, parent: usize, j: usize) {
 /// Units not shared yet: the real ones on Windows.
 #[cfg(windows)]
 mod pending {
-    use crate::settings_model::Section;
     use crate::ui::DialChild;
-    use crate::{downloads, settings, App};
+    use crate::{downloads, App};
 
     pub fn downloads_value(app: &App) -> String {
         downloads::dial_value(app)
@@ -137,16 +137,8 @@ mod pending {
         downloads::dial_children(app)
     }
 
-    pub fn settings_child(app: &App) -> DialChild {
-        settings::dial_child(app)
-    }
-
     pub fn open_downloads(app: &mut App) {
         downloads::open(app);
-    }
-
-    pub fn open_settings(app: &mut App) {
-        settings::open(app, Section::General);
     }
 }
 
@@ -179,15 +171,7 @@ mod pending {
         (vec![plain(Icon::Download, "Downloads")], 1)
     }
 
-    pub fn settings_child(_app: &App) -> DialChild {
-        plain(Icon::Gear, "Settings")
-    }
-
     pub fn open_downloads(app: &mut App) {
         coming(app, "Downloads");
-    }
-
-    pub fn open_settings(app: &mut App) {
-        coming(app, "Settings");
     }
 }

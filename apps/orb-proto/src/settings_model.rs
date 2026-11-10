@@ -20,15 +20,16 @@ pub enum ThemeMode {
 impl ThemeMode {
     pub const ALL: [ThemeMode; 3] = [ThemeMode::Windows, ThemeMode::Light, ThemeMode::Dark];
 
+    /// "Windows" follows the system: "System" on the Mac (the saved value stays `windows`).
     pub fn name(self) -> &'static str {
         match self {
-            ThemeMode::Windows => "Windows",
+            ThemeMode::Windows => os::W.system,
             ThemeMode::Light => "Light",
             ThemeMode::Dark => "Dark",
         }
     }
 
-    /// Whether the app draws dark, given what Windows uses for apps.
+    /// Whether the app draws dark, given what the system uses for apps.
     pub fn is_dark(self, windows_dark: bool) -> bool {
         match self {
             ThemeMode::Windows => windows_dark,
@@ -41,7 +42,8 @@ impl ThemeMode {
     pub fn words(self, windows_dark: bool) -> String {
         match self {
             ThemeMode::Windows => format!(
-                "Follows Windows. {} right now.",
+                "Follows {}. {} right now.",
+                os::W.os,
                 if windows_dark { "Dark" } else { "Light" }
             ),
             ThemeMode::Light => "Always light".into(),
@@ -108,8 +110,22 @@ impl Shortcut {
         v
     }
 
+    /// The keycaps as this system names its keys ("Ctrl", "Option", "Space" on the Mac). `parts`
+    /// stays the saved spelling.
+    pub fn shown_parts(&self) -> Vec<String> {
+        let mut v = os::mods_held(self.ctrl, self.alt, self.shift, self.win);
+        v.push(key_name(self.vk).unwrap_or_else(|| format!("Key {}", self.vk)));
+        v
+    }
+
+    /// The text kept in `settings.json` and the log ("Ctrl+Alt+Space" on both systems).
     pub fn label(&self) -> String {
         self.parts().join("+")
+    }
+
+    /// The shortcut as the windows and pills show it ("Ctrl+Option+Space" on the Mac).
+    pub fn shown(&self) -> String {
+        self.shown_parts().join("+")
     }
 
     pub fn parse(s: &str) -> Option<Shortcut> {
@@ -279,27 +295,19 @@ impl Capture {
     /// The keycaps to show: the whole shortcut once pressed, else the modifiers held now.
     pub fn caps(&self) -> (Vec<String>, bool) {
         if let Some(s) = self.got {
-            return (s.parts(), true);
+            return (s.shown_parts(), true);
         }
-        let mut v = Vec::new();
-        for (on, name) in [
-            (self.ctrl, "Ctrl"),
-            (self.alt, "Alt"),
-            (self.shift, "Shift"),
-            (self.win, "Win"),
-        ] {
-            if on {
-                v.push(name.to_string());
-            }
-        }
-        (v, false)
+        (
+            os::mods_held(self.ctrl, self.alt, self.shift, self.win),
+            false,
+        )
     }
 
     pub fn hint(&self) -> &'static str {
         if self.needs_modifier {
-            "Add Ctrl, Alt or Win to that key."
+            os::W.hint_add
         } else {
-            "Hold Ctrl, Alt or Win, then one more key."
+            os::W.hint_hold
         }
     }
 }
@@ -850,9 +858,138 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
+/// The words that name the system, its keys and what it can do (like `disk_model::os`): Windows
+/// keeps its own strings exactly; the Mac says Mac, Option and Cmd, Open at login, and leaves out
+/// what it does not have yet (a location fix, the adzan file).
+pub mod os {
+    use super::AtTimeSound;
+
+    pub struct Words {
+        /// The system's name in sentences: "Follows Windows."
+        pub os: &'static str,
+        /// The machine: "on this PC".
+        pub device: &'static str,
+        /// The theme choice that follows the system.
+        pub system: &'static str,
+        /// The startup row, its line, the first run's line, and the first run's summary.
+        pub start: &'static str,
+        pub start_sub: &'static str,
+        pub first_run_start_sub: &'static str,
+        pub started: &'static str,
+        /// The startup entry exists but the system holds it back, and the button to go there.
+        pub blocked: &'static str,
+        pub startup_apps: &'static str,
+        /// Ctrl, Alt, Shift, Win as this system's keyboard names them.
+        pub mods: [&'static str; 4],
+        pub hint_hold: &'static str,
+        pub hint_add: &'static str,
+        /// The location radio works (Windows location); without it the row stays disabled.
+        pub location: bool,
+        /// Adzan from a file you choose is offered at the time.
+        pub adzan: bool,
+        /// The first run's startup switch starts on.
+        pub start_default: bool,
+    }
+
+    pub const WINDOWS: Words = Words {
+        os: "Windows",
+        device: "PC",
+        system: "Windows",
+        start: "Start with Windows",
+        start_sub: "Opens quietly as the orb when you sign in",
+        first_run_start_sub: "Opens quietly when you sign in",
+        started: "Starts with Windows.",
+        blocked: "Windows blocked it. Allow Orby there.",
+        startup_apps: "Startup apps",
+        mods: ["Ctrl", "Alt", "Shift", "Win"],
+        hint_hold: "Hold Ctrl, Alt or Win, then one more key.",
+        hint_add: "Add Ctrl, Alt or Win to that key.",
+        location: true,
+        adzan: true,
+        start_default: true,
+    };
+
+    #[cfg_attr(windows, allow(dead_code))] // the Mac's; Windows tests read it
+    pub const MAC: Words = Words {
+        os: "macOS",
+        device: "Mac",
+        system: "System",
+        start: "Open at login",
+        start_sub: "Starts when you log in",
+        first_run_start_sub: "Starts when you log in",
+        started: "Opens at login.",
+        blocked: "macOS waits for your OK. Allow Orby there.",
+        startup_apps: "Login Items",
+        mods: ["Ctrl", "Option", "Shift", "Cmd"],
+        hint_hold: "Hold Ctrl, Option or Cmd, then one more key.",
+        hint_add: "Add Ctrl, Option or Cmd to that key.",
+        location: false,
+        adzan: false,
+        // Login items are off until you turn them on (macOS also tells you when one is added).
+        start_default: false,
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    pub const W: Words = WINDOWS;
+    #[cfg(target_os = "macos")]
+    pub const W: Words = MAC;
+
+    /// The modifier keycaps held, in order.
+    pub fn mods_held(ctrl: bool, alt: bool, shift: bool, win: bool) -> Vec<String> {
+        [ctrl, alt, shift, win]
+            .iter()
+            .zip(W.mods)
+            .filter(|(on, _)| **on)
+            .map(|(_, n)| n.to_string())
+            .collect()
+    }
+
+    /// The sounds the At the time row offers.
+    pub fn sounds() -> &'static [AtTimeSound] {
+        if W.adzan {
+            &AtTimeSound::ALL
+        } else {
+            &AtTimeSound::ALL[..2]
+        }
+    }
+
+    /// The sound as the row shows it: an adzan saved on Windows reads as Bunyi where there is no
+    /// adzan (and plays as Bunyi).
+    pub fn shown_sound(s: AtTimeSound) -> AtTimeSound {
+        if s == AtTimeSound::Adzan && !W.adzan {
+            AtTimeSound::Chime
+        } else {
+            s
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mac_names_its_own_keys_and_keeps_the_saved_spelling() {
+        let s = Shortcut::DEFAULT;
+        assert_eq!(s.label(), "Ctrl+Alt+Space");
+        let cmd = Shortcut {
+            win: true,
+            ..Shortcut::ctrl_alt(0x4B)
+        };
+        assert_eq!(
+            os::MAC.mods.join("+"),
+            "Ctrl+Option+Shift+Cmd",
+            "the Mac's modifier names"
+        );
+        if !os::W.location {
+            assert_eq!(cmd.shown(), "Ctrl+Option+Cmd+K");
+            assert_eq!(ThemeMode::Windows.name(), "System");
+        } else {
+            assert_eq!(cmd.shown(), "Ctrl+Alt+Win+K");
+            assert_eq!(cmd.shown(), cmd.label());
+        }
+        assert_eq!(os::sounds().len(), if os::W.adzan { 3 } else { 2 });
+    }
 
     #[test]
     fn distances_read_with_thousands() {
@@ -961,12 +1098,15 @@ mod tests {
     fn changing_the_shortcut_needs_a_modifier_and_esc_cancels() {
         let mut c = Capture::default();
         assert_eq!(c.key(0x4B, true), CaptureKey::NeedsModifier);
-        assert_eq!(c.hint(), "Add Ctrl, Alt or Win to that key.");
+        assert_eq!(c.hint(), os::W.hint_add);
         assert_eq!(c.key(0xA2, true), CaptureKey::Held);
         assert_eq!(c.key(0x12, true), CaptureKey::Held);
         assert_eq!(
             c.caps(),
-            (vec!["Ctrl".to_string(), "Alt".to_string()], false)
+            (
+                vec![os::W.mods[0].to_string(), os::W.mods[1].to_string()],
+                false
+            )
         );
         assert_eq!(
             c.key(0x0D, true),
@@ -978,7 +1118,7 @@ mod tests {
         // Letting go keeps what was pressed, so Save can take it.
         c.key(0x12, false);
         c.key(0xA2, false);
-        assert_eq!(c.caps().0.join("+"), "Ctrl+Alt+J");
+        assert_eq!(c.caps().0.join("+"), Shortcut::ctrl_alt(0x4A).shown());
         assert_eq!(c.key(0x1B, true), CaptureKey::Cancel);
     }
 
@@ -1037,7 +1177,7 @@ mod tests {
     fn words_stay_plain() {
         assert_eq!(
             ThemeMode::Windows.words(true),
-            "Follows Windows. Dark right now."
+            format!("Follows {}. Dark right now.", os::W.os)
         );
         assert_eq!(day_words(6, 7, 11), "Today, Sat 7 Nov");
         assert_eq!(Locate::Off.words(), "Location is off in Windows");
