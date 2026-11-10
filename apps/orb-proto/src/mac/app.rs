@@ -492,6 +492,9 @@ struct Drag {
 pub(crate) struct App {
     gpu: Option<Gpu>,
     orb_layer: Option<Retained<CAMetalLayer>>,
+    /// The badge over the metal, and the label it shows.
+    badge_layer: Option<Retained<objc2_quartz_core::CALayer>>,
+    badge_shown: String,
     orb: Win,
     dial: Win,
     pill_win: Win,
@@ -828,16 +831,142 @@ impl App {
         let (Some(gpu), Some(layer)) = (&self.gpu, &self.orb_layer) else {
             return;
         };
+        let p = self.orb_params();
+        gpu.draw(layer, &p);
+        self.orb_dirty = false;
+        self.render_badge();
+    }
+
+    /// The shader's uniforms for the drop as it is now: at rest, with the ring when one runs.
+    fn orb_params(&self) -> metal::Params {
         let k = self.scale * SS;
-        let p = metal::rest_params(
+        let mut p = metal::rest_params(
             k,
             self.sun_angle,
             self.brightness,
             self.opacity.pos.clamp(0.0, 1.0),
             1.0,
         );
-        gpu.draw(layer, &p);
-        self.orb_dirty = false;
+        // The ring, as on Windows: a running focus session wins (its dotted track and the
+        // part done), else a scan you started.
+        let dark = self.theme.dark;
+        let (ink, track) = if dark {
+            ([0.98, 0.98, 0.98], [1.0, 1.0, 1.0])
+        } else {
+            ([0.09, 0.09, 0.09], [0.0, 0.0, 0.0])
+        };
+        let hair_a = if dark { 0.24 } else { 0.18 };
+        let ring = match (crate::habits::ring(self), crate::disk::ring(self)) {
+            (Some(f), _) => Some((2.0, f, if dark { 0.6 } else { 0.45 }, 0.0)),
+            (None, Some(app_downloads::Ring::Reading)) => {
+                Some((1.0, 0.25, hair_a, crate::disk::spin_start(self)))
+            }
+            (None, Some(app_downloads::Ring::Progress { fraction, .. })) => {
+                Some((1.0, fraction as f32, hair_a, 0.0))
+            }
+            _ => None,
+        };
+        if let Some((mode, progress, track_a, start)) = ring {
+            let premul = |c: [f32; 3], a: f32| [c[0] * a, c[1] * a, c[2] * a, a];
+            p.ring_mode = mode;
+            p.ring_progress = progress;
+            p.ring_start = start;
+            p.ring_ink = premul(ink, 1.0);
+            p.ring_track = premul(track, track_a);
+            p.ring_halo = if dark {
+                premul([0.06, 0.06, 0.06], 0.55)
+            } else {
+                premul([1.0, 1.0, 1.0], 0.75)
+            };
+        }
+        p
+    }
+
+    /// Overdue tasks for the badge (the Tasks unit is not on the Mac yet).
+    fn overdue_tasks(&self) -> usize {
+        0
+    }
+
+    /// Overdue tasks plus the notices waiting behind the front pill, as a count on the drop's
+    /// upper shoulder away from the edge (Windows' `draw_badge`): an ink disc with panel-coloured
+    /// digits and rim; a Disk scan that needs you shows an ember "!". Drawn on its own layer
+    /// over the metal, only when the label changes.
+    fn render_badge(&mut self) {
+        let n = self.overdue_tasks() + crate::notices::badge_count(self);
+        let ember = self.disk.attention;
+        let label = if ember {
+            "!".to_string()
+        } else if n == 0 {
+            String::new()
+        } else if n > 9 {
+            "9+".to_string()
+        } else {
+            n.to_string()
+        };
+        let key = format!("{label}|{}|{:?}", self.theme.dark, self.side);
+        if key == self.badge_shown {
+            return;
+        }
+        self.badge_shown = key;
+        let Some(orb_layer) = &self.orb_layer else {
+            return;
+        };
+        let layer = self.badge_layer.get_or_insert_with(|| {
+            let l = objc2_quartz_core::CALayer::new();
+            l.setFrame(CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(WIN as f64, WIN as f64),
+            ));
+            orb_layer.addSublayer(&l);
+            l
+        });
+        let b = Bitmap::new(WIN, WIN, self.scale);
+        if !label.is_empty() {
+            let t = self.theme;
+            let wide = if label.len() > 1 { 7.0 } else { 0.0 };
+            let cx = WIN / 2.0
+                + if self.side == Side::Right {
+                    -17.0
+                } else {
+                    17.0
+                };
+            let cy = WIN / 2.0 - 17.0;
+            let mut cv = b.canvas();
+            cv.fill_rrect(
+                &crate::canvas::rrect(
+                    cx - 9.5 - wide / 2.0,
+                    cy - 9.5,
+                    cx + 9.5 + wide / 2.0,
+                    cy + 9.5,
+                    9.5,
+                ),
+                t.panel,
+            );
+            let (fill, digits) = if ember {
+                (t.ember, crate::canvas::rgba(0xFFFFFF, 1.0))
+            } else {
+                (t.text, t.panel)
+            };
+            cv.fill_rrect(
+                &crate::canvas::rrect(
+                    cx - 8.0 - wide / 2.0,
+                    cy - 8.0,
+                    cx + 8.0 + wide / 2.0,
+                    cy + 8.0,
+                    8.0,
+                ),
+                fill,
+            );
+            cv.center_text(&label, &self.fonts.badge, cx, cy - 8.0, 16.0, digits);
+        }
+        let Some(img) = b.image() else { return };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        let obj: &AnyObject =
+            unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
+        unsafe { layer.setContents(Some(obj)) };
+        layer.setContentsScale(self.scale as f64);
+        CATransaction::commit();
     }
 
     fn place_orb(&mut self) {
@@ -1661,6 +1790,38 @@ impl App {
                     ));
                 }
             }
+            _ if cmd.starts_with("orb-shot:") => {
+                // The drop as the shader draws it now (ring included), at 2x, then the badge.
+                let path = std::path::PathBuf::from(&cmd["orb-shot:".len()..]);
+                let mut p = self.orb_params();
+                let k = 2.0;
+                let size = (WIN * k).round();
+                let drop = ORB * k;
+                p.orb_origin = [(size - drop) / 2.0, (size - drop) / 2.0];
+                p.orb_size = drop;
+                p.ring_radius = 30.0 * k;
+                p.px1 = k;
+                let px = self.gpu.as_ref().and_then(|g| g.render(size as usize, &p));
+                match (px, path.parent(), path.file_stem()) {
+                    (Some(px), Some(dir), Some(stem)) => {
+                        crate::snapshot::write(
+                            dir,
+                            &stem.to_string_lossy(),
+                            size as u32,
+                            size as u32,
+                            px,
+                        );
+                        self.log(&format!(
+                            "orb-shot: ring mode {} progress {:.3}, badge \"{}\" -> {}",
+                            p.ring_mode,
+                            p.ring_progress,
+                            self.badge_shown,
+                            path.display()
+                        ));
+                    }
+                    _ => self.log("orb-shot: no Metal"),
+                }
+            }
             _ if cmd.starts_with("dial-shot:") => {
                 let path = cmd["dial-shot:".len()..].to_string();
                 let items = menu::items(self);
@@ -2070,6 +2231,8 @@ pub fn run() {
     let mut a = App {
         gpu: gpu.ok(),
         orb_layer,
+        badge_layer: None,
+        badge_shown: String::new(),
         orb,
         dial,
         pill_win,
