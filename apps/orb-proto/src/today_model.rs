@@ -367,10 +367,12 @@ mod tests {
     fn the_label_never_shows_the_secret_part_of_a_link() {
         let s = Source::parse("https://calendar.google.com/calendar/ical/me%40gmail.com/private-0123456789abcdef/basic.ics").unwrap();
         assert_eq!(s.label(), "calendar.google.com");
-        assert_eq!(
-            Source::parse("C:\\cal\\work.ics").unwrap().label(),
-            "work.ics"
-        );
+        let file = if cfg!(windows) {
+            "C:\\cal\\work.ics"
+        } else {
+            "/Users/me/cal/work.ics"
+        };
+        assert_eq!(Source::parse(file).unwrap().label(), "work.ics");
     }
 
     #[test]

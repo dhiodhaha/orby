@@ -561,6 +561,17 @@ pub fn paste_verdict(text: &str) -> Result<MediaLink, Field> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Windows path as this system writes it ("C:\D\x" is "/C/D/x" on the Mac), so the
+    /// path tests run on both.
+    fn native(p: &str) -> String {
+        if cfg!(windows) {
+            p.to_string()
+        } else {
+            format!("/{}", p.replace(":\\", "/").replace('\\', "/"))
+        }
+    }
+
     use app_downloads::{Outcome, Progress, Update};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -865,23 +876,23 @@ mod tests {
     #[test]
     fn change_folder_moves_the_half_done_files_and_nothing_under_the_final_name() {
         let files = vec![
-            PathBuf::from(r"C:\D\Clip [abc].f137.mp4"),
-            PathBuf::from(r"C:\D\Clip [abc].mp4"),
+            PathBuf::from(native(r"C:\D\Clip [abc].f137.mp4")),
+            PathBuf::from(native(r"C:\D\Clip [abc].mp4")),
         ];
-        let m = moves(&files, Path::new(r"E:\New"));
+        let m = moves(&files, PathBuf::from(native(r"E:\New")).as_path());
         assert!(m.contains(&(
-            PathBuf::from(r"C:\D\Clip [abc].mp4.part"),
-            PathBuf::from(r"E:\New\Clip [abc].mp4.part")
+            PathBuf::from(native(r"C:\D\Clip [abc].mp4.part")),
+            PathBuf::from(native(r"E:\New\Clip [abc].mp4.part"))
         )));
         assert!(m.contains(&(
-            PathBuf::from(r"C:\D\Clip [abc].f137.mp4"),
-            PathBuf::from(r"E:\New\Clip [abc].f137.mp4")
+            PathBuf::from(native(r"C:\D\Clip [abc].f137.mp4")),
+            PathBuf::from(native(r"E:\New\Clip [abc].f137.mp4"))
         )));
         assert!(m
             .iter()
-            .all(|(src, _)| src != &PathBuf::from(r"C:\D\Clip [abc].mp4")));
+            .all(|(src, _)| src != &PathBuf::from(native(r"C:\D\Clip [abc].mp4"))));
         assert!(
-            moves(&files, Path::new(r"C:\D")).is_empty(),
+            moves(&files, PathBuf::from(native(r"C:\D")).as_path()).is_empty(),
             "the same folder moves nothing"
         );
     }
