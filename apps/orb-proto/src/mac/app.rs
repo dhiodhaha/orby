@@ -1,4 +1,4 @@
-//! The macOS app: one state on the main thread, five borderless non-activating panels (the
+//! The macOS app: one state on the main thread, four borderless non-activating panels (the
 //! orb, the dial, the pill, the Prayer panel) and a menu bar item.
 //!
 //! Like Windows it renders only while something moves. Each wake is one NSTimer: 60 Hz while a
@@ -24,10 +24,13 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent,
     NSEventMask, NSImage, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusItem,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowCollectionBehavior, NSWorkspace, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSTimer, NSUserDefaults};
+use objc2_foundation::{
+    NSDistributedNotificationCenter, NSNotification, NSOperationQueue, NSPoint, NSRect, NSSize,
+    NSString, NSTimer, NSUserDefaults,
+};
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
 
 use super::cg::Bitmap;
@@ -263,7 +266,11 @@ impl Win {
         panel.setAcceptsMouseMovedEvents(true);
         panel.setFloatingPanel(true);
         let view = OrbyView::new(mtm, kind, w, h);
-        view.setWantsLayer(true);
+        // The orb hosts its own Metal layer (set before wantsLayer); the others are layer-backed
+        // and get a bitmap as contents.
+        if kind != Kind::Orb {
+            view.setWantsLayer(true);
+        }
         panel.setContentView(Some(&view));
         Win {
             panel,
@@ -1374,6 +1381,48 @@ impl App {
         let _ = std::fs::write(path, v.to_string());
     }
 
+    /// Test commands from `dev.dhio.orby.test` (see `run`).
+    fn test_command(&mut self, cmd: &str) {
+        self.log(&format!("test: {cmd}"));
+        match cmd {
+            "dial" => self.open_dial(true),
+            "dial-mouse" => {
+                self.open_dial(false);
+                self.dial_aim = Some(PRAYER);
+                self.render_dial();
+            }
+            "close" => {
+                self.close_dial();
+                self.close_panel();
+                self.dismiss_pill(false);
+            }
+            "panel" => self.open_panel(),
+            "shortcut" => self.on_shortcut(),
+            "tuck" => self.set_tucked(true),
+            "untuck" => self.set_tucked(false),
+            "hide" => self.set_visible(false),
+            "show" => self.set_visible(true),
+            "pill" => self.pick(0),
+            "windows" => {
+                let n = |w: &Win| w.panel.windowNumber();
+                self.log(&format!(
+                    "windows: orb {} dial {} pill {} panel {}",
+                    n(&self.orb),
+                    n(&self.dial),
+                    n(&self.pill_win),
+                    n(&self.panel_win)
+                ));
+            }
+            _ => {
+                if let Some(off) = cmd.strip_prefix("remind").and_then(|o| o.parse::<i32>().ok()) {
+                    let (np, _, _) =
+                        pr::next(&self.times, clock::now_minutes(), self.tomorrow_subuh);
+                    self.fire_reminder(np, off);
+                }
+            }
+        }
+    }
+
     // ---- the frame loop ----
 
     fn animating(&self) -> bool {
@@ -1681,6 +1730,7 @@ pub fn run() {
         if a.theme.dark { "dark" } else { "light" },
         a.prefs.place.short()
     ));
+    a.day = (0, 0, 0); // computes and logs today's times
     a.refresh_day();
     a.schedule_reminders();
     a.place_orb();
@@ -1711,6 +1761,46 @@ pub fn run() {
         NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown,
         &down,
     );
+    // Test commands, like the tray's test items on Windows. From a shell:
+    // osascript -l JavaScript -e "ObjC.import('Foundation');
+    //   $.NSDistributedNotificationCenter.defaultCenter
+    //   .postNotificationNameObjectUserInfoDeliverImmediately('dev.dhio.orby.test', 'dial', null, true)"
+    let test = RcBlock::new(|n: NonNull<NSNotification>| {
+        let n = unsafe { n.as_ref() };
+        let cmd = n
+            .object()
+            .and_then(|o| o.downcast::<NSString>().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        with_app(|a| a.test_command(&cmd));
+    });
+    let _obs = unsafe {
+        NSDistributedNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(&NSString::from_str("dev.dhio.orby.test")),
+            None,
+            Some(&NSOperationQueue::mainQueue()),
+            &test,
+        )
+    };
+    // After sleep the monotonic clock has stood still: recompute today and the next reminder
+    // from the wall clock.
+    let woke = RcBlock::new(|_n: NonNull<NSNotification>| {
+        with_app(|a| {
+            a.log("woke from sleep");
+            a.refresh_day();
+            a.schedule_reminders();
+        });
+    });
+    let _wake = unsafe {
+        NSWorkspace::sharedWorkspace()
+            .notificationCenter()
+            .addObserverForName_object_queue_usingBlock(
+                Some(&NSString::from_str("NSWorkspaceDidWakeNotification")),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &woke,
+            )
+    };
     with_app(|_| {});
     app.run();
 }
