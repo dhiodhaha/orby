@@ -1708,6 +1708,8 @@ impl App {
             self.close_dial();
         }
         if self.panel_open {
+            // A click in another app gives that app the keyboard: nothing to hand back.
+            self.panel_prev_app = None;
             self.close_panel();
         }
     }
