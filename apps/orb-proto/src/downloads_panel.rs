@@ -1,17 +1,13 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Downloads panel (frames "v6.2 · 11" and "v6.2 · 12"): the title with its count, the
 //! first-run card, the paste field, the rows by section, and the folder footer. Also the small
 //! format menu that opens from the offer pill or a waiting row's format chip.
 
-use windows::Win32::Graphics::Direct2D::Common::*;
-use windows::Win32::Graphics::Direct2D::*;
-
 use app_downloads::{ErrorKind, Format, MediaKind, Tone};
 
+use crate::canvas::{clipped_text, ellipse, pt, rgba, rrect, text_width, Canvas, Color, Stroke};
 use crate::downloads_model::{menu_rows, Btn, Chip, Field, Row, Section};
-use crate::gfx::*;
-use crate::tasks_panel::clipped_text;
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{lip, paint_icon, with_alpha, Fonts, Icon, Theme};
 
 pub const W: f32 = 400.0;
 pub const MAX_H: f32 = 620.0;
@@ -178,18 +174,16 @@ fn item_tops(v: &View) -> Vec<(Item, f32)> {
         .collect()
 }
 
-fn btn_w(g: &Shared, f: &Fonts, b: Btn, row: &Row) -> f32 {
+fn btn_w(f: &Fonts, b: Btn, row: &Row) -> f32 {
     match (b, b.label()) {
-        (_, Some(l)) => g.text_width(l, &f.small_medium) + 24.0,
-        (Btn::Format, _) => {
-            10.0 + g.text_width(&row.format_chip, &f.small_medium) + 4.0 + 14.0 + 8.0
-        }
+        (_, Some(l)) => text_width(l, &f.small_medium) + 24.0,
+        (Btn::Format, _) => 10.0 + text_width(&row.format_chip, &f.small_medium) + 4.0 + 14.0 + 8.0,
         _ => 28.0,
     }
 }
 
 /// The row's buttons, right-aligned, left to right.
-fn buttons(g: &Shared, f: &Fonts, row: &Row, top: f32) -> Vec<(Btn, Rect)> {
+fn buttons(f: &Fonts, row: &Row, top: f32) -> Vec<(Btn, Rect)> {
     let cy = top + ROW_H / 2.0;
     let mut x = X1 - 8.0;
     let mut out: Vec<(Btn, Rect)> = row
@@ -197,7 +191,7 @@ fn buttons(g: &Shared, f: &Fonts, row: &Row, top: f32) -> Vec<(Btn, Rect)> {
         .iter()
         .rev()
         .map(|b| {
-            let w = btn_w(g, f, *b, row);
+            let w = btn_w(f, *b, row);
             let r = (x - w, cy - 14.0, x, cy + 14.0);
             x -= w + 4.0;
             (*b, r)
@@ -207,43 +201,43 @@ fn buttons(g: &Shared, f: &Fonts, row: &Row, top: f32) -> Vec<(Btn, Rect)> {
     out
 }
 
-fn paste_rect(g: &Shared, f: &Fonts, v: &View) -> Rect {
+fn paste_rect(f: &Fonts, v: &View) -> Rect {
     let geo = geo(v);
     if empty_block(v) {
         // No "Ctrl V" hint: the panel never takes the keyboard.
-        let w = g.text_width("Paste link", &f.title) + 28.0;
+        let w = text_width("Paste link", &f.title) + 28.0;
         let l = W / 2.0 - w / 2.0;
         let top = geo.field + 140.0;
         (l, top, l + w, top + 32.0)
     } else {
-        let w = g.text_width("Paste", &f.small_medium) + 24.0;
+        let w = text_width("Paste", &f.small_medium) + 24.0;
         (X1 - 6.0 - w, geo.field + 6.0, X1 - 6.0, geo.field + 34.0)
     }
 }
 
-fn card_button(g: &Shared, f: &Fonts, v: &View) -> Option<Rect> {
+fn card_button(f: &Fonts, v: &View) -> Option<Rect> {
     let label = match &v.engine {
         EngineCard::Missing { .. } => "Fetch yt-dlp",
         EngineCard::Failed(_) => "Try again",
         _ => return None,
     };
     let top = geo(v).card + card_h(&v.engine) - 12.0 - 28.0;
-    let w = g.text_width(label, &f.small_medium) + 28.0;
+    let w = text_width(label, &f.small_medium) + 28.0;
     Some((X0 + 14.0, top, X0 + 14.0 + w, top + 28.0))
 }
 
-fn clear_rect(g: &Shared, f: &Fonts, top: f32) -> Rect {
-    let w = g.text_width("Clear list", &f.small);
+fn clear_rect(f: &Fonts, top: f32) -> Rect {
+    let w = text_width("Clear list", &f.small);
     (X1 - 8.0 - w - 6.0, top + 4.0, X1, top + HEAD_H)
 }
 
-fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
+fn layout(f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     let geo = geo(v);
     let mut out: Vec<(Hit, Rect)> = Vec::new();
-    if let Some(r) = card_button(g, f, v) {
+    if let Some(r) = card_button(f, v) {
         out.push((Hit::Fetch, r));
     }
-    out.push((Hit::Paste, paste_rect(g, f, v)));
+    out.push((Hit::Paste, paste_rect(f, v)));
     if !empty_block(v) {
         // A click on the field itself pastes too: the panel never takes the keyboard.
         out.push((Hit::Paste, (X0, geo.field, X1, geo.field + 40.0)));
@@ -254,10 +248,10 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
             continue;
         }
         match item {
-            Item::Head(Section::Done) => out.push((Hit::ClearList, clear_rect(g, f, top))),
+            Item::Head(Section::Done) => out.push((Hit::ClearList, clear_rect(f, top))),
             Item::Head(_) => {}
             Item::Row(i) => {
-                for (b, r) in buttons(g, f, &v.rows[i], top) {
+                for (b, r) in buttons(f, &v.rows[i], top) {
                     out.push((Hit::Btn(i, b), r));
                 }
                 out.push((
@@ -275,33 +269,27 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     out
 }
 
-pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
-    layout(g, f, v)
+pub fn hit(f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
+    layout(f, v)
         .into_iter()
         .find(|(_, r)| inside(r, x, y))
         .map(|(h, _)| h)
 }
 
 /// The waiting row's format chip in panel coordinates, for anchoring the format menu.
-pub fn btn_rect(
-    g: &Shared,
-    f: &Fonts,
-    v: &View,
-    row: usize,
-    which: Btn,
-) -> Option<(f32, f32, f32, f32)> {
+pub fn btn_rect(f: &Fonts, v: &View, row: usize, which: Btn) -> Option<(f32, f32, f32, f32)> {
     item_tops(v)
         .into_iter()
         .find(|(i, _)| *i == Item::Row(row))
         .and_then(|(_, top)| {
-            buttons(g, f, &v.rows[row], top)
+            buttons(f, &v.rows[row], top)
                 .into_iter()
                 .find(|(b, _)| *b == which)
                 .map(|(_, r)| r)
         })
 }
 
-fn track(t: &Theme) -> D2D1_COLOR_F {
+fn track(t: &Theme) -> Color {
     if t.dark {
         rgba(0xFFFFFF, 0.12)
     } else {
@@ -309,7 +297,7 @@ fn track(t: &Theme) -> D2D1_COLOR_F {
     }
 }
 
-fn tone_color(t: &Theme, tone: Tone) -> D2D1_COLOR_F {
+fn tone_color(t: &Theme, tone: Tone) -> Color {
     match tone {
         Tone::Ink => t.text,
         Tone::Grey => t.passed,
@@ -319,31 +307,19 @@ fn tone_color(t: &Theme, tone: Tone) -> D2D1_COLOR_F {
 
 /// A 28 px status chip: r 12 hairline track, a 2 px arc from 12 o'clock, a 12 px icon inside.
 fn ring_chip(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     cx: f32,
     cy: f32,
     from: f32,
     to: f32,
-    arc: D2D1_COLOR_F,
-    icon: Option<(Icon, D2D1_COLOR_F)>,
+    arc: Color,
+    icon: Option<(Icon, Color)>,
 ) {
-    unsafe { dc.DrawEllipse(&ellipse(cx, cy, 12.0), &brush(dc, track(t)), 1.5, None) };
-    draw_arc(
-        g,
-        dc,
-        cx,
-        cy,
-        12.0,
-        from,
-        to,
-        &brush(dc, arc),
-        2.0,
-        &round_stroke(g),
-    );
+    cv.stroke_ellipse(&ellipse(cx, cy, 12.0), track(t), 1.5, Stroke::Plain);
+    cv.arc(cx, cy, 12.0, from, to, arc, 2.0, Stroke::Round);
     if let Some((i, c)) = icon {
-        draw_icon(g, dc, i, cx, cy, 12.0, &brush(dc, c));
+        paint_icon(cv, i, cx, cy, 12.0, c);
     }
 }
 
@@ -355,10 +331,10 @@ fn kind_icon(audio: bool) -> Icon {
     }
 }
 
-fn draw_chip(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, row: &Row, cx: f32, cy: f32) {
+fn draw_chip(cv: &mut dyn Canvas, t: &Theme, row: &Row, cx: f32, cy: f32) {
     let kind = kind_icon(row.audio);
     match row.chip {
-        Chip::Reading => ring_chip(g, dc, t, cx, cy, 0.0, 90.0, t.text, None),
+        Chip::Reading => ring_chip(cv, t, cx, cy, 0.0, 90.0, t.text, None),
         Chip::Ring { fraction, tone } => {
             let icon = if tone == Tone::Ember {
                 Icon::Drive
@@ -366,8 +342,7 @@ fn draw_chip(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, row: &Row, cx: f32,
                 kind
             };
             ring_chip(
-                g,
-                dc,
+                cv,
                 t,
                 cx,
                 cy,
@@ -378,8 +353,7 @@ fn draw_chip(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, row: &Row, cx: f32,
             );
         }
         Chip::Paused { fraction } => ring_chip(
-            g,
-            dc,
+            cv,
             t,
             cx,
             cy,
@@ -389,33 +363,21 @@ fn draw_chip(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, row: &Row, cx: f32,
             Some((Icon::Pause, t.muted)),
         ),
         Chip::Waiting => {
-            unsafe {
-                dc.DrawEllipse(
-                    &ellipse(cx, cy, 12.0),
-                    &brush(dc, t.passed),
-                    1.5,
-                    &dotted_stroke(g),
-                )
-            };
-            draw_icon(g, dc, kind, cx, cy, 12.0, &brush(dc, t.muted));
+            cv.stroke_ellipse(&ellipse(cx, cy, 12.0), t.passed, 1.5, Stroke::Dotted);
+            paint_icon(cv, kind, cx, cy, 12.0, t.muted);
         }
         Chip::Done => {
-            unsafe { dc.FillEllipse(&ellipse(cx, cy, 14.0), &brush(dc, t.chip)) };
-            draw_icon(g, dc, Icon::Tick, cx, cy, 14.0, &brush(dc, t.text));
+            cv.fill_ellipse(&ellipse(cx, cy, 14.0), t.chip);
+            paint_icon(cv, Icon::Tick, cx, cy, 14.0, t.text);
         }
         Chip::Failed(kind) => {
-            unsafe {
-                dc.FillEllipse(
-                    &ellipse(cx, cy, 14.0),
-                    &brush(dc, with_alpha(t.ember, 0.14)),
-                )
-            };
+            cv.fill_ellipse(&ellipse(cx, cy, 14.0), with_alpha(t.ember, 0.14));
             let icon = if kind == ErrorKind::Private {
                 Icon::Private
             } else {
                 Icon::Alert
             };
-            draw_icon(g, dc, icon, cx, cy, 13.0, &brush(dc, t.ember));
+            paint_icon(cv, icon, cx, cy, 13.0, t.ember);
         }
     }
 }
@@ -430,8 +392,7 @@ fn button_icon(b: Btn) -> Icon {
 }
 
 fn draw_row(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     i: usize,
@@ -441,92 +402,64 @@ fn draw_row(
 ) {
     let row_hover = matches!(hover, Some(Hit::Row(j) | Hit::Btn(j, _)) if j == i);
     if row_hover {
-        unsafe {
-            dc.FillRoundedRectangle(&rrect(X0, top, X1, top + ROW_H, 8.0), &brush(dc, t.raised))
-        };
+        cv.fill_rrect(&rrect(X0, top, X1, top + ROW_H, 8.0), t.raised);
     }
     let cy = top + ROW_H / 2.0;
-    draw_chip(g, dc, t, row, X0 + 22.0, cy);
-    let btns = buttons(g, f, row, top);
+    draw_chip(cv, t, row, X0 + 22.0, cy);
+    let btns = buttons(f, row, top);
     for (b, r) in &btns {
         let on = hover == Some(Hit::Btn(i, *b));
         let fill = if on { t.button_hover } else { t.button };
         match (b, b.label()) {
             (_, Some(label)) => {
-                unsafe {
-                    dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, fill))
-                };
-                center_text(
-                    g,
-                    dc,
-                    label,
-                    &f.small_medium,
-                    (r.0 + r.2) / 2.0,
-                    r.1,
-                    28.0,
-                    &brush(dc, t.text),
-                );
+                cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 14.0), fill);
+                cv.center_text(label, &f.small_medium, (r.0 + r.2) / 2.0, r.1, 28.0, t.text);
             }
             (Btn::Format, _) => {
-                unsafe {
-                    dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, fill))
-                };
-                let ink = brush(dc, t.text);
-                text(
-                    dc,
+                cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 14.0), fill);
+                let ink = t.text;
+                cv.text(
                     &row.format_chip,
                     &f.small_medium,
                     r.0 + 10.0,
                     r.1,
                     r.2 - r.0,
                     28.0,
-                    &ink,
+                    ink,
                 );
-                draw_icon(g, dc, Icon::ChevronDown, r.2 - 15.0, cy, 12.0, &ink);
+                paint_icon(cv, Icon::ChevronDown, r.2 - 15.0, cy, 12.0, ink);
             }
             _ => {
                 // Quiet icons until the row is hovered, then full buttons.
                 if row_hover {
-                    unsafe {
-                        dc.FillEllipse(&ellipse((r.0 + r.2) / 2.0, cy, 14.0), &brush(dc, fill))
-                    };
+                    cv.fill_ellipse(&ellipse((r.0 + r.2) / 2.0, cy, 14.0), fill);
                 }
                 let c = if row_hover { t.text } else { t.muted };
-                draw_icon(
-                    g,
-                    dc,
-                    button_icon(*b),
-                    (r.0 + r.2) / 2.0,
-                    cy,
-                    14.0,
-                    &brush(dc, c),
-                );
+                paint_icon(cv, button_icon(*b), (r.0 + r.2) / 2.0, cy, 14.0, c);
             }
         }
     }
     let right = btns.first().map_or(X1 - 8.0, |(_, r)| r.0 - 10.0);
     let x = X0 + 44.0;
     clipped_text(
-        g,
-        dc,
+        cv,
         &row.title,
         &f.title,
         x,
         top + 6.0,
         right - x,
         18.0,
-        &brush(dc, t.text),
+        t.text,
     );
     clipped_text(
-        g,
-        dc,
+        cv,
         &row.line,
         &f.small,
         x,
         top + 24.0,
         right - x,
         16.0,
-        &brush(dc, t.muted),
+        t.muted,
     );
 }
 
@@ -538,53 +471,33 @@ fn section_name(s: Section) -> &'static str {
     }
 }
 
-fn draw_list(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_list(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let geo = geo(v);
-    let muted = brush(dc, t.muted);
-    unsafe {
-        dc.PushAxisAlignedClip(
-            &D2D_RECT_F {
-                left: 0.0,
-                top: geo.list_top,
-                right: W,
-                bottom: geo.list_bottom,
-            },
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        )
-    };
+    let muted = t.muted;
+    cv.push_clip(0.0, geo.list_top, W, geo.list_bottom);
     for (item, top) in item_tops(v) {
         if top + item.h() < geo.list_top || top > geo.list_bottom {
             continue;
         }
         match item {
             Item::Head(s) => {
-                text(
-                    dc,
+                cv.text(
                     section_name(s),
                     &f.small,
                     X0 + 4.0,
                     top + 4.0,
                     160.0,
                     HEAD_H - 4.0,
-                    &muted,
+                    muted,
                 );
                 match s {
-                    Section::Now => right_text(
-                        g,
-                        dc,
+                    Section::Now => cv.right_text(
                         "2 at a time",
                         &f.small,
                         X1 - 8.0,
                         top + 4.0,
                         HEAD_H - 4.0,
-                        &muted,
+                        muted,
                     ),
                     Section::Done => {
                         let c = if hover == Some(Hit::ClearList) {
@@ -592,76 +505,44 @@ fn draw_list(
                         } else {
                             t.muted
                         };
-                        right_text(
-                            g,
-                            dc,
-                            "Clear list",
-                            &f.small,
-                            X1 - 8.0,
-                            top + 4.0,
-                            HEAD_H - 4.0,
-                            &brush(dc, c),
-                        );
+                        cv.right_text("Clear list", &f.small, X1 - 8.0, top + 4.0, HEAD_H - 4.0, c);
                     }
                     Section::NeedsYou => {}
                 }
             }
-            Item::Row(i) => draw_row(g, dc, t, f, i, &v.rows[i], top, hover),
+            Item::Row(i) => draw_row(cv, t, f, i, &v.rows[i], top, hover),
         }
     }
-    unsafe { dc.PopAxisAlignedClip() };
+    cv.pop_clip();
     let ms = max_scroll(v);
     if ms > 0.0 {
         let track_h = geo.list_bottom - geo.list_top;
         let th = (track_h * track_h / content_h(v)).max(24.0);
         let ty = geo.list_top + (track_h - th) * (v.scroll / ms);
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(W - 7.0, ty, W - 4.0, ty + th, 1.5),
-                &brush(dc, t.track),
-            )
-        };
+        cv.fill_rrect(&rrect(W - 7.0, ty, W - 4.0, ty + th, 1.5), t.track);
     }
 }
 
-fn draw_card(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_card(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let y = geo(v).card;
     let h = card_h(&v.engine);
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(X0, y, X1, y + h, 14.0), &brush(dc, t.raised));
-        dc.DrawRoundedRectangle(
-            &rrect(X0 + 0.5, y + 0.5, X1 - 0.5, y + h - 0.5, 13.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
-    crate::depth::lip(g, dc, t, X0, y, X1, y + h, 14.0, 1.0);
+    let ink = t.text;
+    let muted = t.muted;
+    cv.fill_rrect(&rrect(X0, y, X1, y + h, 14.0), t.raised);
+    cv.stroke_rrect(
+        &rrect(X0 + 0.5, y + 0.5, X1 - 0.5, y + h - 0.5, 13.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
+    lip(cv, t, X0, y, X1, y + h, 14.0, 1.0);
     let title = if matches!(v.engine, EngineCard::Failed(_)) {
         "Couldn't fetch the engine"
     } else {
         "Getting downloads ready"
     };
-    text(dc, title, &f.title, X0 + 14.0, y + 12.0, 260.0, 18.0, &ink);
-    right_text(
-        g,
-        dc,
-        "once only",
-        &f.small,
-        X1 - 14.0,
-        y + 13.0,
-        16.0,
-        &muted,
-    );
+    cv.text(title, &f.title, X0 + 14.0, y + 12.0, 260.0, 18.0, ink);
+    cv.right_text("once only", &f.small, X1 - 14.0, y + 13.0, 16.0, muted);
     let body: [String; 2] = match &v.engine {
         EngineCard::Missing { waiting } => [
             "Saving uses yt-dlp, a free engine from GitHub (about 18 MB).".into(),
@@ -686,8 +567,7 @@ fn draw_card(
                 .filter(|t| *t > 0)
                 .map_or(0.25, |t| (*done as f32 / t as f32).min(1.0));
             ring_chip(
-                g,
-                dc,
+                cv,
                 t,
                 X0 + 26.0,
                 cy,
@@ -696,15 +576,14 @@ fn draw_card(
                 t.text,
                 Some((Icon::Download, t.text)),
             );
-            text(
-                dc,
+            cv.text(
                 "Fetching yt-dlp",
                 &f.body,
                 X0 + 48.0,
                 cy - 18.0,
                 280.0,
                 18.0,
-                &ink,
+                ink,
             );
             let amount = match total {
                 Some(tt) => crate::downloads_model::of(*done, *tt),
@@ -716,15 +595,14 @@ fn draw_card(
                 "then you can save links"
             };
             clipped_text(
-                g,
-                dc,
+                cv,
                 &format!("{amount} · {tail}"),
                 &f.small,
                 X0 + 48.0,
                 cy,
                 X1 - X0 - 62.0,
                 16.0,
-                &muted,
+                muted,
             );
             return;
         }
@@ -732,45 +610,41 @@ fn draw_card(
     };
     for (k, line) in body.iter().enumerate() {
         clipped_text(
-            g,
-            dc,
+            cv,
             line,
             &f.small,
             X0 + 14.0,
             y + 36.0 + 16.0 * k as f32,
             X1 - X0 - 28.0,
             16.0,
-            &muted,
+            muted,
         );
     }
-    if let Some(r) = card_button(g, f, v) {
+    if let Some(r) = card_button(f, v) {
         let fill = if hover == Some(Hit::Fetch) {
             with_alpha(t.text, 0.85)
         } else {
             t.text
         };
-        unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, fill)) };
+        cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 14.0), fill);
         let label = if matches!(v.engine, EngineCard::Failed(_)) {
             "Try again"
         } else {
             "Fetch yt-dlp"
         };
-        center_text(
-            g,
-            dc,
+        cv.center_text(
             label,
             &f.small_medium,
             (r.0 + r.2) / 2.0,
             r.1,
             28.0,
-            &brush(dc, t.panel),
+            t.panel,
         );
     }
 }
 
 fn draw_field_msg(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     field: &Field,
@@ -785,134 +659,105 @@ fn draw_field_msg(
         ],
         Field::NoLink => vec!["Copy a video or audio link first, then press Paste."],
     };
-    let c = brush(
-        dc,
-        if matches!(field, Field::Unsupported(_)) {
-            t.ember
-        } else {
-            t.muted
-        },
-    );
+    let c = if matches!(field, Field::Unsupported(_)) {
+        t.ember
+    } else {
+        t.muted
+    };
     for (k, l) in lines.iter().enumerate() {
         let y = top + 16.0 * k as f32;
         if centred {
-            center_text(g, dc, l, &f.small, W / 2.0, y, 16.0, &c);
+            cv.center_text(l, &f.small, W / 2.0, y, 16.0, c);
         } else {
             if k == 0 {
-                draw_icon(g, dc, Icon::Alert, X0 + 20.0, y + 8.0, 12.0, &c);
+                paint_icon(cv, Icon::Alert, X0 + 20.0, y + 8.0, 12.0, c);
             }
-            text(dc, l, &f.small, X0 + 32.0, y, X1 - X0 - 32.0, 16.0, &c);
+            cv.text(l, &f.small, X0 + 32.0, y, X1 - X0 - 32.0, 16.0, c);
         }
     }
 }
 
-fn draw_empty(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_empty(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let y = geo(v).field;
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    unsafe { dc.FillEllipse(&ellipse(W / 2.0, y + 34.0, 18.0), &brush(dc, t.chip)) };
-    draw_icon(g, dc, Icon::Download, W / 2.0, y + 34.0, 16.0, &ink);
-    center_text(
-        g,
-        dc,
+    let ink = t.text;
+    let muted = t.muted;
+    cv.fill_ellipse(&ellipse(W / 2.0, y + 34.0, 18.0), t.chip);
+    paint_icon(cv, Icon::Download, W / 2.0, y + 34.0, 16.0, ink);
+    cv.center_text(
         "No downloads yet",
         &f.panel_title,
         W / 2.0,
         y + 64.0,
         20.0,
-        &ink,
+        ink,
     );
-    center_text(
-        g,
-        dc,
+    cv.center_text(
         "Copy a video link anywhere and the",
         &f.body,
         W / 2.0,
         y + 90.0,
         18.0,
-        &muted,
+        muted,
     );
-    center_text(
-        g,
-        dc,
+    cv.center_text(
         "orb offers to save it. Or paste one here.",
         &f.body,
         W / 2.0,
         y + 108.0,
         18.0,
-        &muted,
+        muted,
     );
-    let r = paste_rect(g, f, v);
+    let r = paste_rect(f, v);
     let fill = if hover == Some(Hit::Paste) {
         with_alpha(t.text, 0.85)
     } else {
         t.text
     };
-    unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 16.0), &brush(dc, fill)) };
-    center_text(
-        g,
-        dc,
+    cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 16.0), fill);
+    cv.center_text(
         "Paste link",
         &f.title,
         (r.0 + r.2) / 2.0,
         r.1,
         32.0,
-        &brush(dc, t.panel),
+        t.panel,
     );
-    draw_field_msg(g, dc, t, f, &v.field, y + EMPTY_H - 6.0, true);
+    draw_field_msg(cv, t, f, &v.field, y + EMPTY_H - 6.0, true);
 }
 
-fn draw_field(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+fn draw_field(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let y = geo(v).field;
     let ember = matches!(v.field, Field::Unsupported(_));
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(X0, y, X1, y + 40.0, 20.0), &brush(dc, t.panel));
-        let edge = if ember { t.ember } else { t.hair };
-        dc.DrawRoundedRectangle(
-            &rrect(X0 + 0.5, y + 0.5, X1 - 0.5, y + 39.5, 19.5),
-            &brush(dc, edge),
-            1.0,
-            None,
-        );
-    }
-    let muted = brush(dc, t.muted);
-    draw_icon(g, dc, Icon::Link, X0 + 22.0, y + 20.0, 15.0, &muted);
-    let r = paste_rect(g, f, v);
+    cv.fill_rrect(&rrect(X0, y, X1, y + 40.0, 20.0), t.panel);
+    let edge = if ember { t.ember } else { t.hair };
+    cv.stroke_rrect(
+        &rrect(X0 + 0.5, y + 0.5, X1 - 0.5, y + 39.5, 19.5),
+        edge,
+        1.0,
+        Stroke::Plain,
+    );
+    let muted = t.muted;
+    paint_icon(cv, Icon::Link, X0 + 22.0, y + 20.0, 15.0, muted);
+    let r = paste_rect(f, v);
     match &v.field {
         Field::Unsupported(link) => clipped_text(
-            g,
-            dc,
+            cv,
             link,
             &f.body,
             X0 + 40.0,
             y,
             r.0 - X0 - 48.0,
             40.0,
-            &brush(dc, t.text),
+            t.text,
         ),
-        _ => text(
-            dc,
+        _ => cv.text(
             "Paste a video or audio link",
             &f.body,
             X0 + 40.0,
             y,
             r.0 - X0 - 48.0,
             40.0,
-            &muted,
+            muted,
         ),
     }
     let fill = if hover == Some(Hit::Paste) {
@@ -920,45 +765,33 @@ fn draw_field(
     } else {
         t.button
     };
-    unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 14.0), &brush(dc, fill)) };
-    center_text(
-        g,
-        dc,
+    cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 14.0), fill);
+    cv.center_text(
         "Paste",
         &f.small_medium,
         (r.0 + r.2) / 2.0,
         r.1,
         28.0,
-        &brush(dc, t.text),
+        t.text,
     );
-    draw_field_msg(g, dc, t, f, &v.field, y + 46.0, false);
+    draw_field_msg(cv, t, f, &v.field, y + 46.0, false);
 }
 
-pub fn draw(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let geo = geo(v);
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, W, geo.h, 20.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(
-            &rrect(0.5, 0.5, W - 0.5, geo.h - 0.5, 19.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
-    text(dc, "Downloads", &f.panel_title, X0, 16.0, 140.0, 18.0, &ink);
+    let ink = t.text;
+    let muted = t.muted;
+    cv.fill_rrect(&rrect(0.0, 0.0, W, geo.h, 20.0), t.panel);
+    cv.stroke_rrect(
+        &rrect(0.5, 0.5, W - 0.5, geo.h - 0.5, 19.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
+    cv.text("Downloads", &f.panel_title, X0, 16.0, 140.0, 18.0, ink);
     // "2 of 5 · 42%": the count and percent roll on the quick spring as downloads move.
-    crate::motion::rolling_text_right(
-        g,
-        dc,
+    crate::motion::roll_text_right(
+        cv,
         "downloads.count",
         &v.count,
         crate::motion::Roll::Quick,
@@ -966,38 +799,35 @@ pub fn draw(
         X1,
         17.0,
         16.0,
-        &muted,
+        muted,
     );
     if v.engine != EngineCard::None {
-        draw_card(g, dc, t, f, v, hover);
+        draw_card(cv, t, f, v, hover);
     }
     if empty_block(v) {
-        draw_empty(g, dc, t, f, v, hover);
+        draw_empty(cv, t, f, v, hover);
         return;
     }
-    draw_field(g, dc, t, f, v, hover);
-    draw_list(g, dc, t, f, v, hover);
+    draw_field(cv, t, f, v, hover);
+    draw_list(cv, t, f, v, hover);
     let fy = geo.h - FOOT + 8.0;
-    unsafe {
-        dc.DrawLine(
-            pt(X0, fy - 0.5),
-            pt(X1, fy - 0.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        )
-    };
+    cv.line(
+        pt(X0, fy - 0.5),
+        pt(X1, fy - 0.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
     let c = if hover == Some(Hit::Folder) {
-        &ink
+        ink
     } else {
-        &muted
+        muted
     };
-    draw_icon(g, dc, Icon::Folder, X0 + 8.0, fy + 18.0, 14.0, c);
-    let fw = g.text_width(&v.free, &f.small);
-    right_text(g, dc, &v.free, &f.small, X1 - 4.0, fy, 36.0, &muted);
+    paint_icon(cv, Icon::Folder, X0 + 8.0, fy + 18.0, 14.0, c);
+    let fw = text_width(&v.free, &f.small);
+    cv.right_text(&v.free, &f.small, X1 - 4.0, fy, 36.0, muted);
     clipped_text(
-        g,
-        dc,
+        cv,
         &v.folder,
         &f.small,
         X0 + 24.0,
@@ -1023,80 +853,49 @@ pub fn menu_hit(x: f32, y: f32) -> Option<usize> {
 }
 
 /// `chosen` is the format Save would use (active fill and a check).
-pub fn draw_menu(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    chosen: Format,
-    hover: Option<usize>,
-) {
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, MENU_W, MENU_H, 12.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(
-            &rrect(0.5, 0.5, MENU_W - 0.5, MENU_H - 0.5, 11.5),
-            &brush(dc, t.hair),
-            1.0,
-            None,
-        );
-    }
+pub fn draw_menu(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, chosen: Format, hover: Option<usize>) {
+    let ink = t.text;
+    let muted = t.muted;
+    cv.fill_rrect(&rrect(0.0, 0.0, MENU_W, MENU_H, 12.0), t.panel);
+    cv.stroke_rrect(
+        &rrect(0.5, 0.5, MENU_W - 0.5, MENU_H - 0.5, 11.5),
+        t.hair,
+        1.0,
+        Stroke::Plain,
+    );
     for (i, (format, kind, label, key)) in menu_rows().into_iter().enumerate() {
         let top = 4.0 + MENU_ROW * i as f32;
         let on = format == chosen;
         if on || hover == Some(i) {
-            unsafe {
-                dc.FillRoundedRectangle(
-                    &rrect(4.0, top, MENU_W - 4.0, top + MENU_ROW, 8.0),
-                    &brush(dc, if on { t.chip } else { t.raised }),
-                )
-            };
+            cv.fill_rrect(
+                &rrect(4.0, top, MENU_W - 4.0, top + MENU_ROW, 8.0),
+                if on { t.chip } else { t.raised },
+            );
         }
         let cy = top + MENU_ROW / 2.0;
-        draw_icon(
-            g,
-            dc,
+        paint_icon(
+            cv,
             kind_icon(format.kind() == MediaKind::Audio),
             4.0 + 16.0,
             cy,
             14.0,
-            &muted,
+            muted,
         );
-        let kw = g.text_width(kind, &f.title);
-        text(
-            dc,
-            kind,
-            &f.title,
-            4.0 + 32.0,
-            top,
-            kw + 2.0,
-            MENU_ROW,
-            &ink,
-        );
-        text(
-            dc,
+        let kw = text_width(kind, &f.title);
+        cv.text(kind, &f.title, 4.0 + 32.0, top, kw + 2.0, MENU_ROW, ink);
+        cv.text(
             &label,
             &f.body,
             4.0 + 36.0 + kw,
             top,
             120.0,
             MENU_ROW,
-            &muted,
+            muted,
         );
         if on {
-            draw_icon(g, dc, Icon::Tick, MENU_W - 4.0 - 16.0, cy, 14.0, &ink);
+            paint_icon(cv, Icon::Tick, MENU_W - 4.0 - 16.0, cy, 14.0, ink);
         } else if !key.is_empty() {
-            right_text(
-                g,
-                dc,
-                key,
-                &f.small,
-                MENU_W - 4.0 - 12.0,
-                top,
-                MENU_ROW,
-                &muted,
-            );
+            cv.right_text(key, &f.small, MENU_W - 4.0 - 12.0, top, MENU_ROW, muted);
         }
     }
 }

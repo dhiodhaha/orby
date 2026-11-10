@@ -1,14 +1,11 @@
-#![allow(clippy::too_many_arguments)] // drawing helpers take a device context plus a full set of geometry
+#![allow(clippy::too_many_arguments)] // drawing helpers take a canvas plus a full set of geometry
 //! The Notices panel, "Earlier today" (frame `Y_alKzOsBY`, column 3): the header with Clear all,
 //! Waiting and Earlier rows, the row menu (mark as seen, mute), muted sources with Unmute, and
 //! the mute confirmation with Undo. Drawing and hit tests.
 
-use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-
-use crate::gfx::*;
+use crate::canvas::{ellipse, pt, rrect, text_width, Canvas, Font, Stroke};
 use crate::notices_model::Source;
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{lip, num_text, paint_icon, with_alpha, Fonts, Icon, Theme};
 
 pub const W: f32 = 300.0;
 const PAD: f32 = 12.0;
@@ -170,18 +167,18 @@ pub fn height(v: &View) -> f32 {
     layout(v).h
 }
 
-fn header_button(g: &Shared, f: &Fonts, v: &View) -> (Hit, &'static str, Rect) {
+fn header_button(f: &Fonts, v: &View) -> (Hit, &'static str, Rect) {
     let (hit, label) = if v.undo_clear {
         (Hit::UndoClear, "Undo")
     } else {
         (Hit::ClearAll, "Clear all")
     };
-    let w = g.text_width(label, &f.title) + 24.0;
+    let w = text_width(label, &f.title) + 24.0;
     (hit, label, (W - PAD - w, 14.0, W - PAD, 42.0))
 }
 
-fn small_button(g: &Shared, f: &Fonts, label: &str, r: Rect) -> Rect {
-    let w = g.text_width(label, &f.title) + 24.0;
+fn small_button(f: &Fonts, label: &str, r: Rect) -> Rect {
+    let w = text_width(label, &f.title) + 24.0;
     (r.2 - 6.0 - w, r.1 + 6.0, r.2 - 6.0, r.3 - 6.0)
 }
 
@@ -202,7 +199,7 @@ fn menu_items(m: Rect) -> Vec<(MenuItem, Rect)> {
     out
 }
 
-pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
+pub fn hit(f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
     let l = layout(v);
     if let Some(m) = l.menu {
         if inside(m, x, y) {
@@ -212,7 +209,7 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
                 .map(|(it, _)| Hit::Menu(it));
         }
     }
-    let (h, _, r) = header_button(g, f, v);
+    let (h, _, r) = header_button(f, v);
     if (!v.rows.is_empty() || v.undo_clear) && inside(r, x, y) {
         return Some(h);
     }
@@ -226,61 +223,36 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
         }
     }
     if let Some(r) = l.note {
-        if inside(small_button(g, f, "Undo", r), x, y) {
+        if inside(small_button(f, "Undo", r), x, y) {
             return Some(Hit::UndoMute);
         }
     }
     for (s, r) in &l.muted {
-        if inside(small_button(g, f, "Unmute", *r), x, y) {
+        if inside(small_button(f, "Unmute", *r), x, y) {
             return Some(Hit::Unmute(*s));
         }
     }
     None
 }
 
-fn button(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    label: &str,
-    r: Rect,
-    hover: bool,
-) {
-    unsafe {
-        dc.FillRoundedRectangle(
-            &rrect(r.0, r.1, r.2, r.3, (r.3 - r.1) / 2.0),
-            &brush(dc, if hover { t.button_hover } else { t.button }),
-        );
-    }
-    crate::depth::lip(g, dc, t, r.0, r.1, r.2, r.3, (r.3 - r.1) / 2.0, 1.0);
-    center_text(
-        g,
-        dc,
-        label,
-        &f.title,
-        (r.0 + r.2) / 2.0,
-        r.1,
-        r.3 - r.1,
-        &brush(dc, t.text),
+fn button(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, label: &str, r: Rect, hover: bool) {
+    cv.fill_rrect(
+        &rrect(r.0, r.1, r.2, r.3, (r.3 - r.1) / 2.0),
+        if hover { t.button_hover } else { t.button },
     );
+    lip(cv, t, r.0, r.1, r.2, r.3, (r.3 - r.1) / 2.0, 1.0);
+    cv.center_text(label, &f.title, (r.0 + r.2) / 2.0, r.1, r.3 - r.1, t.text);
 }
 
-fn chip(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, icon: Icon, x: f32, cy: f32) {
-    unsafe {
-        dc.FillRoundedRectangle(
-            &rrect(x, cy - 12.0, x + 24.0, cy + 12.0, 7.0),
-            &brush(dc, t.chip),
-        );
-    }
-    let ink = brush(dc, if icon.is_ember() { t.ember } else { t.text });
-    draw_icon(g, dc, icon, x + 12.0, cy, 14.0, &ink);
+fn chip(cv: &mut dyn Canvas, t: &Theme, icon: Icon, x: f32, cy: f32) {
+    cv.fill_rrect(&rrect(x, cy - 12.0, x + 24.0, cy + 12.0, 7.0), t.chip);
+    let ink = if icon.is_ember() { t.ember } else { t.text };
+    paint_icon(cv, icon, x + 12.0, cy, 14.0, ink);
 }
 
 /// The noun in ink, the value muted, on one line; an ellipsis when it runs long.
 fn two_tone(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
+    cv: &mut dyn Canvas,
     t: &Theme,
     f: &Fonts,
     title: &str,
@@ -290,115 +262,85 @@ fn two_tone(
     w: f32,
     h: f32,
 ) {
-    let title = ellipsize(g, title, &f.title, w);
-    let tw = g.text_width(&title, &f.title);
-    text(dc, &title, &f.title, x, y, tw + 2.0, h, &brush(dc, t.text));
+    let title = ellipsize(title, &f.title, w);
+    let tw = text_width(&title, &f.title);
+    cv.text(&title, &f.title, x, y, tw + 2.0, h, t.text);
     let room = w - tw - 4.0;
     if !value.is_empty() && room > 24.0 {
-        let value = ellipsize(g, value, &f.body, room);
-        text(
-            dc,
-            &value,
-            &f.body,
-            x + tw + 4.0,
-            y,
-            room + 2.0,
-            h,
-            &brush(dc, t.muted),
-        );
+        let value = ellipsize(value, &f.body, room);
+        cv.text(&value, &f.body, x + tw + 4.0, y, room + 2.0, h, t.muted);
     }
 }
 
-fn ellipsize(g: &Shared, s: &str, fmt: &IDWriteTextFormat, max: f32) -> String {
-    if g.text_width(s, fmt) <= max {
+fn ellipsize(s: &str, fmt: &Font, max: f32) -> String {
+    if text_width(s, fmt) <= max {
         return s.to_string();
     }
     let chars: Vec<char> = s.chars().collect();
     (1..chars.len())
         .rev()
         .map(|n| chars[..n].iter().collect::<String>().trim_end().to_string() + "…")
-        .find(|c| g.text_width(c, fmt) <= max)
+        .find(|c| text_width(c, fmt) <= max)
         .unwrap_or_default()
 }
 
-pub fn draw(
-    g: &Shared,
-    dc: &ID2D1DeviceContext,
-    t: &Theme,
-    f: &Fonts,
-    v: &View,
-    hover: Option<Hit>,
-) {
+pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<Hit>) {
     let l = layout(v);
-    let ink = brush(dc, t.text);
-    let muted = brush(dc, t.muted);
-    let hair = brush(dc, t.hair);
-    unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, W, l.h, 20.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(&rrect(0.5, 0.5, W - 0.5, l.h - 0.5, 19.5), &hair, 1.0, None);
-    }
-    // Header: "Notices" with a muted "Today", and Clear all (Undo for 6 s after it).
-    text(dc, "Notices", &f.panel_title, 20.0, 18.0, 80.0, 20.0, &ink);
-    let nw = g.text_width("Notices", &f.panel_title);
-    text(
-        dc,
-        "Today",
-        &f.small,
-        20.0 + nw + 8.0,
-        19.0,
-        60.0,
-        18.0,
-        &muted,
+    let ink = t.text;
+    let muted = t.muted;
+    let hair = t.hair;
+    cv.fill_rrect(&rrect(0.0, 0.0, W, l.h, 20.0), t.panel);
+    cv.stroke_rrect(
+        &rrect(0.5, 0.5, W - 0.5, l.h - 0.5, 19.5),
+        hair,
+        1.0,
+        Stroke::Plain,
     );
+    // Header: "Notices" with a muted "Today", and Clear all (Undo for 6 s after it).
+    cv.text("Notices", &f.panel_title, 20.0, 18.0, 80.0, 20.0, ink);
+    let nw = text_width("Notices", &f.panel_title);
+    cv.text("Today", &f.small, 20.0 + nw + 8.0, 19.0, 60.0, 18.0, muted);
     if !v.rows.is_empty() || v.undo_clear {
-        let (h, label, r) = header_button(g, f, v);
-        button(g, dc, t, f, label, r, hover == Some(h));
+        let (h, label, r) = header_button(f, v);
+        button(cv, t, f, label, r, hover == Some(h));
     }
 
     if let Some(y) = l.empty {
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(PAD, y, W - PAD, y + 68.0, 12.0),
-                &brush(dc, t.raised),
-            );
-            dc.FillEllipse(&ellipse(PAD + 26.0, y + 34.0, 16.0), &brush(dc, t.chip));
-        }
-        draw_icon(g, dc, Icon::Inbox, PAD + 26.0, y + 34.0, 16.0, &ink);
-        text(
-            dc,
+        cv.fill_rrect(&rrect(PAD, y, W - PAD, y + 68.0, 12.0), t.raised);
+        cv.fill_ellipse(&ellipse(PAD + 26.0, y + 34.0, 16.0), t.chip);
+        paint_icon(cv, Icon::Inbox, PAD + 26.0, y + 34.0, 16.0, ink);
+        cv.text(
             "Nothing today",
             &f.title,
             PAD + 52.0,
             y + 10.0,
             W - PAD * 2.0 - 60.0,
             18.0,
-            &ink,
+            ink,
         );
-        text(
-            dc,
+        cv.text(
             "Notices you missed or dismissed show here until midnight.",
             &f.small_wrap,
             PAD + 52.0,
             y + 29.0,
             W - PAD * 2.0 - 62.0,
             34.0,
-            &muted,
+            muted,
         );
     }
     if let Some(y) = l.waiting_label {
-        text(
-            dc,
+        cv.text(
             &format!("Waiting · {}", v.n_waiting),
             &f.small,
             20.0,
             y + 6.0,
             160.0,
             16.0,
-            &muted,
+            muted,
         );
     }
     if let Some(y) = l.earlier_label {
-        text(dc, "Earlier", &f.small, 20.0, y + 6.0, 160.0, 16.0, &muted);
+        cv.text("Earlier", &f.small, 20.0, y + 6.0, 160.0, 16.0, muted);
     }
     for (i, r) in &l.rows {
         let row = &v.rows[*i];
@@ -406,31 +348,28 @@ pub fn draw(
             matches!(hover, Some(Hit::Row(j) | Hit::More(j)) if j == *i) || v.menu == Some(*i);
         let focused = v.focus == Some(*i);
         let cy = (r.1 + r.3) / 2.0;
-        unsafe {
-            if hov || focused {
-                dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 8.0), &brush(dc, t.raised));
-            }
-            if focused {
-                dc.DrawRoundedRectangle(
-                    &rrect(r.0 + 1.0, r.1 + 1.0, r.2 - 1.0, r.3 - 1.0, 7.0),
-                    &ink,
-                    2.0,
-                    None,
-                );
-            }
-            if row.unseen {
-                dc.FillEllipse(&ellipse(r.0 + 8.0, cy, 3.0), &ink);
-            }
+        if hov || focused {
+            cv.fill_rrect(&rrect(r.0, r.1, r.2, r.3, 8.0), t.raised);
         }
-        chip(g, dc, t, row.icon, r.0 + 18.0, cy);
+        if focused {
+            cv.stroke_rrect(
+                &rrect(r.0 + 1.0, r.1 + 1.0, r.2 - 1.0, r.3 - 1.0, 7.0),
+                ink,
+                2.0,
+                Stroke::Plain,
+            );
+        }
+        if row.unseen {
+            cv.fill_ellipse(&ellipse(r.0 + 8.0, cy, 3.0), ink);
+        }
+        chip(cv, t, row.icon, r.0 + 18.0, cy);
         let right = if hov || focused {
             r.2 - 40.0
         } else {
-            r.2 - 8.0 - g.text_width(&row.time, &f.small) - 10.0
+            r.2 - 8.0 - text_width(&row.time, &f.small) - 10.0
         };
         two_tone(
-            g,
-            dc,
+            cv,
             t,
             f,
             &row.title,
@@ -443,31 +382,28 @@ pub fn draw(
         if hov || focused {
             let m = more_rect(*r);
             let (cx, my) = ((m.0 + m.2) / 2.0, (m.1 + m.3) / 2.0);
-            unsafe {
-                let fill = if hover == Some(Hit::More(*i)) || v.menu == Some(*i) {
-                    t.button_hover
-                } else {
-                    t.button
-                };
-                dc.FillEllipse(&ellipse(cx, my, 14.0), &brush(dc, fill));
-                for dx in [-5.0, 0.0, 5.0] {
-                    dc.FillEllipse(&ellipse(cx + dx, my, 1.4), &muted);
-                }
+            let fill = if hover == Some(Hit::More(*i)) || v.menu == Some(*i) {
+                t.button_hover
+            } else {
+                t.button
+            };
+            cv.fill_ellipse(&ellipse(cx, my, 14.0), fill);
+            for dx in [-5.0, 0.0, 5.0] {
+                cv.fill_ellipse(&ellipse(cx + dx, my, 1.4), muted);
             }
         } else {
-            crate::ui::text_num(g, dc, &row.time, &f.small, r.2 - 8.0, r.1, ROW_H, &muted);
+            num_text(cv, &row.time, &f.small, r.2 - 8.0, r.1, ROW_H, muted);
         }
     }
     if let Some((n, y)) = l.older {
-        text(
-            dc,
+        cv.text(
             &format!("and {n} earlier"),
             &f.small,
             20.0,
             y + 6.0,
             200.0,
             16.0,
-            &muted,
+            muted,
         );
     }
     if l.note.is_some() || !l.muted.is_empty() {
@@ -477,15 +413,12 @@ pub fn draw(
             .or(l.muted.first().map(|(_, r)| r.1))
             .unwrap_or(0.0)
             - 5.0;
-        unsafe {
-            dc.DrawLine(pt(20.0, y), pt(W - 20.0, y), &hair, 1.0, None);
-        }
+        cv.line(pt(20.0, y), pt(W - 20.0, y), hair, 1.0, Stroke::Plain);
     }
     if let (Some(r), Some((title, words))) = (l.note, &v.note) {
-        let b = small_button(g, f, "Undo", r);
+        let b = small_button(f, "Undo", r);
         two_tone(
-            g,
-            dc,
+            cv,
             t,
             f,
             title,
@@ -495,7 +428,7 @@ pub fn draw(
             b.0 - r.0 - 16.0,
             ROW_H,
         );
-        button(g, dc, t, f, "Undo", b, hover == Some(Hit::UndoMute));
+        button(cv, t, f, "Undo", b, hover == Some(Hit::UndoMute));
     }
     for (s, r) in &l.muted {
         let words = v
@@ -504,10 +437,9 @@ pub fn draw(
             .find(|(m, _)| m == s)
             .map(|(_, w)| w.as_str())
             .unwrap_or("");
-        let b = small_button(g, f, "Unmute", *r);
+        let b = small_button(f, "Unmute", *r);
         two_tone(
-            g,
-            dc,
+            cv,
             t,
             f,
             s.name(),
@@ -517,38 +449,31 @@ pub fn draw(
             b.0 - r.0 - 16.0,
             ROW_H,
         );
-        button(g, dc, t, f, "Unmute", b, hover == Some(Hit::Unmute(*s)));
+        button(cv, t, f, "Unmute", b, hover == Some(Hit::Unmute(*s)));
     }
 
     // The row menu: Mark as seen, then the source's mutes under its name.
     if let (Some(m), Some(i)) = (l.menu, v.menu) {
         let source = v.rows[i].source;
-        unsafe {
-            dc.FillRoundedRectangle(&rrect(m.0, m.1, m.2, m.3, 12.0), &brush(dc, t.surface));
-            dc.DrawRoundedRectangle(
-                &rrect(m.0 + 0.5, m.1 + 0.5, m.2 - 0.5, m.3 - 0.5, 11.5),
-                &hair,
-                1.0,
-                None,
-            );
-        }
+        cv.fill_rrect(&rrect(m.0, m.1, m.2, m.3, 12.0), t.surface);
+        cv.stroke_rrect(
+            &rrect(m.0 + 0.5, m.1 + 0.5, m.2 - 0.5, m.3 - 0.5, 11.5),
+            hair,
+            1.0,
+            Stroke::Plain,
+        );
         let items = menu_items(m);
         for (k, (it, r)) in items.iter().enumerate() {
             let on = hover == Some(Hit::Menu(*it)) || v.menu_item == k;
             if on {
-                unsafe {
-                    dc.FillRoundedRectangle(
-                        &rrect(r.0, r.1, r.2, r.3, 8.0),
-                        &brush(
-                            dc,
-                            if v.menu_item == k && hover != Some(Hit::Menu(*it)) {
-                                t.raised
-                            } else {
-                                t.button
-                            },
-                        ),
-                    );
-                }
+                cv.fill_rrect(
+                    &rrect(r.0, r.1, r.2, r.3, 8.0),
+                    if v.menu_item == k && hover != Some(Hit::Menu(*it)) {
+                        t.raised
+                    } else {
+                        t.button
+                    },
+                );
             }
             let (icon, label) = match it {
                 MenuItem::Seen => (Icon::Tick, "Mark as seen".to_string()),
@@ -556,37 +481,33 @@ pub fn draw(
                 MenuItem::Tomorrow => (Icon::Clock, "Mute until tomorrow".to_string()),
                 MenuItem::Always => (Icon::Close, format!("Don't show {} again", source.noun())),
             };
-            draw_icon(g, dc, icon, r.0 + 16.0, (r.1 + r.3) / 2.0, 14.0, &muted);
-            text(
-                dc,
+            paint_icon(cv, icon, r.0 + 16.0, (r.1 + r.3) / 2.0, 14.0, muted);
+            cv.text(
                 &label,
                 &f.body,
                 r.0 + 32.0,
                 r.1,
                 r.2 - r.0 - 36.0,
                 ITEM_H,
-                &ink,
+                ink,
             );
             if *it == MenuItem::Seen {
                 let y = r.3 + 4.5;
-                unsafe {
-                    dc.DrawLine(
-                        pt(m.0 + 10.0, y),
-                        pt(m.2 - 10.0, y),
-                        &brush(dc, with_alpha(t.hair, 1.0)),
-                        1.0,
-                        None,
-                    );
-                }
-                text(
-                    dc,
+                cv.line(
+                    pt(m.0 + 10.0, y),
+                    pt(m.2 - 10.0, y),
+                    with_alpha(t.hair, 1.0),
+                    1.0,
+                    Stroke::Plain,
+                );
+                cv.text(
                     source.name(),
                     &f.small,
                     m.0 + 12.0,
                     y + 6.0,
                     MENU_W - 24.0,
                     16.0,
-                    &muted,
+                    muted,
                 );
             }
         }

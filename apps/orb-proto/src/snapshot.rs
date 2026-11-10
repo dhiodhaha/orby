@@ -276,6 +276,7 @@ fn panel_scenes(_f: &Fonts) -> Vec<Scene> {
     #[allow(unused_mut)]
     let mut out: Vec<Scene> = Vec::new();
     out.extend(crate::settings_scenes::scenes(_f));
+    out.extend(crate::today_scenes::scenes(_f));
     out
 }
 
