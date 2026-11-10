@@ -222,6 +222,16 @@ pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
             crate::panel::draw(&mut D2dCanvas::new(&g, dc), &th, &fonts, &view);
         })?;
         write(dir, &format!("prayer-{tag}"), w, h, px);
+        let map =
+            crate::disk_panel::map_rect(&fonts, crate::disk_panel::W, crate::disk_panel::H, &[]);
+        for (name, v, hover) in crate::disk_scenes::scenes(map) {
+            let (w, h) = crate::disk_panel::size(&fonts, &v);
+            let h = h.max(v.room);
+            let (pw, ph, px) = render_offscreen(&g, w, h, SCALE, |dc| {
+                crate::disk_panel::draw(&mut D2dCanvas::new(&g, dc), &th, &fonts, &v, hover);
+            })?;
+            write(dir, &format!("{name}-{tag}"), pw, ph, px);
+        }
     }
     Ok(())
 }

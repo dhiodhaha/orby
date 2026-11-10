@@ -725,6 +725,42 @@ pub fn measure(s: &str, fmt: &IDWriteTextFormat) -> (f32, f32) {
     }
 }
 
+fn shared_layout(s: &str, fmt: &IDWriteTextFormat, w: f32, h: f32) -> Option<IDWriteTextLayout> {
+    TEXT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|(dw, ty)| new_layout(dw, ty.as_ref(), s, fmt, w, h))
+    })
+}
+
+/// Height of `s` wrapped at `w`, rounded up (16 when there is no text system).
+pub fn wrap_height(s: &str, fmt: &IDWriteTextFormat, w: f32) -> f32 {
+    match shared_layout(s, fmt, w.max(1.0), 1000.0) {
+        Some(l) => unsafe {
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = l.GetMetrics(&mut m);
+            m.height.ceil()
+        },
+        None => 16.0,
+    }
+}
+
+/// Where the baseline of `s` falls in a box `h` tall (the formats centre their one line).
+pub fn baseline_in(s: &str, fmt: &IDWriteTextFormat, h: f32) -> f32 {
+    let Some(l) = shared_layout(s, fmt, 2000.0, h) else {
+        return h * 0.7;
+    };
+    unsafe {
+        let mut lm = [DWRITE_LINE_METRICS::default(); 1];
+        let mut n = 0u32;
+        if l.GetLineMetrics(Some(&mut lm), &mut n).is_ok() && n > 0 {
+            (h - lm[0].height) / 2.0 + lm[0].baseline
+        } else {
+            h * 0.7
+        }
+    }
+}
+
 /// The portable `Canvas` on a Direct2D device context. Every call is the Direct2D call the
 /// drawing code made before it was portable (a brush per call, path geometries through `path`,
 /// the shared stroke styles), so what it draws is pixel for pixel the same.
@@ -836,6 +872,47 @@ impl Canvas for D2dCanvas<'_> {
 
     fn text(&mut self, s: &str, f: &IDWriteTextFormat, x: f32, y: f32, w: f32, h: f32, c: Color) {
         text(self.dc, s, f, x, y, w, h, &brush(self.dc, c));
+    }
+
+    fn text_tracked(
+        &mut self,
+        s: &str,
+        f: &IDWriteTextFormat,
+        x: f32,
+        y: f32,
+        h: f32,
+        c: Color,
+        spacing: f32,
+    ) -> f32 {
+        use windows::core::Interface;
+        match self.g.layout(s, f, 2000.0, h) {
+            Some(l) => unsafe {
+                if let Ok(l1) = l.cast::<IDWriteTextLayout1>() {
+                    let _ = l1.SetCharacterSpacing(
+                        0.0,
+                        spacing,
+                        0.0,
+                        DWRITE_TEXT_RANGE {
+                            startPosition: 0,
+                            length: s.encode_utf16().count() as u32,
+                        },
+                    );
+                }
+                self.dc.DrawTextLayout(
+                    pt(x, y),
+                    &l,
+                    &brush(self.dc, c),
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+                let mut m = DWRITE_TEXT_METRICS::default();
+                let _ = l.GetMetrics(&mut m);
+                m.widthIncludingTrailingWhitespace
+            },
+            None => {
+                text(self.dc, s, f, x, y, 600.0, h, &brush(self.dc, c));
+                self.g.text_width(s, f)
+            }
+        }
     }
 
     fn lip(&mut self, c: Color, dy: f32, l: f32, t: f32, r: f32, b: f32, radius: f32) {

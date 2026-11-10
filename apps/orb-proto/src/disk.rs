@@ -2145,13 +2145,7 @@ fn level(app: &mut App) {
     if !matches!(app.disk.scan, Scan::Done(_)) {
         return;
     }
-    let map = dp::map_rect(
-        &app.g,
-        &app.fonts,
-        app.disk.win.w,
-        app.disk.win.room,
-        &cards(app),
-    );
+    let map = dp::map_rect(&app.fonts, app.disk.win.w, app.disk.win.room, &cards(app));
     let Scan::Done(d) = &app.disk.scan else {
         return;
     };
@@ -2721,7 +2715,7 @@ fn live_results(app: &App, now: Instant) -> Option<dp::ResultsView> {
             }
         })
         .collect();
-    let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.w, app.disk.win.room, &[]);
+    let map = dp::map_rect(&app.fonts, app.disk.win.w, app.disk.win.room, &[]);
     let sizes: Vec<u64> = live.rows.iter().map(|r| r.size).collect();
     let skeleton = space.map_or(0, |s| s.used().saturating_sub(live.on_disk));
     let tiles = fit_tiles(&sizes, map, skeleton, &|_, _| Vec::new());
@@ -3384,7 +3378,7 @@ fn reflow_ease(app: &App, p: f32) -> f32 {
 fn screen_tiles(app: &App) -> Option<(Vec<dp::MapTile>, Vec<String>)> {
     match &app.disk.scan {
         Scan::Running { space, live, .. } if app.disk.place == Place::Scanning => {
-            let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.w, app.disk.win.room, &[]);
+            let map = dp::map_rect(&app.fonts, app.disk.win.w, app.disk.win.room, &[]);
             let sizes: Vec<u64> = live.rows.iter().map(|r| r.size).collect();
             let skeleton = space.map_or(0, |s| s.used().saturating_sub(live.on_disk));
             Some((
@@ -3614,7 +3608,7 @@ pub fn view(app: &App) -> View {
 }
 
 pub fn size(app: &App) -> (f32, f32) {
-    dp::size(&app.g, &app.fonts, &view(app))
+    dp::size(&app.fonts, &view(app))
 }
 
 /// Before a draw: the results level for where the window is (it is computed once per place),
@@ -3625,7 +3619,7 @@ pub fn prepare(app: &mut App) {
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    dp::hit(&app.g, &app.fonts, &view(app), x, y)
+    dp::hit(&app.fonts, &view(app), x, y)
 }
 
 /// Data behind the window changed: rebuild the level and redraw.
@@ -3716,7 +3710,7 @@ fn up(app: &mut App) {
 }
 
 fn keep_visible(app: &mut App) {
-    let fit = dp::fit(&app.g, &app.fonts, &view(app));
+    let fit = dp::fit(&app.fonts, &view(app));
     if let Some(s) = app.disk.sel {
         if s < app.disk.first {
             app.disk.first = s;
@@ -4428,8 +4422,8 @@ pub fn on_esc(app: &mut App) {
 pub fn on_wheel(app: &mut App, x: f32, y: f32, delta: i16) {
     level(app);
     let v = view(app);
-    let fit = dp::fit(&app.g, &app.fonts, &v);
-    let target = dp::scroll_target(&app.g, &app.fonts, &v, x, y);
+    let fit = dp::fit(&app.fonts, &v);
+    let target = dp::scroll_target(&app.fonts, &v, x, y);
     let step = if delta > 0 { -1i64 } else { 1 };
     match target {
         Some(dp::Scroll::Folders) => {
@@ -4805,15 +4799,21 @@ mod tests {
                 max: false,
                 motion: dp::Motion::default(),
             };
-            std::hint::black_box(dp::size(g, fonts, &v));
-            std::hint::black_box(dp::fit(g, fonts, &v));
-            std::hint::black_box(dp::hit(g, fonts, &v, 300.0, 400.0));
+            std::hint::black_box(dp::size(fonts, &v));
+            std::hint::black_box(dp::fit(fonts, &v));
+            std::hint::black_box(dp::hit(fonts, &v, 300.0, 400.0));
             let t1 = Instant::now();
             unsafe {
                 g.dc.SetTarget(&bmp);
                 g.dc.BeginDraw();
             }
-            dp::draw(g, &g.dc, theme, fonts, &v, Some(dp::Hit::DupeRow(1300, 1)));
+            dp::draw(
+                &mut crate::gfx::D2dCanvas::new(g, &g.dc),
+                theme,
+                fonts,
+                &v,
+                Some(dp::Hit::DupeRow(1300, 1)),
+            );
             unsafe {
                 let _ = g.dc.EndDraw(None, None);
                 g.dc.SetTarget(None);

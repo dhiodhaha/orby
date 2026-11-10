@@ -206,6 +206,19 @@ pub trait Canvas {
     fn push_translate(&mut self, dx: f32, dy: f32);
     fn pop_translate(&mut self);
 
+    /// One line of text at (`x`, `y`) in a box `h` tall, with `spacing` px added after each
+    /// character (negative tightens): the big numbers. Returns its width.
+    fn text_tracked(
+        &mut self,
+        s: &str,
+        f: &Font,
+        x: f32,
+        y: f32,
+        h: f32,
+        c: Color,
+        spacing: f32,
+    ) -> f32;
+
     fn text_width(&self, s: &str, f: &Font) -> f32 {
         text_width(s, f)
     }
@@ -250,8 +263,66 @@ pub fn line_height(f: &Font) -> f32 {
     crate::gfx::measure("0", f).1
 }
 
+/// The height of `s` wrapped at `w` in a wrapping font, rounded up to whole pixels.
+#[cfg(windows)]
+pub fn wrap_height(s: &str, f: &Font, w: f32) -> f32 {
+    crate::gfx::wrap_height(s, f, w)
+}
+
+/// Where the baseline of `s` falls in a box `h` tall (one line, vertically centred).
+#[cfg(windows)]
+pub fn baseline_in(s: &str, f: &Font, h: f32) -> f32 {
+    crate::gfx::baseline_in(s, f, h)
+}
+
+/// Names a font for caches: which font object, and its size.
+#[cfg(windows)]
+pub fn font_key(f: &Font) -> (usize, u32) {
+    use windows::core::Interface;
+    (f.as_raw() as usize, unsafe { f.GetFontSize() }.to_bits())
+}
+
 #[cfg(target_os = "macos")]
-pub use crate::mac::text::{line_height, text_width};
+pub use crate::mac::text::{baseline_in, font_key, line_height, text_width, wrap_height};
+
+/// `s` when it fits `w`, else its longest start that fits with an ellipsis after it.
+pub fn ellipsize(s: &str, w: f32, measure: impl Fn(&str) -> f32) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if measure(s) <= w {
+        return Cow::Borrowed(s);
+    }
+    let cut = |end: usize| format!("{}…", s[..end].trim_end());
+    let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+    // Binary search for the widest start that fits: widths only grow with length.
+    let (mut lo, mut hi) = (0, ends.len());
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if measure(&cut(ends[mid])) <= w {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Cow::Owned(cut(ends.get(lo).copied().unwrap_or(0)))
+}
+
+/// One line of text, cut to `w` with an ellipsis.
+pub fn clipped_text(
+    cv: &mut dyn Canvas,
+    s: &str,
+    f: &Font,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    c: Color,
+) {
+    let w = w.max(0.0);
+    let shown = ellipsize(s, w, |t| text_width(t, f));
+    cv.push_clip(x, y, x + w + 2.0, y + h);
+    cv.text(&shown, f, x, y, w + 400.0, h, c);
+    cv.pop_clip();
+}
 
 #[cfg(test)]
 mod tests {

@@ -221,7 +221,7 @@ fn on_size(app: &mut App) {
 pub fn min_height(app: &App) -> f32 {
     let mut v = disk::view(app);
     v.room = 0.0;
-    dp::size(&app.g, &app.fonts, &v).1.max(MIN_ROOM)
+    dp::size(&app.fonts, &v).1.max(MIN_ROOM)
 }
 
 fn take_foreground(app: &App) {
@@ -239,7 +239,7 @@ fn render(app: &mut App) {
     disk::prepare(app);
     // One view per frame: the size and the drawing both read it.
     let v = disk::view(app);
-    let (lw, lh) = dp::size(&app.g, &app.fonts, &v);
+    let (lw, lh) = dp::size(&app.fonts, &v);
     let hwnd = app.disk.win.hwnd;
     let (cw, ch) = frame::client_size(hwnd);
     let (tw, th) = (px(app, lw).ceil() as i32, px(app, lh).ceil() as i32);
@@ -265,7 +265,13 @@ fn render(app: &mut App) {
     };
     let t1 = Instant::now();
     let dc = s.begin(&app.g);
-    dp::draw(&app.g, dc, &app.theme, &app.fonts, &v, app.disk.win.hover);
+    dp::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &v,
+        app.disk.win.hover,
+    );
     s.end(&app.g);
     app.disk.win.frames += 1;
     if frame_log() {
