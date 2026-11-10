@@ -64,9 +64,12 @@ pub struct Win {
     pub frames: u64,
 }
 
-/// `ORB_NO_FIRST_RUN=1` skips the first run on a fresh data folder (test drives).
+/// `ORB_NO_FIRST_RUN=1` skips the first run on a fresh data folder (test drives). So does a
+/// settings.json from an earlier Orby for Mac (phase 1 and 2a wrote one without
+/// `first_run_done`): someone who already uses Orby is not walked through it again.
 pub fn no_first_run() -> bool {
     std::env::var_os("ORB_NO_FIRST_RUN").is_some_and(|v| v != "0")
+        || crate::sys::data_dir().join("settings.json").exists()
 }
 
 // ---- the shortcut: a Carbon hot key ----
