@@ -45,6 +45,8 @@ const CBAR_Y: f32 = 104.0;
 const LEG_Y: f32 = 124.0;
 const TOOL_Y: f32 = 158.0;
 pub const BODY_Y: f32 = 202.0;
+/// Where the Files rows are cut while a trackpad has them mid-row: under the count line.
+const FILES_CLIP: f32 = BODY_Y + 4.0;
 /// The list's column header ("Name", "%", "Size") and the gap under it.
 const LIST_HEAD: f32 = 20.0;
 /// The detail strip under the map, and the selection bar where one shows.
@@ -419,6 +421,10 @@ pub struct View {
     /// Maximized: square corners.
     pub max: bool,
     pub motion: Motion,
+    /// How far past its first row the screen's list is scrolled, in px (0 up to that row's
+    /// height): a trackpad on the Mac moves the list by the pixel. Always 0 on Windows, where
+    /// the wheel moves a row at a time, and the drawing is then exactly as before.
+    pub scroll_px: f32,
 }
 
 /// How many rows each list shows at the window's height.
@@ -803,6 +809,22 @@ fn dupe_entry_h(e: DupeEntry) -> f32 {
     }
 }
 
+/// The entries from `first` with the list `px` further on (a trackpad's part of a row): each
+/// with its top, the partly shown ones at both ends included.
+fn dupe_visible_px(d: &DupesView, b: f32, px: f32) -> Vec<(DupeEntry, f32)> {
+    let bottom = bar_top(b) - 4.0;
+    let mut y = DUPES_TOP - px;
+    let mut out = Vec::new();
+    for e in dupe_entries_from(d, d.first) {
+        if y >= bottom {
+            break;
+        }
+        out.push((e, y));
+        y += dupe_entry_h(e);
+    }
+    out
+}
+
 /// The visible entries from `first`, each with its top.
 fn dupe_visible(d: &DupesView, b: f32) -> Vec<(DupeEntry, f32)> {
     let bottom = bar_top(b) - 4.0;
@@ -1120,13 +1142,22 @@ fn results_rects(f: &Fonts, r: &ResultsView, v: &View, b: f32) -> Vec<(Hit, Rect
                     out.push((Hit::Tile(row), t.rect));
                 }
             }
-            for (k, i) in (r.first..r.rows.len().min(r.first + folder_rows(b))).enumerate() {
-                let top = list_top() + k as f32 * ROW;
-                out.push((
-                    Hit::RowCheck(i),
-                    (list_l(vw), top, list_l(vw) + 30.0, top + ROW),
-                ));
-                out.push((Hit::Row(i), (list_l(vw), top, x1(vw), top + ROW)));
+            let n = folder_rows(b);
+            let px = if r.scanning { 0.0 } else { v.scroll_px };
+            let end = r.rows.len().min(r.first + n + usize::from(px > 0.0));
+            let (lo, hi) = (list_top(), list_top() + n as f32 * ROW);
+            for (k, i) in (r.first..end).enumerate() {
+                let top = list_top() + k as f32 * ROW - px;
+                let (t, bt) = if px > 0.0 {
+                    (top.max(lo), (top + ROW).min(hi))
+                } else {
+                    (top, top + ROW)
+                };
+                if bt <= t {
+                    continue;
+                }
+                out.push((Hit::RowCheck(i), (list_l(vw), t, list_l(vw) + 30.0, bt)));
+                out.push((Hit::Row(i), (list_l(vw), t, x1(vw), bt)));
             }
             if r.selected.is_some() {
                 out.extend(sel_bar_rects(f, b, false, primary_w(f, &v.motion), vw));
@@ -1136,9 +1167,20 @@ fn results_rects(f: &Fonts, r: &ResultsView, v: &View, b: f32) -> Vec<(Hit, Rect
         }
         Tab::Files => {
             let n = files_rows(b);
-            for (k, i) in (r.files_first..r.files.len().min(r.files_first + n)).enumerate() {
-                let top = BODY_Y + k as f32 * FILE_ROW;
-                out.push((Hit::File(i), (X0 - 8.0, top, x1(vw) + 8.0, top + ROW)));
+            let px = v.scroll_px;
+            let end = r.files.len().min(r.files_first + n + usize::from(px > 0.0));
+            let hi = BODY_Y + n as f32 * FILE_ROW;
+            for (k, i) in (r.files_first..end).enumerate() {
+                let top = BODY_Y + k as f32 * FILE_ROW - px;
+                let (t, bt) = if px > 0.0 {
+                    (top.max(FILES_CLIP), (top + ROW).min(hi))
+                } else {
+                    (top, top + ROW)
+                };
+                if bt <= t {
+                    continue;
+                }
+                out.push((Hit::File(i), (X0 - 8.0, t, x1(vw) + 8.0, bt)));
             }
             out.extend(sel_bar_rects(f, b, true, primary_w(f, &v.motion), vw));
         }
@@ -1295,19 +1337,37 @@ fn dupes_rects(f: &Fonts, d: &DupesView, v: &View, b: f32) -> Vec<(Hit, Rect)> {
     out.extend(dupes_block_button(f, d, vw));
     if let DupesBody::Groups(groups) = &d.body {
         out.push((Hit::DupesAll, dupes_all_rect(f, d, vw)));
-        for (e, top) in dupe_visible(d, b) {
+        let px = v.scroll_px;
+        let visible = if px > 0.0 {
+            dupe_visible_px(d, b, px)
+        } else {
+            dupe_visible(d, b)
+        };
+        let (lo, hi) = (DUPES_TOP, bar_top(b) - 4.0);
+        for (e, top) in visible {
             if let DupeEntry::Row(gi, k) = e {
+                // Mid-row, a row only answers inside the list's space.
+                let clip = |r: Rect| -> Option<Rect> {
+                    if px <= 0.0 {
+                        return Some(r);
+                    }
+                    let (t, b) = (r.1.max(lo), r.3.min(hi));
+                    (b > t).then_some((r.0, t, r.2, b))
+                };
                 let Some(row) = groups[gi].rows.get(k) else {
                     continue;
                 };
                 if !row.keep {
-                    out.push((Hit::DupeCheck(gi, k), (X0 - 8.0, top, X0 + 24.0, top + ROW)));
+                    out.extend(
+                        clip((X0 - 8.0, top, X0 + 24.0, top + ROW))
+                            .map(|r| (Hit::DupeCheck(gi, k), r)),
+                    );
                 }
-                out.push((Hit::DupeKeep(gi, k), keep_rect(top, vw)));
-                out.push((
-                    Hit::DupeRow(gi, k),
-                    (X0 - 8.0, top, x1(vw) + 8.0, top + ROW),
-                ));
+                out.extend(clip(keep_rect(top, vw)).map(|r| (Hit::DupeKeep(gi, k), r)));
+                out.extend(
+                    clip((X0 - 8.0, top, x1(vw) + 8.0, top + ROW))
+                        .map(|r| (Hit::DupeRow(gi, k), r)),
+                );
             }
         }
     }
@@ -2673,8 +2733,20 @@ fn draw_results(
             cv.right_text("Size", &f.small, size_r, BODY_Y, 16.0, muted);
             let n = folder_rows(b);
             let shown = r.rows.len().min(r.first + n);
-            for (k, i) in (r.first..shown).enumerate() {
-                draw_folder_row(cv, t, f, r, v, i, k, hover);
+            if v.scroll_px > 0.0 && !r.scanning {
+                // Mid-row: the rows slide under the header, the next one comes in at the
+                // bottom; the tail row keeps its place.
+                cv.push_clip(0.0, list_top(), vw, list_top() + n as f32 * ROW);
+                cv.push_translate(0.0, -v.scroll_px);
+                for (k, i) in (r.first..r.rows.len().min(shown + 1)).enumerate() {
+                    draw_folder_row(cv, t, f, r, v, i, k, hover);
+                }
+                cv.pop_translate();
+                cv.pop_clip();
+            } else {
+                for (k, i) in (r.first..shown).enumerate() {
+                    draw_folder_row(cv, t, f, r, v, i, k, hover);
+                }
             }
             if r.scanning && r.rows.len() <= shown {
                 // Skeleton rows hold the places the scan has not filled yet.
@@ -2739,9 +2811,19 @@ fn draw_results(
             }
             let n = files_rows(b);
             let shown = r.files.len().min(r.files_first + n);
+            let px = v.scroll_px;
+            // Mid-row (a trackpad on the Mac): the rows slide inside the list's own space and
+            // the next one comes in at the bottom.
+            let shown = if px > 0.0 {
+                // From under the count line above the list (it ends 2 px into the rows).
+                cv.push_clip(0.0, FILES_CLIP, vw, BODY_Y + n as f32 * FILE_ROW);
+                r.files.len().min(shown + 1)
+            } else {
+                shown
+            };
             for (k, i) in (r.files_first..shown).enumerate() {
                 let (dy, a) = ripple(&v.motion, k);
-                let top = BODY_Y + k as f32 * FILE_ROW + dy;
+                let top = BODY_Y + k as f32 * FILE_ROW + dy - px;
                 draw_file_row(
                     cv,
                     t,
@@ -2753,6 +2835,9 @@ fn draw_results(
                     a,
                     vw,
                 );
+            }
+            if px > 0.0 {
+                cv.pop_clip();
             }
             draw_scroll_thumb(
                 cv,
@@ -3303,7 +3388,13 @@ fn draw_dupes(
             row_pos -= 1;
             seen += 1 + gr.len;
         }
-        let visible = dupe_visible(d, b);
+        let px = v.scroll_px;
+        let visible = if px > 0.0 {
+            cv.push_clip(0.0, DUPES_TOP, vw, bar_top(b) - 4.0);
+            dupe_visible_px(d, b, px)
+        } else {
+            dupe_visible(d, b)
+        };
         for (k, &(e, top)) in visible.iter().enumerate() {
             let (dy, a) = ripple(&v.motion, k);
             let top = top + dy;
@@ -3376,8 +3467,15 @@ fn draw_dupes(
                 }
             }
         }
+        if px > 0.0 {
+            cv.pop_clip();
+        }
         let n_entries = dupe_entry_count(d);
-        let shown = visible.len();
+        let shown = if px > 0.0 {
+            dupe_visible(d, b).len()
+        } else {
+            visible.len()
+        };
         draw_scroll_thumb(
             cv,
             t,
@@ -3649,6 +3747,65 @@ pub fn draw(cv: &mut dyn Canvas, t: &Theme, f: &Fonts, v: &View, hover: Option<H
     }
     // The device context is shared with every other window: leave it untransformed.
     cv.pop_translate();
+}
+
+/// The list on this screen that a trackpad moves by the pixel, and the height of the row at
+/// its top (the one `scroll_px` is part of). The other lists move a row at a time.
+#[cfg_attr(windows, allow(dead_code))] // the Mac's trackpad scrolling
+pub fn px_list(v: &View) -> Option<(Scroll, f32)> {
+    match &v.screen {
+        Screen::Results(r) if !r.scanning => match r.tab {
+            Tab::Folders => Some((Scroll::Folders, ROW)),
+            Tab::Files => Some((Scroll::Files, FILE_ROW)),
+            Tab::Types => None,
+        },
+        Screen::Dupes(d) if matches!(d.body, DupesBody::Groups(_)) => {
+            let h = dupe_entries_from(d, d.first)
+                .next()
+                .map_or(FILE_ROW, dupe_entry_h);
+            Some((Scroll::Dupes, h))
+        }
+        _ => None,
+    }
+}
+
+/// What a scroll of `px_list` changes on screen, in window coordinates: its rows (and the
+/// Folders tail row) and its scroll thumb, a little past them. The Mac redraws only this while
+/// nothing else moves.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn px_list_rect(f: &Fonts, v: &View) -> Option<Rect> {
+    let b = body_h(f, v);
+    let vw = v.w;
+    let (l, t, r, bt) = match &v.screen {
+        Screen::Results(r) if !r.scanning => match r.tab {
+            Tab::Folders => {
+                let la = list_at(b, vw);
+                (la.0 - 8.0, la.1 - 2.0, vw, la.3 + 2.0)
+            }
+            Tab::Files => (
+                0.0,
+                BODY_Y - 2.0,
+                vw,
+                BODY_Y + files_rows(b) as f32 * FILE_ROW + 2.0,
+            ),
+            Tab::Types => return None,
+        },
+        Screen::Dupes(d) if matches!(d.body, DupesBody::Groups(_)) => {
+            (0.0, DUPES_TOP - 2.0, vw, bar_top(b) - 2.0)
+        }
+        _ => return None,
+    };
+    Some((l, t + TOP, r, bt + TOP))
+}
+
+/// A hover that shows only inside `px_list_rect`: a Files row or a Duplicates copy (a folder
+/// row also lights its treemap tile, so it does not count), or nothing.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn hover_in_list(h: Option<Hit>) -> bool {
+    matches!(
+        h,
+        None | Some(Hit::File(_) | Hit::DupeRow(..) | Hit::DupeCheck(..) | Hit::DupeKeep(..))
+    )
 }
 
 /// Which list a wheel over (x, y) scrolls.

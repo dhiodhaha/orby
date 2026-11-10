@@ -567,6 +567,7 @@ fn view(screen: Screen) -> View {
         room: dp::H,
         max: false,
         motion: Motion::default(),
+        scroll_px: 0.0,
     }
 }
 

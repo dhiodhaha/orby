@@ -410,40 +410,22 @@ impl Win {
         draw: impl FnOnce(&mut dyn Canvas),
     ) {
         let space = self.panel.colorSpace().and_then(|s| s.CGColorSpace());
-        let b = match &space {
-            Some(sp) => Bitmap::with_space(w, h, scale, sp),
-            None => Bitmap::new(w, h, scale),
-        };
-        draw(&mut b.canvas());
-        set_contents(sub, &b, scale);
+        super::surface::paint(sub, w, h, scale, space.as_deref(), None, draw);
     }
 
-    /// Draws with the shared Canvas into a bitmap that becomes the view's layer contents.
+    /// Draws with the shared Canvas into the view's layer (mac/surface.rs).
     pub(crate) fn paint(&self, scale: f32, draw: impl FnOnce(&mut dyn Canvas)) {
         let space = self.panel.colorSpace().and_then(|s| s.CGColorSpace());
-        let b = match &space {
-            Some(sp) => Bitmap::with_space(self.w, self.h, scale, sp),
-            None => Bitmap::new(self.w, self.h, scale),
-        };
-        draw(&mut b.canvas());
-        set_contents(&self.view, &b, scale);
+        super::surface::paint(
+            &self.view,
+            self.w,
+            self.h,
+            scale,
+            space.as_deref(),
+            None,
+            draw,
+        );
     }
-}
-
-/// Makes a bitmap a view's layer contents, without an implicit animation.
-pub(crate) fn set_contents(view: &NSView, b: &Bitmap, scale: f32) {
-    let Some(img) = b.image() else { return };
-    let Some(layer) = view.layer() else {
-        return;
-    };
-    CATransaction::begin();
-    CATransaction::setDisableActions(true);
-    // A CGImage is a CFType, toll-free bridged to an object.
-    let obj: &AnyObject =
-        unsafe { &*(&*img as *const objc2_core_graphics::CGImage as *const AnyObject) };
-    unsafe { layer.setContents(Some(obj)) };
-    layer.setContentsScale(scale as f64);
-    CATransaction::commit();
 }
 
 // ---- the menu bar item's target ----
@@ -665,6 +647,8 @@ pub(crate) struct App {
     pub(crate) disk_release_at: Option<Instant>,
     // The run loop.
     timer: Option<Retained<NSTimer>>,
+    /// When `timer` fires.
+    timer_at: Option<Instant>,
     last_frame: Instant,
 }
 
@@ -2086,7 +2070,38 @@ impl App {
             }
             "disk-resources" => {
                 let rss = super::disk::resident_bytes() as f64 / 1_048_576.0;
-                self.log(&format!("resources: resident {rss:.1} MB"));
+                let surf = super::surface::held_bytes() as f64 / 1_048_576.0;
+                self.log(&format!(
+                    "resources: resident {rss:.1} MB, window surfaces {surf:.1} MB"
+                ));
+            }
+            "frames-on" => super::frames::set(true),
+            "frames-off" => super::frames::set(false),
+            "frames-reset" => super::frames::reset(),
+            "frames-report" => {
+                for l in super::frames::report() {
+                    self.log(&l);
+                }
+            }
+            _ if cmd.starts_with("drive:") => self.drive(&cmd["drive:".len()..]),
+            // A window covered by other apps gets no display link frames (nothing to see):
+            // test drives float it over them, and put it back after.
+            _ if cmd.starts_with("float:") => {
+                let (win, on) = cmd["float:".len()..]
+                    .split_once(':')
+                    .unwrap_or(("disk", "on"));
+                let refs = match win {
+                    "tasks" => super::tasks_win::refs(self),
+                    _ => super::disk_win::refs(self),
+                };
+                if let Some((w, _)) = refs {
+                    w.setLevel(if on == "on" { 3 } else { 0 });
+                    w.orderFrontRegardless();
+                    self.log(&format!(
+                        "float: {win} {on}, occlusion {:?}",
+                        w.occlusionState()
+                    ));
+                }
             }
             _ if cmd.starts_with("disk-") => crate::disk::test_command(self, cmd),
             _ if self.tasks_test_command(cmd) => {}
@@ -2101,6 +2116,64 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Test: synthetic input for `frames-report`: `<win>:<kind>:<secs>[:<x>,<y>]`, win `disk` or
+    /// `tasks`, kind `trackpad` (120 Hz, 4 px), `trackpad-fast` (120 Hz, 12 px), `wheel` (30
+    /// notches a second), `trackpad60` (60 Hz, 8 px), `hover` (120 Hz pointer moves) or
+    /// `resize` (a 60 Hz resize step), at a point in the window (logical, y down; the list's
+    /// middle when left out).
+    fn drive(&mut self, arg: &str) {
+        use super::frames::drive::{self, Kind};
+        let parts: Vec<&str> = arg.split(':').collect();
+        let win = parts.first().copied().unwrap_or("disk");
+        let kind = match parts.get(1).copied().unwrap_or("trackpad") {
+            "trackpad-fast" => Kind::Trackpad {
+                hz: 120.0,
+                px: 12.0,
+            },
+            "wheel" => Kind::Wheel { hz: 30.0 },
+            "hover" => Kind::Hover { hz: 120.0 },
+            "resize" => Kind::Resize { hz: 60.0 },
+            "trackpad60" => Kind::Trackpad { hz: 60.0, px: 8.0 },
+            _ => Kind::Trackpad { hz: 120.0, px: 4.0 },
+        };
+        let secs: f64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(5.0);
+        let at: Option<(f64, f64)> = parts.get(3).and_then(|s| {
+            let (x, y) = s.split_once(',')?;
+            Some((x.parse().ok()?, y.parse().ok()?))
+        });
+        let refs = match win {
+            "tasks" => super::tasks_win::refs(self),
+            _ => super::disk_win::refs(self),
+        };
+        let Some((w, v)) = refs else {
+            self.log(&format!("drive: no {win} window"));
+            return;
+        };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        super::frames::probe_vsync(&v);
+        let f = w.frame();
+        let screen_h = NSScreen::screens(mtm)
+            .iter()
+            .next()
+            .map_or(0.0, |s| s.frame().size.height);
+        let t = drive::Target {
+            window: w.windowNumber(),
+            frame: (f.origin.x, f.origin.y, f.size.width, f.size.height),
+            screen_h,
+        };
+        let (x, y) = at.unwrap_or((f.size.width - 200.0, 400.0));
+        self.log(&format!(
+            "drive: {win} {arg} at {x:.0},{y:.0} (app active {}, window key {}, visible {}, occlusion {:?})",
+            NSApplication::sharedApplication(mtm).isActive(),
+            w.isKeyWindow(),
+            w.isVisible(),
+            w.occlusionState()
+        ));
+        drive::start(t, kind, secs, x, y);
     }
 
     /// The test channel's Tasks and Today commands (one log line each). Rows are counted as the
@@ -2282,8 +2355,6 @@ impl App {
             || (self.pill_win.shown && !self.pill_reveal.settled(0.002))
             || panels::animating(self)
             || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002))
-            || (self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty))
-            || super::tasks_win::animating(self)
     }
 
     /// The only thing moving is a rolling number in the open panel.
@@ -2292,9 +2363,7 @@ impl App {
             || !self.opacity.settled(0.002)
             || (self.dial.shown && !self.dial_reveal.settled(0.002))
             || (self.pill_win.shown && !self.pill_reveal.settled(0.002))
-            || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002))
-            || (self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty))
-            || super::tasks_win::animating(self);
+            || (self.dial_branch.is_some() && !self.branch_reveal.settled(0.002));
         !other && panels::only_rolling(self)
     }
 
@@ -2405,22 +2474,27 @@ impl App {
             self.branch_reveal.step(dt);
             self.render_dial();
         }
-        if self.disk.win.open && (self.disk.win.ticking || self.disk.win.dirty) {
-            super::disk_win::render(self);
-        }
         super::tasks_win::tick(self);
     }
 
-    /// Sets the one timer to the next frame or the next deadline.
+    /// Sets the one timer to the next frame or the next deadline. Every input event comes
+    /// through here (`with_app`): while something moves, the next frame stays one frame after
+    /// the last one, so events arriving faster than frames (a trackpad, the pointer over the
+    /// dial) can never keep pushing it out; a timer already due by then is kept.
     fn schedule(&mut self) {
-        let wait = if self.animating() {
+        let animating = self.animating();
+        let wait = if animating {
             // A panel's rolling number alone (the countdowns each second) moves at 30 Hz: a
             // 0.3 s digit roll looks the same and costs half.
-            if self.only_panel_rolls() {
+            let frame = if self.only_panel_rolls() {
                 2.0 * FRAME
             } else {
                 FRAME
-            }
+            };
+            let due = self.last_frame + Duration::from_secs_f64(frame);
+            due.saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .max(0.0005)
         } else {
             let now = Instant::now();
             [
@@ -2441,25 +2515,42 @@ impl App {
             .map(|t| t.saturating_duration_since(now).as_secs_f64().max(0.001))
             .unwrap_or(3600.0)
         };
+        let at = Instant::now() + Duration::from_secs_f64(wait);
+        if let (Some(t), Some(was)) = (&self.timer, self.timer_at) {
+            // Already due no later than this (within half a millisecond): keep it.
+            if t.isValid() && was <= at + Duration::from_micros(500) {
+                return;
+            }
+        }
         if let Some(t) = self.timer.take() {
             t.invalidate();
         }
-        if !self.animating() {
+        if !animating {
             self.last_frame = Instant::now();
         }
+        self.timer_at = Some(at);
         let block = RcBlock::new(|_t: NonNull<NSTimer>| {
             APP.with(|cell| {
                 if let Ok(mut b) = cell.try_borrow_mut() {
                     if let Some(a) = b.as_mut() {
+                        // This timer has fired: the next one is made fresh.
+                        a.timer = None;
+                        a.timer_at = None;
                         a.tick();
                         a.schedule();
                     }
                 }
             });
         });
-        self.timer = Some(unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(wait, false, &block)
-        });
+        // In the common modes: frames and deadlines keep coming while a menu is open or a
+        // window is being resized. (The constant itself: CFRunLoop tells the common modes by
+        // the pointer, so an equal string made here would be a mode of its own that never runs.)
+        let t = unsafe { NSTimer::timerWithTimeInterval_repeats_block(wait, false, &block) };
+        unsafe {
+            objc2_foundation::NSRunLoop::mainRunLoop()
+                .addTimer_forMode(&t, objc2_foundation::NSRunLoopCommonModes)
+        };
+        self.timer = Some(t);
     }
 }
 
@@ -2534,6 +2625,7 @@ pub fn run() {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+    super::frames::init();
     let dir = clock::data_dir();
     let settings = crate::settings::Settings::load(&dir, Default::default());
     let day = clock::today();
@@ -2715,6 +2807,7 @@ pub fn run() {
         disk_check_every: Duration::from_secs(600),
         disk_release_at: None,
         timer: None,
+        timer_at: None,
         last_frame: Instant::now(),
     };
     a.top = a.clamp_top(a.top);

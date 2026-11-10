@@ -17,7 +17,7 @@
 //! appearance. There is no location fix (Orby never asks for Location Services) and no adzan
 //! file yet.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
@@ -40,6 +40,7 @@ use super::app::with_app;
 use super::cg::Bitmap;
 use super::hotkey;
 use super::input::{self, Input, InputView, Mods};
+use super::pacer::{Pacer, Who};
 use crate::settings::{self, edge_radius};
 use crate::settings_model::{Locate, Shortcut, Startup};
 use crate::settings_panel::{self as sp, View};
@@ -62,6 +63,12 @@ pub struct Win {
     /// Trackpad scroll not yet a notch (the city list).
     wheel: f32,
     pub frames: u64,
+    /// A redraw is due at the next display refresh (hover and typing coalesce into one).
+    dirty: Cell<bool>,
+    /// The display link's frames, running while a redraw is due.
+    pacer: RefCell<Option<Pacer>>,
+    /// The size the window shadow was last made for.
+    shadow_for: Cell<(f32, f32)>,
 }
 
 /// `ORB_NO_FIRST_RUN=1` skips the first run on a fresh data folder (test drives). So does a
@@ -165,7 +172,7 @@ pub fn redraw_others(app: &mut App) {
     app.redraw_for_theme();
     crate::panels::redraw(app);
     if app.disk.win.open {
-        super::disk_win::render(app);
+        super::disk_win::refresh(app);
     }
 }
 
@@ -360,6 +367,7 @@ fn make(app: &mut App, mtm: MainThreadMarker) {
     let field = InputView::new(mtm);
     view.addSubview(&field);
     w.setContentView(Some(&view));
+    *app.settings.win.pacer.borrow_mut() = Some(Pacer::new(&view, Who::Settings));
     // Becoming key: the typing goes to Settings, the startup entry is read again; going to the
     // background cancels a shortcut being pressed (WM_ACTIVATE on Windows).
     let center = NSNotificationCenter::defaultCenter();
@@ -431,9 +439,14 @@ pub fn hide(app: &mut App) {
     if let Some(w) = &app.settings.win.window {
         w.orderOut(None);
     }
-    // The bitmap is about 1.6 MB at 2x; let it go while hidden.
-    if let Some(layer) = app.settings.win.view.as_ref().and_then(|v| v.layer()) {
-        unsafe { layer.setContents(None) };
+    // The surfaces are about 6 MB each at 2x; let them go while hidden.
+    app.settings.win.dirty.set(false);
+    app.settings.win.shadow_for.set((0.0, 0.0));
+    if let Some(p) = app.settings.win.pacer.borrow_mut().as_mut() {
+        p.pause();
+    }
+    if let Some(v) = &app.settings.win.view {
+        super::surface::release(v);
     }
     if let Some(f) = &app.settings.win.input {
         f.discard_marked();
@@ -493,48 +506,64 @@ pub fn prepare(app: &mut App) {
     }
 }
 
-fn draw(
-    app: &App,
-    v: &View,
-    scale: f32,
-    space: Option<&objc2_core_graphics::CGColorSpace>,
-) -> Bitmap {
+/// The window and its lip, drawn with the shared Canvas.
+fn draw(cv: &mut dyn crate::canvas::Canvas, app: &App, v: &View) {
     let screen = v.screen;
     let (lw, lh) = sp::size(screen);
-    let b = match space {
-        Some(sp) => Bitmap::with_space(lw, lh, scale, sp),
-        None => Bitmap::new(lw, lh, scale),
-    };
-    {
-        let mut cv = b.canvas();
-        sp::draw(&mut cv, &app.theme, &app.fonts, v);
-        // The T3 lip along the window's edge.
-        crate::ui::lip(
-            &mut cv,
-            &app.theme,
-            0.0,
-            0.0,
-            lw,
-            lh,
-            edge_radius(screen),
-            1.0,
-        );
-    }
-    b
+    sp::draw(cv, &app.theme, &app.fonts, v);
+    // The T3 lip along the window's edge.
+    crate::ui::lip(cv, &app.theme, 0.0, 0.0, lw, lh, edge_radius(screen), 1.0);
 }
 
-/// Draws the view into the window's layer.
+/// The view is out of date: drawn at the next display refresh (hover, typing and clicks that
+/// come together cost one frame), or now while the window is not on screen yet, so it never
+/// shows empty.
 pub fn paint(app: &App, v: &View) {
+    let (Some(w), Some(_)) = (&app.settings.win.window, &app.settings.win.view) else {
+        return;
+    };
+    if !w.isVisible() {
+        paint_now(app, v);
+        return;
+    }
+    app.settings.win.dirty.set(true);
+    if let Some(p) = app.settings.win.pacer.borrow_mut().as_mut() {
+        p.run();
+    }
+}
+
+/// Draws the view into the window's layer now.
+fn paint_now(app: &App, v: &View) {
     let (Some(w), Some(view)) = (&app.settings.win.window, &app.settings.win.view) else {
         return;
     };
     let scale = w.backingScaleFactor() as f32;
     let space = w.colorSpace().and_then(|s| s.CGColorSpace());
-    let b = draw(app, v, scale, space.as_deref());
-    super::app::set_contents(view, &b, scale);
-    // The shadow follows the drawn rounded shape.
-    w.invalidateShadow();
+    let (lw, lh) = sp::size(v.screen);
+    let mut sw = super::frames::Stopwatch::start();
+    super::surface::paint(view, lw, lh, scale, space.as_deref(), Some(&mut sw), |cv| {
+        draw(cv, app, v)
+    });
+    sw.done("settings");
+    app.settings.win.dirty.set(false);
+    // The shadow follows the drawn rounded shape: made again when the size changes.
+    if app.settings.win.shadow_for.get() != (lw, lh) {
+        app.settings.win.shadow_for.set((lw, lh));
+        w.invalidateShadow();
+    }
     sync_responder(app);
+}
+
+/// One display refresh: the redraw that is due, then the link rests.
+pub fn on_vsync(app: &mut App) {
+    if app.settings.win.dirty.get() && app.settings.screen.is_some() {
+        prepare(app);
+        let v = settings::view(app);
+        paint_now(app, &v);
+    }
+    if let Some(p) = app.settings.win.pacer.borrow_mut().as_mut() {
+        p.pause();
+    }
 }
 
 // ---- input ----
@@ -664,7 +693,9 @@ pub fn shot(app: &mut App, path: &str) {
         return;
     }
     let v = settings::view(app);
-    let b = draw(app, &v, 2.0, None);
+    let (lw, lh) = sp::size(v.screen);
+    let b = Bitmap::new(lw, lh, 2.0);
+    draw(&mut b.canvas(), app, &v);
     let p = std::path::Path::new(path);
     if let (Some(dir), Some(name)) = (p.parent(), p.file_stem()) {
         crate::snapshot::write(
