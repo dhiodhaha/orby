@@ -102,7 +102,7 @@ pub fn size(app: &App) -> (f32, f32) {
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
-    history_panel::hit(&app.g, &app.fonts, &view(app), x, y)
+    history_panel::hit(&app.fonts, &view(app), x, y)
 }
 
 pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
@@ -127,7 +127,14 @@ pub fn draw_panel(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
         };
         m::detail(&log, v.tab, span, c, &pace).map(|d| (i, d))
     });
-    history_panel::draw(&app.g, dc, &app.theme, &app.fonts, &v, detail, hover);
+    history_panel::draw(
+        &mut crate::gfx::D2dCanvas::new(&app.g, dc),
+        &app.theme,
+        &app.fonts,
+        &v,
+        detail,
+        hover,
+    );
 }
 
 /// Opens History, on `tab` or the last tab used, on this week's page.
