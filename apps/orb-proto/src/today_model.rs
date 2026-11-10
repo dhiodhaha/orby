@@ -347,12 +347,18 @@ mod tests {
             Source::parse("http://127.0.0.1:8765/cal.ics"),
             Some(Source::Http("http://127.0.0.1:8765/cal.ics".into()))
         );
-        assert_eq!(
-            Source::parse("file:///C:/Users/me/My%20Cal/work.ics"),
-            Some(Source::File(PathBuf::from(
-                "C:\\Users\\me\\My Cal\\work.ics"
-            )))
-        );
+        let (link, file) = if cfg!(windows) {
+            (
+                "file:///C:/Users/me/My%20Cal/work.ics",
+                "C:\\Users\\me\\My Cal\\work.ics",
+            )
+        } else {
+            (
+                "file:///Users/me/My%20Cal/work.ics",
+                "/Users/me/My Cal/work.ics",
+            )
+        };
+        assert_eq!(Source::parse(link), Some(Source::File(PathBuf::from(file))));
         assert_eq!(
             Source::parse("\"C:\\Users\\me\\My Cal\\work.ics\""),
             Some(Source::File(PathBuf::from(
