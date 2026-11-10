@@ -135,7 +135,10 @@ pub fn scan(root: &Path, options: &ScanOptions, mut progress: impl FnMut(Progres
             let Ok(listing) = res_rx.recv() else { break };
             pending -= 1;
             for (name, e) in listing.entry_errors {
-                tree.skip(Skipped { path: listing.path.join(name), reason: SkipReason::of(&e) });
+                // No name: reading the folder's listing failed part way, so the folder is what
+                // was skipped (joining "" would add a trailing separator).
+                let path = if name.is_empty() { listing.path.clone() } else { listing.path.join(name) };
+                tree.skip(Skipped { path, reason: SkipReason::of(&e) });
             }
             let entries = match listing.read {
                 Read::Done(v) => v,
@@ -201,7 +204,7 @@ fn worker(jobs: &Mutex<mpsc::Receiver<Job>>, results: mpsc::Sender<Listing>, can
 fn read_dir(job: Job, cancel: &AtomicBool, vol: &Volume) -> Listing {
     let dev = vol.mounts.device(&job.path);
     let mut entry_errors = Vec::new();
-    let read = match fs::read_dir(&job.path) {
+    let read = match read_dir_retrying(&job.path) {
         Err(e) => Read::Failed(e),
         Ok(iter) => {
             let mut entries = Vec::new();
@@ -227,6 +230,18 @@ fn read_dir(job: Job, cancel: &AtomicBool, vol: &Volume) -> Listing {
         }
     };
     Listing { dir: job.dir, path: job.path, read, entry_errors }
+}
+
+/// `fs::read_dir`, tried again when a signal interrupts it: macOS sometimes answers `EINTR`
+/// for a sandboxed app container's folder that lists fine a moment later.
+fn read_dir_retrying(p: &Path) -> io::Result<fs::ReadDir> {
+    let mut tries = 0;
+    loop {
+        match fs::read_dir(p) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && tries < 3 => tries += 1,
+            r => return r,
+        }
+    }
 }
 
 /// Builds a node from directory-listing data only. On Windows that data comes from the

@@ -1,13 +1,13 @@
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "macos"))]
 //! Duplicate finding on trees made under the test target folder. Nothing here reads the user's
-//! own folders, and nothing goes to the Recycle Bin: removal is only checked, never done.
+//! own folders, and nothing goes to the Recycle Bin or the Trash: removal is only checked, never
+//! done.
 
 use app_disk::{
     candidates, check_duplicate_removal, drive_kind, find_duplicates, scan, Candidates, DriveKind, DupeOptions, DupeProgress, DupeRemoval,
     DupeReport, DupeStage, Refusal, RuleEnv, ScanOptions, DUPE_EDGE,
 };
 use std::fs::{self, File, FileTimes};
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -16,8 +16,11 @@ use std::time::{Duration, SystemTime};
 fn fresh(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dupes").join(name);
     if dir.exists() {
-        // A crashed earlier run may have left a deny rule behind.
+        // A crashed earlier run may have left a file unreadable.
+        #[cfg(windows)]
         let _ = Command::new("icacls").arg(&dir).args(["/reset", "/T", "/Q"]).output();
+        #[cfg(unix)]
+        let _ = Command::new("chmod").args(["-R", "u+rw"]).arg(&dir).output();
         fs::remove_dir_all(&dir).unwrap();
     }
     fs::create_dir_all(&dir).unwrap();
@@ -128,9 +131,15 @@ fn a_hard_link_is_one_file_with_two_names() {
 
     write(&root.join("copy.bin"), &data);
     let (r, _) = check(&root, &opts(&root));
-    assert_eq!(r.groups.len(), 1);
-    assert_eq!(r.groups[0].files.len(), 2, "the copy and one name of the linked file");
-    assert!(r.groups[0].files.iter().any(|f| f.path.ends_with("copy.bin")));
+    if cfg!(windows) {
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].files.len(), 2, "the copy and one name of the linked file");
+        assert!(r.groups[0].files.iter().any(|f| f.path.ends_with("copy.bin")));
+    } else {
+        // macOS leaves a hard-linked file out whole (moving one name frees nothing), so the copy
+        // has nothing to pair with.
+        assert!(r.groups.is_empty(), "{r:?}");
+    }
 }
 
 #[test]
@@ -143,6 +152,40 @@ fn empty_files_and_an_empty_folder_find_nothing() {
     assert_eq!(stage1(&root, &opts(&root)).groups, 0, "zero-byte files are never candidates");
 }
 
+/// Windows: `c` is open in another "app" that shares nothing, and `d` denies reading its data.
+#[cfg(windows)]
+fn make_unreadable(c: &Path, d: &Path) -> Option<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let lock = fs::OpenOptions::new().read(true).share_mode(0).open(c).unwrap();
+    let deny = Command::new("icacls").arg(d).args(["/deny", "*S-1-1-0:(RD)"]).output().unwrap();
+    assert!(deny.status.success(), "{deny:?}");
+    Some(lock)
+}
+
+#[cfg(windows)]
+fn make_readable(_c: &Path, d: &Path, lock: Option<File>) {
+    let _ = Command::new("icacls").arg(d).args(["/remove:d", "*S-1-1-0"]).output();
+    drop(lock);
+}
+
+/// macOS has no share modes, so both files lose their read permission.
+#[cfg(unix)]
+fn make_unreadable(c: &Path, d: &Path) -> Option<File> {
+    use std::os::unix::fs::PermissionsExt;
+    for p in [c, d] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    None
+}
+
+#[cfg(unix)]
+fn make_readable(c: &Path, d: &Path, _lock: Option<File>) {
+    use std::os::unix::fs::PermissionsExt;
+    for p in [c, d] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
 #[test]
 fn locked_and_unreadable_files_are_skipped_and_counted() {
     let root = fresh("unreadable");
@@ -150,14 +193,10 @@ fn locked_and_unreadable_files_are_skipped_and_counted() {
     for n in ["a.bin", "b.bin", "c.bin", "d.bin"] {
         write(&root.join(n), &data);
     }
-    // c.bin is open in another "app" that shares nothing; d.bin denies reading its data.
-    let lock = fs::OpenOptions::new().read(true).share_mode(0).open(root.join("c.bin")).unwrap();
-    let denied = root.join("d.bin");
-    let deny = Command::new("icacls").arg(&denied).args(["/deny", "*S-1-1-0:(RD)"]).output().unwrap();
-    assert!(deny.status.success(), "{deny:?}");
+    let (c, d) = (root.join("c.bin"), root.join("d.bin"));
+    let held = make_unreadable(&c, &d);
     let (r, _) = check(&root, &opts(&root));
-    let _ = Command::new("icacls").arg(&denied).args(["/remove:d", "*S-1-1-0"]).output();
-    drop(lock);
+    make_readable(&c, &d, held);
     assert_eq!(r.skipped, 2);
     assert!(!r.stopped);
     assert_eq!(names(&r), [vec!["a.bin", "b.bin"]], "the readable copies still group");
@@ -246,7 +285,7 @@ fn an_extra_copy_moves_only_while_its_kept_copy_is_there() {
     assert_eq!(check_duplicate_removal(&env, &item(&b, &root.join("gone.bin")), &[]), Err(Refusal::NoCopyLeft));
     let wrong = DupeRemoval { size: 299_999, ..item(&b, &a) };
     assert_eq!(check_duplicate_removal(&env, &wrong, &[]), Err(Refusal::Changed), "not the file that was compared");
-    let ssh = root.join(r"Home\.ssh\id.bin");
+    let ssh = root.join("Home/.ssh/id.bin");
     write(&ssh, &data);
     assert_eq!(check_duplicate_removal(&env, &item(&ssh, &a), &[]), Err(Refusal::NeverTouch));
     let relative = DupeRemoval { path: PathBuf::from("b.bin"), ..item(&b, &a) };
@@ -258,5 +297,8 @@ fn an_extra_copy_moves_only_while_its_kept_copy_is_there() {
 fn drive_type_has_an_answer_or_says_unknown() {
     // The dev PC's drive answers either way; a drive that is not there cannot.
     let _ = drive_kind(Path::new(env!("CARGO_TARGET_TMPDIR")));
+    #[cfg(windows)]
     assert_eq!(drive_kind(Path::new(r"Q:\nowhere")), DriveKind::Unknown);
+    #[cfg(unix)]
+    assert_eq!(drive_kind(Path::new("/Volumes/app-disk-test-no-such-volume/nowhere")), DriveKind::Unknown);
 }

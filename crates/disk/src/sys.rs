@@ -547,12 +547,31 @@ mod imp {
         }
     }
 
-    /// Where the scan stops: a folder on another device than its parent is a mount point (an
-    /// external disk under `/Volumes`, `/System/Volumes/Data` seen again from `/`), listed as a
-    /// link and never entered. Firmlinks (`/Users`, `/Applications`, ...) also cross from the
-    /// system volume to the data volume but are the one real copy, so they are entered.
+    /// Where the scan stops: a mount point (an external disk under `/Volumes`,
+    /// `/System/Volumes/Data` seen again from `/`) is listed as a link and never entered. A
+    /// folder is a mount point when the mount table names it, or when it is on another device
+    /// than its parent (a disk mounted after the scan started). The table matters: the system and
+    /// data volumes of an APFS volume group report the same `st_dev`, so `/System/Volumes/Data`
+    /// does not look like another device. Firmlinks (`/Users`, `/Applications`, ...) cross from
+    /// the system volume to the data volume but are the one real copy, so they are entered.
     pub struct Mounts {
         firmlinks: HashSet<PathBuf>,
+        mounted: HashSet<PathBuf>,
+    }
+
+    /// Every mount point but `/`, from `getfsstat` (no waiting on slow or network mounts).
+    fn mount_points() -> HashSet<PathBuf> {
+        // SAFETY: a null buffer asks for the count only.
+        let n = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        let Ok(n) = usize::try_from(n) else { return HashSet::new() };
+        // Room for a few mounts that appear between the two calls.
+        // SAFETY: all-zero is a valid statfs.
+        let mut buf: Vec<libc::statfs> = vec![unsafe { std::mem::zeroed() }; n + 8];
+        let bytes = libc::c_int::try_from(buf.len() * std::mem::size_of::<libc::statfs>()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: `buf` holds `bytes` bytes of statfs records.
+        let got = unsafe { libc::getfsstat(buf.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+        buf.truncate(usize::try_from(got).unwrap_or(0));
+        buf.iter().map(mounted_on).filter(|p| p != Path::new("/")).collect()
     }
 
     /// The firmlinks Apple ships, in case `/usr/share/firmlinks` cannot be read.
@@ -583,7 +602,7 @@ mod imp {
             if let Ok(text) = std::fs::read_to_string("/usr/share/firmlinks") {
                 firmlinks.extend(text.lines().filter_map(|l| l.split('\t').next()).filter(|p| p.starts_with('/')).map(PathBuf::from));
             }
-            Mounts { firmlinks }
+            Mounts { firmlinks, mounted: mount_points() }
         }
 
         pub fn device(&self, dir: &Path) -> Option<u64> {
@@ -591,7 +610,11 @@ mod imp {
         }
 
         pub fn crosses(&self, parent_dev: Option<u64>, child: &std::fs::DirEntry, md: &Metadata) -> bool {
-            md.is_dir() && parent_dev.is_some_and(|d| d != md.dev()) && !self.firmlinks.contains(&child.path())
+            if !md.is_dir() {
+                return false;
+            }
+            let path = child.path();
+            !self.firmlinks.contains(&path) && (self.mounted.contains(&path) || parent_dev.is_some_and(|d| d != md.dev()))
         }
     }
 }
@@ -736,7 +759,7 @@ pub(crate) const READ_FLAGS: u32 = imp::READ_FLAGS;
 
 #[cfg(all(test, target_os = "macos"))]
 mod mac_tests {
-    use super::imp::{facts_from, off_limits, trash_error, SF_DATALESS};
+    use super::imp::{facts_from, off_limits, trash_error, Mounts, SF_DATALESS};
     use crate::recycle::RecycleError;
 
     #[test]
@@ -755,6 +778,22 @@ mod mac_tests {
         assert!(off_limits(0x0008_0000, true, 1));
         assert!(off_limits(0, false, 1), "not a plain file");
         assert!(off_limits(0, true, 2), "a hard link frees nothing when one name moves");
+    }
+
+    /// Reads only the listing of `/System/Volumes`. The data volume shares `st_dev` with the
+    /// sealed system volume, so only the mount table tells the scan not to enter it again.
+    #[test]
+    fn the_data_volume_seen_from_the_system_volume_is_a_mount_point() {
+        let data = std::path::Path::new("/System/Volumes/Data");
+        if !data.is_dir() {
+            return;
+        }
+        let m = Mounts::new();
+        let e = std::fs::read_dir("/System/Volumes").unwrap().flatten().find(|e| e.path() == data).unwrap();
+        let md = e.metadata().unwrap();
+        assert!(m.crosses(m.device(std::path::Path::new("/System/Volumes")), &e, &md));
+        let users = std::fs::read_dir("/").unwrap().flatten().find(|e| e.file_name() == "Users").unwrap();
+        assert!(!m.crosses(m.device(std::path::Path::new("/")), &users, &users.metadata().unwrap()), "a firmlink is entered");
     }
 
     #[test]

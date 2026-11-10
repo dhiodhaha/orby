@@ -1,6 +1,12 @@
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "macos"))]
+//! Safe to clean on trees made under the test target folder. Nothing here reads the user's own
+//! folders, and suggesting never removes anything.
+
 use app_disk::{safe_to_clean, CleanPlaces, SuggestionKind, Tag};
 use std::fs::{self, File, FileTimes};
+#[cfg(target_os = "macos")]
+use std::os::macos::fs::FileTimesExt;
+#[cfg(windows)]
 use std::os::windows::fs::FileTimesExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -71,12 +77,20 @@ fn downloads_older_than_cutoff_by_newer_of_created_and_modified() {
     assert!(dl.join("old.iso").exists(), "suggesting never removes");
 }
 
-/// A writable handle on a folder, so its times can be set.
+/// A handle on a folder its times can be set through.
+#[cfg(windows)]
 fn open_dir(p: &Path) -> File {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     File::options().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(p).unwrap()
 }
+
+/// A handle on a folder its times can be set through (the owner may, on a read-only handle).
+#[cfg(unix)]
+fn open_dir(p: &Path) -> File {
+    File::open(p).unwrap()
+}
+
 #[test]
 fn temp_items_from_every_temp_folder_biggest_first() {
     let root = fresh("temp");
@@ -92,7 +106,7 @@ fn temp_items_from_every_temp_folder_biggest_first() {
     let got: Vec<_> = t.items.iter().map(|c| (c.path.strip_prefix(&root).unwrap().to_path_buf(), c.size)).collect();
     assert_eq!(
         got,
-        [(PathBuf::from(r"user-temp\sub"), 700), (PathBuf::from(r"win-temp\c.log"), 500), (PathBuf::from(r"user-temp\a.tmp"), 300)]
+        [(PathBuf::from("user-temp/sub"), 700), (PathBuf::from("win-temp/c.log"), 500), (PathBuf::from("user-temp/a.tmp"), 300)]
     );
     assert!(s[0].items.is_empty() && s[2].items.is_empty());
 }

@@ -1,7 +1,10 @@
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "macos"))]
+//! Scans of trees made under the test target folder. Nothing here reads the user's own folders.
+
 use app_disk::{drive_space, scan, Category, NodeKind, ScanError, ScanOptions, ScanStatus, SkipReason, Tree};
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -9,12 +12,58 @@ use std::time::{Duration, SystemTime};
 fn fresh(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("scan").join(name);
     if dir.exists() {
-        // A crashed earlier run may have left a deny rule behind.
-        let _ = Command::new("icacls").arg(&dir).args(["/reset", "/T", "/Q"]).output();
+        // A crashed earlier run may have left a folder unreadable.
+        unlock_all(&dir);
         fs::remove_dir_all(&dir).unwrap();
     }
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Takes away the right to list `dir`, for everyone.
+#[cfg(windows)]
+fn lock(dir: &Path) {
+    let deny = Command::new("icacls").arg(dir).args(["/deny", "*S-1-1-0:(RD)"]).output().unwrap();
+    assert!(deny.status.success(), "{deny:?}");
+}
+
+#[cfg(windows)]
+fn unlock(dir: &Path) {
+    let _ = Command::new("icacls").arg(dir).args(["/remove:d", "*S-1-1-0"]).output();
+}
+
+#[cfg(windows)]
+fn unlock_all(dir: &Path) {
+    let _ = Command::new("icacls").arg(dir).args(["/reset", "/T", "/Q"]).output();
+}
+
+#[cfg(unix)]
+fn lock(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+}
+
+#[cfg(unix)]
+fn unlock(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn unlock_all(dir: &Path) {
+    let _ = std::process::Command::new("chmod").args(["-R", "u+rwx"]).arg(dir).output();
+}
+
+/// A folder link the scan must not follow: a junction on Windows, a symbolic link on macOS.
+#[cfg(windows)]
+fn dir_link(link: &Path, target: &Path) {
+    let out = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+    assert!(out.status.success(), "mklink failed: {out:?}");
+}
+
+#[cfg(unix)]
+fn dir_link(link: &Path, target: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 fn write(path: &Path, bytes: usize) {
@@ -106,13 +155,12 @@ fn paths_round_trip_and_folder_dates_are_newest_in_subtree() {
 }
 
 #[test]
-fn junctions_are_listed_but_not_followed() {
+fn folder_links_are_listed_but_not_followed() {
     let root = fresh("junction");
     write(&root.join("real/big.bin"), 10_000);
     let link = root.join("link");
-    let out = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(root.join("real")).output().unwrap();
-    assert!(out.status.success(), "mklink failed: {out:?}");
-    assert!(link.join("big.bin").exists(), "junction resolves");
+    dir_link(&link, &root.join("real"));
+    assert!(link.join("big.bin").exists(), "the link resolves");
 
     let t = run(&root);
     assert_eq!(t.node(t.root()).size(), 10_000, "bytes behind the junction are counted once");
@@ -121,6 +169,31 @@ fn junctions_are_listed_but_not_followed() {
     assert_eq!(t.node(l).kind(), NodeKind::Link);
     assert!(t.children(l).is_empty());
     assert_eq!(t.node(l).size(), 0);
+}
+
+/// Hidden in Explorer or the Finder: the hidden attribute, or `chflags hidden`.
+fn hide(p: &Path) {
+    #[cfg(windows)]
+    let out = Command::new("attrib").arg("+h").arg(p).output().unwrap();
+    #[cfg(unix)]
+    let out = std::process::Command::new("chflags").arg("hidden").arg(p).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn hidden_items_are_marked() {
+    let root = fresh("hidden");
+    write(&root.join("shown.txt"), 10);
+    write(&root.join("flagged.txt"), 20);
+    hide(&root.join("flagged.txt"));
+    write(&root.join(".dotfile"), 30);
+    let t = run(&root);
+    let hidden = |n: &str| t.node(t.find(&root.join(n)).unwrap()).hidden();
+    assert!(!hidden("shown.txt"));
+    assert!(hidden("flagged.txt"));
+    // A leading dot hides a file on macOS only.
+    assert_eq!(hidden(".dotfile"), cfg!(unix));
+    assert_eq!(t.node(t.root()).size(), 60, "hidden files still count");
 }
 
 fn wide_tree(root: &Path, dirs: usize, files_per_dir: usize) {
@@ -198,10 +271,9 @@ fn access_denied_folders_are_listed_and_the_scan_continues() {
     write(&root.join("open/ok.txt"), 300);
     write(&root.join("private/secret.txt"), 900);
     let private = root.join("private");
-    let deny = Command::new("icacls").arg(&private).args(["/deny", "*S-1-1-0:(RD)"]).output().unwrap();
-    assert!(deny.status.success(), "{deny:?}");
+    lock(&private);
     let t = run(&root);
-    let _ = Command::new("icacls").arg(&private).args(["/remove:d", "*S-1-1-0"]).output();
+    unlock(&private);
 
     assert_eq!(t.status(), ScanStatus::Complete);
     assert_eq!(t.skipped().len(), 1);
@@ -219,10 +291,18 @@ fn unusable_roots_are_typed_errors() {
     let opts = ScanOptions::default();
     assert!(matches!(scan(&root.join("missing"), &opts, |_| {}, &none), Err(ScanError::NotFound)));
     assert!(matches!(scan(&root.join("file.txt"), &opts, |_| {}, &none), Err(ScanError::NotADirectory)));
-    let free_letter = (b'D'..=b'Z').map(|c| format!("{}:\\", c as char)).find(|d| !Path::new(d).exists());
-    if let Some(d) = free_letter {
-        let r = scan(Path::new(&d), &opts, |_| {}, &none);
-        assert!(matches!(r, Err(ScanError::NotFound | ScanError::NotReady)), "{d}: {r:?}");
+    #[cfg(windows)]
+    {
+        let free_letter = (b'D'..=b'Z').map(|c| format!("{}:\\", c as char)).find(|d| !Path::new(d).exists());
+        if let Some(d) = free_letter {
+            let r = scan(Path::new(&d), &opts, |_| {}, &none);
+            assert!(matches!(r, Err(ScanError::NotFound | ScanError::NotReady)), "{d}: {r:?}");
+        }
+    }
+    #[cfg(unix)]
+    {
+        let r = scan(Path::new("/Volumes/app-disk-test-no-such-volume"), &opts, |_| {}, &none);
+        assert!(matches!(r, Err(ScanError::NotFound)), "{r:?}");
     }
 }
 
