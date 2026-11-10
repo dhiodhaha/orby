@@ -318,7 +318,8 @@ pub fn badge_count(app: &App) -> usize {
     }
 }
 
-/// One timer: a paced or cooling pill, a waiting notice going stale, midnight, or a pause ending.
+/// One timer: a paced or cooling pill, a waiting notice going stale, midnight, a pause ending, or
+/// the next minute of the prayer countdown on screen (only while that pill shows).
 fn arm(app: &mut App) {
     let now = clock();
     let mut ms: Option<u64> = None;
@@ -326,6 +327,12 @@ fn arm(app: &mut App) {
     if app.pill.is_none() && !panel_shown(app) {
         if let Some(w) = app.notices.q.wait_ms(now, unix_now()) {
             take(w);
+        }
+    }
+    if app.pill.is_some() && !app.pill_closing {
+        if let Some(d) = app.notices.q.countdown_wait(now.at) {
+            // The clock reads whole seconds: a little after the second it changes.
+            take(d.as_millis() as u64 + 100);
         }
     }
     if let Some(at) = app.notices.q.next_change(now.at) {
@@ -361,7 +368,18 @@ pub fn on_timer(app: &mut App) {
         pump(app);
         return;
     }
+    countdown(app);
     pump(app);
+}
+
+/// The prayer countdown on screen: new words in place, no enter, no change of place in line.
+fn countdown(app: &mut App) {
+    if app.pill.is_none() || app.pill_closing {
+        return;
+    }
+    if let Some(p) = app.notices.q.countdown_tick(habits::now()) {
+        pill::update_pill(app, p);
+    }
 }
 
 // ---- quiet times ----
@@ -647,12 +665,13 @@ pub fn stack_action(app: &mut App, id: u64) {
 // ---- sources: small builders the callers share ----
 
 /// "30 menit lagi Isya" and "10 menit lagi Isya": they pass every quiet time except presenting,
-/// and are dropped rather than shown late. `sticky`: it stays until you close it.
+/// and are dropped rather than shown late. `sticky`: it stays until you close it, counting the
+/// minutes down ("9 menit lagi Isya", then "Isya sebentar lagi").
 pub fn prayer_before(prayer: &str, at: Moment, p: Pill, sticky: bool) -> Notice {
     let n =
         Notice::new(Source::Prayer, Priority::Normal, p).before_prayer(prayer, at, habits::now());
     if sticky {
-        n.sticky()
+        n.sticky().counting_down()
     } else {
         n
     }

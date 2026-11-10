@@ -3,9 +3,9 @@
 //! rows, files and types, the squarified treemap, and the confirm sheet's list.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use app_disk::{Category, DriveSpace, NodeId, NodeKind, ScanError, Tree, TypeShare};
 
@@ -980,6 +980,296 @@ mod cleaning {
     }
 }
 
+// ---- duplicates ----
+
+/// Folders whose copy is never preferred as the keeper while another copy lives elsewhere.
+const PASSING_THROUGH: [&str; 3] = ["Downloads", "Temp", "Desktop"];
+
+/// In Downloads, Temp or Desktop (any folder of that name on the way).
+pub fn passing_through(p: &Path) -> bool {
+    p.components().any(|c| {
+        let n = c.as_os_str().to_string_lossy();
+        PASSING_THROUGH.iter().any(|t| t.eq_ignore_ascii_case(&n))
+    })
+}
+
+/// One copy of a duplicated file. `gone` once it was moved to the Recycle Bin (from here or
+/// from Results), until Undo puts it back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DupeCopy {
+    pub path: PathBuf,
+    pub modified: Option<SystemTime>,
+    pub gone: bool,
+}
+
+/// One group of identical files with its keeper and what is picked for removal. The keeper is
+/// always a copy that is still there and is never picked, so a group can never have every copy
+/// picked: every way to change the picks goes through the methods below.
+#[derive(Clone, Debug)]
+pub struct DupeSet {
+    pub size: u64,
+    pub copies: Vec<DupeCopy>,
+    keep: usize,
+    picked: BTreeSet<usize>,
+}
+
+/// The copy to keep: not in Downloads, Temp or Desktop when another copy lives elsewhere, then
+/// the oldest, then the first by path. Only copies still there count.
+pub fn default_keeper(copies: &[DupeCopy]) -> usize {
+    (0..copies.len())
+        .filter(|&i| !copies[i].gone)
+        .min_by(|&a, &b| {
+            let (x, y) = (&copies[a], &copies[b]);
+            passing_through(&x.path)
+                .cmp(&passing_through(&y.path))
+                .then_with(|| match (x.modified, y.modified) {
+                    (Some(p), Some(q)) => p.cmp(&q),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| x.path.cmp(&y.path))
+        })
+        .unwrap_or(0)
+}
+
+impl DupeSet {
+    pub fn new(size: u64, copies: Vec<DupeCopy>) -> DupeSet {
+        let keep = default_keeper(&copies);
+        DupeSet {
+            size,
+            copies,
+            keep,
+            picked: BTreeSet::new(),
+        }
+    }
+
+    pub fn live(&self) -> usize {
+        self.copies.iter().filter(|c| !c.gone).count()
+    }
+
+    /// Two or more copies still there: the group shows.
+    pub fn shown(&self) -> bool {
+        self.live() >= 2
+    }
+
+    pub fn keeper(&self) -> usize {
+        self.keep
+    }
+
+    pub fn is_picked(&self, i: usize) -> bool {
+        self.picked.contains(&i)
+    }
+
+    pub fn picked(&self) -> impl Iterator<Item = usize> + '_ {
+        self.picked.iter().copied()
+    }
+
+    /// (live - 1) × size.
+    pub fn reclaimable(&self) -> u64 {
+        self.size * (self.live() as u64).saturating_sub(1)
+    }
+
+    /// One click: this copy stays. A copy that is gone cannot be the keeper.
+    pub fn set_keeper(&mut self, i: usize) -> bool {
+        if self.copies.get(i).is_none_or(|c| c.gone) {
+            return false;
+        }
+        self.keep = i;
+        self.picked.remove(&i);
+        true
+    }
+
+    /// Picks or unpicks a copy. The keeper and copies that are gone never toggle.
+    pub fn toggle(&mut self, i: usize) -> bool {
+        if i == self.keep || self.copies.get(i).is_none_or(|c| c.gone) {
+            return false;
+        }
+        if !self.picked.remove(&i) {
+            self.picked.insert(i);
+        }
+        true
+    }
+
+    /// Every copy but the keeper, or none.
+    pub fn pick_extras(&mut self, on: bool) {
+        self.picked = if on && self.shown() {
+            (0..self.copies.len())
+                .filter(|&i| i != self.keep && !self.copies[i].gone)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+    }
+
+    pub fn all_extras_picked(&self) -> bool {
+        self.shown() && self.picked.len() + 1 == self.live()
+    }
+
+    /// Copies moved to the Recycle Bin (`gone`) or put back, on their own or with a folder that
+    /// holds them. A keeper that went gets a new one by the rule; picks never outlive their copy.
+    pub fn mark(&mut self, paths: &[PathBuf], gone: bool) {
+        for c in &mut self.copies {
+            if paths.iter().any(|p| c.path.starts_with(p)) {
+                c.gone = gone;
+            }
+        }
+        let copies = &self.copies;
+        self.picked.retain(|&i| !copies[i].gone);
+        if self.copies[self.keep].gone {
+            self.keep = default_keeper(&self.copies);
+            self.picked.remove(&self.keep);
+        }
+        if !self.shown() {
+            self.picked.clear();
+        }
+    }
+}
+
+/// The groups a check found, most to reclaim first (the check's order, kept while copies go).
+#[derive(Clone, Debug, Default)]
+pub struct DupeList {
+    pub sets: Vec<DupeSet>,
+}
+
+impl DupeList {
+    pub fn new(groups: &[app_disk::DupeGroup]) -> DupeList {
+        DupeList {
+            sets: groups
+                .iter()
+                .map(|g| {
+                    let copies = g
+                        .files
+                        .iter()
+                        .map(|f| DupeCopy {
+                            path: f.path.clone(),
+                            modified: f.modified,
+                            gone: false,
+                        })
+                        .collect();
+                    DupeSet::new(g.size, copies)
+                })
+                .collect(),
+        }
+    }
+
+    /// Indexes of the groups that show (two or more copies still there).
+    pub fn shown(&self) -> Vec<usize> {
+        (0..self.sets.len())
+            .filter(|&i| self.sets[i].shown())
+            .collect()
+    }
+
+    pub fn reclaimable(&self) -> u64 {
+        self.sets.iter().map(DupeSet::reclaimable).sum()
+    }
+
+    /// Picked copies and their bytes.
+    pub fn selection(&self) -> (usize, u64) {
+        self.sets.iter().fold((0, 0), |(n, b), s| {
+            let k = s.picked.len();
+            (n + k, b + k as u64 * s.size)
+        })
+    }
+
+    pub fn pick_extras(&mut self, on: bool) {
+        for s in &mut self.sets {
+            s.pick_extras(on);
+        }
+    }
+
+    pub fn all_extras_picked(&self) -> bool {
+        let shown = self.shown();
+        !shown.is_empty() && shown.iter().all(|&i| self.sets[i].all_extras_picked())
+    }
+
+    /// What the confirm moves: (copy, size, the copy that stays).
+    pub fn removals(&self) -> Vec<(PathBuf, u64, PathBuf)> {
+        self.sets
+            .iter()
+            .flat_map(|s| {
+                let keep = s.copies[s.keep].path.clone();
+                s.picked()
+                    .map(move |i| (s.copies[i].path.clone(), s.size, keep.clone()))
+            })
+            .collect()
+    }
+
+    pub fn mark(&mut self, paths: &[PathBuf], gone: bool) {
+        for s in &mut self.sets {
+            s.mark(paths, gone);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.pick_extras(false);
+    }
+}
+
+/// The running check's stage, as a verb with an ellipsis.
+pub fn dupe_stage_words(stage: app_disk::DupeStage) -> &'static str {
+    match stage {
+        app_disk::DupeStage::Sizes => "Matching sizes…",
+        app_disk::DupeStage::Ends => "Comparing the start and end of each file…",
+        app_disk::DupeStage::Contents => "Comparing whole files…",
+    }
+}
+
+/// "1,204 of 3,400 files · 1.2 GB of 4.5 GB", and how far along the bar is.
+pub fn dupe_progress_words(p: &app_disk::DupeProgress) -> (String, f32) {
+    let files = format!(
+        "{} of {}",
+        count(p.files_done),
+        plural(p.files_total, "file", "files")
+    );
+    let frac = if p.bytes_total > 0 {
+        p.bytes_done as f32 / p.bytes_total as f32
+    } else if p.files_total > 0 {
+        p.files_done as f32 / p.files_total as f32
+    } else {
+        0.0
+    };
+    if p.bytes_total > 0 {
+        (
+            format!(
+                "{files} · {} of {}",
+                short_size(p.bytes_done),
+                short_size(p.bytes_total)
+            ),
+            frac.clamp(0.0, 1.0),
+        )
+    } else {
+        (files, frac.clamp(0.0, 1.0))
+    }
+}
+
+/// One decimal with ".0" dropped, as the Disk window shows sizes.
+fn short_size(bytes: u64) -> String {
+    size(bytes).replacen(".0 ", " ", 1)
+}
+
+/// "3 copies · 1.2 GB to reclaim".
+pub fn dupe_group_words(copies: usize, reclaimable: u64) -> String {
+    format!(
+        "{} · {} to reclaim",
+        plural(copies as u64, "copy", "copies"),
+        short_size(reclaimable)
+    )
+}
+
+/// What a check costs, honestly and roughly: by drive type, not a timer.
+pub fn dupe_cost_words(kind: Option<app_disk::DriveKind>) -> &'static str {
+    match kind {
+        Some(app_disk::DriveKind::Ssd) => {
+            "Reads files to compare them. On this SSD it usually takes under a minute."
+        }
+        Some(app_disk::DriveKind::Hdd) => {
+            "Reads files to compare them. On this hard drive it can take minutes."
+        }
+        _ => "Reads files to compare them. SSD: usually under a minute · hard drive: can take minutes.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,5 +1726,176 @@ mod tests {
         );
         assert_eq!(file_label(OsStr::new("x.TMP")), Some("Unfinished download"));
         assert_eq!(file_label(OsStr::new("Win11.iso")), None);
+    }
+
+    fn copy(path: &str, days_old: u64) -> DupeCopy {
+        DupeCopy {
+            path: PathBuf::from(path),
+            modified: Some(
+                std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000 - days_old * 86_400),
+            ),
+            gone: false,
+        }
+    }
+
+    #[test]
+    fn the_keeper_is_the_oldest_copy_outside_downloads_temp_and_desktop() {
+        let s = DupeSet::new(
+            10,
+            vec![
+                copy(r"C:\Users\me\Downloads\movie.mp4", 900),
+                copy(r"C:\Users\me\Videos\movie.mp4", 30),
+                copy(r"D:\Backup\movie.mp4", 200),
+            ],
+        );
+        assert_eq!(s.keeper(), 2, "the oldest copy outside Downloads");
+        let s = DupeSet::new(
+            10,
+            vec![
+                copy(r"C:\Users\me\Desktop\a.zip", 5),
+                copy(r"C:\Users\me\AppData\Local\Temp\a.zip", 9),
+            ],
+        );
+        assert_eq!(s.keeper(), 1, "all passing through: the oldest");
+        assert!(passing_through(Path::new(r"C:\Users\me\downloads\x")));
+        assert!(!passing_through(Path::new(r"C:\Users\me\Downloads2\x")));
+    }
+
+    #[test]
+    fn nothing_is_picked_until_you_pick_and_the_keeper_never_is() {
+        let mut s = DupeSet::new(
+            10,
+            vec![copy(r"C:\a", 3), copy(r"C:\b", 2), copy(r"C:\c", 1)],
+        );
+        assert_eq!(s.picked().count(), 0);
+        assert_eq!(s.keeper(), 0);
+        assert!(!s.toggle(0), "the keeper does not tick");
+        s.pick_extras(true);
+        assert_eq!(s.picked().collect::<Vec<_>>(), [1, 2]);
+        assert!(s.all_extras_picked());
+        // One click on another copy makes it the keeper and unpicks it.
+        assert!(s.set_keeper(2));
+        assert_eq!(s.picked().collect::<Vec<_>>(), [1]);
+        assert_eq!(s.reclaimable(), 20);
+    }
+
+    #[test]
+    fn a_group_can_never_have_every_copy_picked() {
+        // Every operation in every order, on groups of two to four copies, some going and coming
+        // back: the keeper is always a live copy and never picked.
+        let mut seed = 7u64;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % n
+        };
+        for size in 2..=4 {
+            let paths: Vec<PathBuf> = (0..size)
+                .map(|i| PathBuf::from(format!(r"C:\f{i}")))
+                .collect();
+            let mut s = DupeSet::new(
+                1,
+                paths
+                    .iter()
+                    .map(|p| DupeCopy {
+                        path: p.clone(),
+                        modified: None,
+                        gone: false,
+                    })
+                    .collect(),
+            );
+            for _ in 0..2_000 {
+                let i = next(size);
+                match next(6) {
+                    0 => {
+                        s.toggle(i);
+                    }
+                    1 => {
+                        s.set_keeper(i);
+                    }
+                    2 => s.pick_extras(true),
+                    3 => s.pick_extras(false),
+                    4 => s.mark(&[paths[i].clone()], true),
+                    _ => s.mark(&[paths[i].clone()], false),
+                }
+                let live = s.live();
+                assert!(!s.is_picked(s.keeper()), "the keeper is never picked");
+                assert!(
+                    live == 0 || !s.copies[s.keeper()].gone,
+                    "the keeper is still there"
+                );
+                assert!(
+                    s.picked().count() < live.max(1),
+                    "at least one copy stays: {} of {live}",
+                    s.picked().count()
+                );
+                assert!(s.picked().all(|k| !s.copies[k].gone));
+            }
+        }
+    }
+
+    #[test]
+    fn removals_name_the_copy_that_stays_and_moved_copies_leave_the_group() {
+        let groups = vec![app_disk::DupeGroup {
+            size: 100,
+            files: ["a", "b", "c"]
+                .iter()
+                .map(|n| app_disk::DupeFile {
+                    path: PathBuf::from(format!(r"C:\{n}")),
+                    size: 100,
+                    modified: None,
+                })
+                .collect(),
+        }];
+        let mut l = DupeList::new(&groups);
+        assert_eq!(l.selection(), (0, 0));
+        l.pick_extras(true);
+        assert_eq!(l.selection(), (2, 200));
+        assert!(l
+            .removals()
+            .iter()
+            .all(|(p, _, keep)| keep == &PathBuf::from(r"C:\a") && p != keep));
+        l.mark(&[PathBuf::from(r"C:\b")], true);
+        assert_eq!(l.reclaimable(), 100);
+        assert_eq!(l.selection(), (1, 100));
+        l.mark(&[PathBuf::from(r"C:\c")], true);
+        assert!(l.shown().is_empty(), "one copy left is not a duplicate");
+        assert_eq!(l.selection(), (0, 0));
+        l.mark(&[PathBuf::from(r"C:\b")], false);
+        assert_eq!(l.shown(), [0], "Undo brings the group back");
+        // A folder moved from Results takes the copies inside it along.
+        let mut l = DupeList::new(&[app_disk::DupeGroup {
+            size: 5,
+            files: [r"C:\Videos\x.mp4", r"D:\Backup\x.mp4"]
+                .iter()
+                .map(|p| app_disk::DupeFile {
+                    path: PathBuf::from(p),
+                    size: 5,
+                    modified: None,
+                })
+                .collect(),
+        }]);
+        l.mark(&[PathBuf::from(r"C:\Videos")], true);
+        assert!(l.shown().is_empty());
+    }
+
+    #[test]
+    fn duplicate_words_read_plainly() {
+        assert_eq!(
+            dupe_group_words(3, 1288490188),
+            "3 copies · 1.2 GB to reclaim"
+        );
+        assert_eq!(dupe_group_words(2, 3 << 30), "2 copies · 3 GB to reclaim");
+        let (line, frac) = dupe_progress_words(&app_disk::DupeProgress {
+            stage: app_disk::DupeStage::Contents,
+            files_done: 1204,
+            files_total: 3400,
+            bytes_done: 1 << 30,
+            bytes_total: 4 << 30,
+        });
+        assert_eq!(line, "1,204 of 3,400 files · 1 GB of 4 GB");
+        assert!((frac - 0.25).abs() < 1e-6);
+        assert!(dupe_stage_words(app_disk::DupeStage::Ends).ends_with('…'));
     }
 }

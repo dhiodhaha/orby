@@ -2,8 +2,9 @@
 //! The Disk window, Disk v2 (Doop page "v6.3 · Foundation + Disk v2", frames 02 to 06): the drive
 //! list, Results (headline, capacity bar by top-level folder, treemap, folder list, detail strip)
 //! that also shows a scan live under a veil, Files and Types, Safe to clean with its groups,
-//! filter chips and selection bar, a suggestion's Review list, the state cards and the grouped
-//! confirm sheet, under a title band with the close button. Pure drawing and hit testing over a
+//! filter chips and selection bar, a suggestion's Review list, Duplicates (groups of identical
+//! files with a keeper each), the state cards and the grouped confirm sheet, under a title band
+//! with the close button. Pure drawing and hit testing over a
 //! `View` that disk.rs builds; the moving parts arrive already eased in `View::motion`.
 
 use windows::core::Interface;
@@ -53,6 +54,14 @@ const MINI_W: f32 = 56.0;
 const CLEAN_TOP: f32 = 84.0;
 const CLEAN_ROW: f32 = 42.0;
 const REVIEW_TOP: f32 = 80.0;
+/// Duplicates: the list starts under the line with "Select all extra copies".
+const DUPES_TOP: f32 = 92.0;
+const DUPE_HEAD: f32 = 32.0;
+/// The keep column and the date column, from the right of a copy's row.
+const KEEP_W: f32 = 76.0;
+const DATE_W: f32 = 84.0;
+/// The Start screen's "Also find duplicate files" row.
+const OPTION_H: f32 = 44.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -225,6 +234,11 @@ pub struct CleanView {
 pub struct ReviewView {
     pub title: String,
     pub sub: String,
+    /// Every item in the list.
+    pub len: usize,
+    /// The rows from `rows_from` on, as many as can show (`REVIEW_WINDOW`): a review of temp
+    /// files can list thousands, and only these are ever drawn.
+    pub rows_from: usize,
     pub rows: Vec<FileRow>,
     pub first: usize,
     pub selected: Option<(String, String)>,
@@ -253,6 +267,68 @@ pub struct ConfirmView {
     pub on_move: bool,
 }
 
+/// One copy of a duplicated file.
+pub struct DupeRowView {
+    /// The full path (cut in the middle when drawn).
+    pub path: String,
+    /// "6 Nov 2025".
+    pub date: String,
+    pub keep: bool,
+    pub checked: bool,
+}
+
+/// One group of copies. A check can find thousands of groups, so disk.rs fills `name`, `sub`
+/// and `rows` only for the groups that reach into the list's window (`DUPES_WINDOW` entries
+/// from `first`); every other group carries only its row count.
+#[derive(Default)]
+pub struct DupeGroupView {
+    /// The copies still there (the group's rows, whether filled or not).
+    pub len: usize,
+    /// The file's name, from the first copy.
+    pub name: String,
+    /// "3 copies · 1.2 GB to reclaim".
+    pub sub: String,
+    pub rows: Vec<DupeRowView>,
+}
+
+pub enum DupesBody {
+    /// Before a check (or after Stop): stage 1's estimate and Check now (`check`).
+    Offer {
+        title: String,
+        body: String,
+        cost: &'static str,
+        check: bool,
+    },
+    /// "Comparing whole files…", "1,204 of 3,400 files · 1.2 GB of 4.5 GB", and the bar.
+    Running {
+        stage: &'static str,
+        line: String,
+        frac: f32,
+    },
+    Groups(Vec<DupeGroupView>),
+    /// A check that found nothing (or nothing is left).
+    Empty {
+        title: String,
+        body: String,
+    },
+}
+
+pub struct DupesView {
+    /// "C:, from the 09:12 scan".
+    pub place: String,
+    /// "1.2 GB" with " to reclaim", or "up to 4.1 GB" with " possible".
+    pub total: String,
+    pub total_label: &'static str,
+    /// "12 groups · 3 skipped".
+    pub sub: String,
+    pub body: DupesBody,
+    pub first: usize,
+    pub selected: Option<(String, String)>,
+    /// Every extra copy is picked: the chip reads "Select none".
+    pub all: bool,
+    pub can_recycle: bool,
+}
+
 pub struct Card {
     pub icon: Icon,
     pub ember: bool,
@@ -264,10 +340,12 @@ pub struct Card {
 // Built once per frame and never stored, so the big Results variant costs nothing to keep inline.
 #[allow(clippy::large_enum_variant)]
 pub enum Screen {
-    Start(Vec<DriveRow>),
+    /// The drives, and whether "Also find duplicate files" is ticked.
+    Start(Vec<DriveRow>, bool),
     Results(ResultsView),
     Clean(CleanView),
     Review(ReviewView),
+    Dupes(DupesView),
 }
 
 /// What is lit while the pointer rests on something: the others fade to 0.3.
@@ -341,6 +419,8 @@ pub struct Fit {
     pub review: usize,
     /// Safe to clean entries (headers and rows) that fit.
     pub clean: usize,
+    /// Duplicates entries (group headings and copies) that fit.
+    pub dupes: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -381,6 +461,18 @@ pub enum Hit {
     Sheet,
     /// The title band's close button.
     Close,
+    /// Duplicates in the Results header.
+    OpenDupes,
+    /// "Also find duplicate files" on the drive list.
+    DupesOption,
+    DupesCheck,
+    DupesStop,
+    /// "Select all extra copies" (or none).
+    DupesAll,
+    /// A copy's row, its checkbox and its keep column, by shown group and copy.
+    DupeRow(usize, usize),
+    DupeCheck(usize, usize),
+    DupeKeep(usize, usize),
 }
 
 fn inside(r: &Rect, x: f32, y: f32) -> bool {
@@ -483,27 +575,70 @@ fn big_text(
     }
 }
 
-/// Cuts the middle out of a path so its drive and its last folders both show.
+/// Cuts the middle out of a path so its drive and its last folders both show: the longest cut
+/// (most characters kept, a third of them from the start) that fits `w`.
+///
+/// A cut that keeps one more character is never narrower, so the longest fit is found by a
+/// binary search: about 8 measurements for a long path instead of one per character dropped.
 pub fn middle_cut(s: &str, w: f32, measure: impl Fn(&str) -> f32) -> String {
     if measure(s) <= w {
         return s.to_string();
     }
     let chars: Vec<char> = s.chars().collect();
-    let mut keep = chars.len();
-    while keep > 2 {
-        keep -= 1;
+    let cut = |keep: usize| -> String {
         let head = keep / 3;
         let tail = keep - head;
-        let cut: String = chars[..head]
+        chars[..head]
             .iter()
             .chain(std::iter::once(&'…'))
             .chain(chars[chars.len() - tail..].iter())
-            .collect();
-        if measure(&cut) <= w {
-            return cut;
+            .collect()
+    };
+    // Keeps 2..len-1 are the candidates; find the largest that fits.
+    let (mut lo, mut hi) = (2usize, chars.len());
+    let mut best = None;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let c = cut(mid);
+        if measure(&c) <= w {
+            best = Some(c);
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
-    "…".into()
+    best.unwrap_or_else(|| "…".into())
+}
+
+thread_local! {
+    /// Cut paths by (path, room, format), so a list that scrolls measures each path once
+    /// instead of every frame. Widths are in DIPs, which do not change with the DPI.
+    static CUTS: std::cell::RefCell<std::collections::HashMap<(String, u32, usize, u32), String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `middle_cut` measured in `fmt`, remembered per path, room and format.
+fn cut_path(g: &Shared, s: &str, w: f32, fmt: &IDWriteTextFormat) -> String {
+    let size = unsafe { fmt.GetFontSize() };
+    let key = (
+        s.to_string(),
+        w.to_bits(),
+        fmt.as_raw() as usize,
+        size.to_bits(),
+    );
+    if let Some(c) = CUTS.with(|m| m.borrow().get(&key).cloned()) {
+        return c;
+    }
+    let c = middle_cut(s, w, |x| g.text_width(x, fmt));
+    CUTS.with(|m| {
+        let mut m = m.borrow_mut();
+        // Bounded: a long session's paths never pile up.
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(key, c.clone());
+    });
+    c
 }
 
 thread_local! {
@@ -522,18 +657,29 @@ fn tag_font(g: &Shared, f: &Fonts) -> IDWriteTextFormat {
 
 // ---- heights ----
 
+/// The "Also find duplicate files" row, under the drives.
+fn option_top(n: usize) -> f32 {
+    52.0 + n as f32 * 60.0 + 4.0
+}
+
+/// Scan a folder and Safe to clean, under the option row.
+fn start_buttons_y(n: usize) -> f32 {
+    option_top(n) + OPTION_H + 12.0
+}
+
 fn start_h(n: usize) -> f32 {
-    52.0 + n as f32 * 60.0 + 12.0 + 28.0 + 16.0
+    start_buttons_y(n) + 28.0 + 16.0
 }
 
 /// The least each screen needs above the cards. The list screens stretch past it to fill the
 /// window; the drive list keeps its own height.
 fn min_body(v: &View) -> f32 {
     match &v.screen {
-        Screen::Start(d) => start_h(d.len()),
+        Screen::Start(d, _) => start_h(d.len()),
         Screen::Results(_) => results_min(),
         Screen::Clean(_) => CLEAN_TOP + 6.0 * CLEAN_ROW + BAR_H,
         Screen::Review(_) => REVIEW_TOP + MIN_ROWS as f32 * FILE_ROW + 8.0 + BAR_H,
+        Screen::Dupes(_) => DUPES_TOP + MIN_ROWS as f32 * FILE_ROW + 8.0 + BAR_H,
     }
 }
 
@@ -568,6 +714,10 @@ fn folder_rows(b: f32) -> usize {
     (((b - BAR_H - 4.0 - BODY_Y - LIST_HEAD) / ROW).floor() as usize).max(MIN_ROWS + 1) - 1
 }
 
+/// More folder rows than the list can show at the full height: the window disk.rs puts words
+/// in.
+pub const FOLDER_WINDOW: usize = ((H - TOP - BODY_Y - LIST_HEAD) / ROW) as usize + 1;
+
 /// The treemap's rectangle: as tall as the list header, the rows and the tail row beside it.
 fn map_at(b: f32) -> Rect {
     (
@@ -594,6 +744,10 @@ fn bar_top(b: f32) -> f32 {
 fn files_rows(b: f32) -> usize {
     (((bar_top(b) - 8.0 - BODY_Y) / FILE_ROW).floor() as usize).max(1)
 }
+
+/// The most Review rows the list can show at once (at the full height): the window disk.rs
+/// fills rows for.
+pub const REVIEW_WINDOW: usize = ((H - TOP - REVIEW_TOP) / FILE_ROW) as usize + 1;
 
 fn review_rows(b: f32) -> usize {
     (((bar_top(b) - 8.0 - REVIEW_TOP) / FILE_ROW).floor() as usize).max(1)
@@ -653,6 +807,87 @@ fn clean_visible(c: &CleanView, b: f32) -> Vec<(Entry, f32)> {
     out
 }
 
+/// Duplicates, one entry of its scrolling list.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DupeEntry {
+    Group(usize),
+    /// Shown group, copy.
+    Row(usize, usize),
+}
+
+/// The most Duplicates entries the list can show at once (all headings at the full height),
+/// plus one: the window disk.rs fills rows for.
+pub const DUPES_WINDOW: usize = ((H - TOP - DUPES_TOP) / DUPE_HEAD) as usize + 2;
+
+/// Every entry of the Duplicates list, in order (none before a check has found groups),
+/// without collecting them: the list can run to thousands.
+pub fn dupe_entry_iter(d: &DupesView) -> impl Iterator<Item = DupeEntry> + '_ {
+    dupe_entries_from(d, 0)
+}
+
+/// The entries from `first` on, skipping whole groups to get there.
+fn dupe_entries_from(d: &DupesView, first: usize) -> impl Iterator<Item = DupeEntry> + '_ {
+    let groups: &[DupeGroupView] = match &d.body {
+        DupesBody::Groups(groups) => groups,
+        _ => &[],
+    };
+    let mut skip = first;
+    let mut start = groups.len();
+    for (gi, g) in groups.iter().enumerate() {
+        if skip < 1 + g.len {
+            start = gi;
+            break;
+        }
+        skip -= 1 + g.len;
+    }
+    groups[start..]
+        .iter()
+        .enumerate()
+        .flat_map(move |(k, g)| {
+            let gi = start + k;
+            std::iter::once(DupeEntry::Group(gi))
+                .chain((0..g.len).map(move |r| DupeEntry::Row(gi, r)))
+        })
+        .skip(skip)
+}
+
+/// Every entry of the Duplicates list, in order.
+#[cfg(test)]
+pub fn dupe_entries(d: &DupesView) -> Vec<DupeEntry> {
+    dupe_entry_iter(d).collect()
+}
+
+/// How many entries the Duplicates list has (headings and copies).
+pub fn dupe_entry_count(d: &DupesView) -> usize {
+    match &d.body {
+        DupesBody::Groups(groups) => groups.iter().map(|g| 1 + g.len).sum(),
+        _ => 0,
+    }
+}
+
+fn dupe_entry_h(e: DupeEntry) -> f32 {
+    match e {
+        DupeEntry::Group(_) => DUPE_HEAD,
+        DupeEntry::Row(..) => FILE_ROW,
+    }
+}
+
+/// The visible entries from `first`, each with its top.
+fn dupe_visible(d: &DupesView, b: f32) -> Vec<(DupeEntry, f32)> {
+    let bottom = bar_top(b) - 4.0;
+    let mut y = DUPES_TOP;
+    let mut out = Vec::new();
+    for e in dupe_entries_from(d, d.first) {
+        let h = dupe_entry_h(e);
+        if y + h > bottom {
+            break;
+        }
+        out.push((e, y));
+        y += h;
+    }
+    out
+}
+
 fn clean_fit(b: f32) -> usize {
     (((bar_top(b) - 4.0 - CLEAN_TOP) / CLEAN_ROW).floor() as usize).max(1)
 }
@@ -667,6 +902,10 @@ pub fn fit(g: &Shared, f: &Fonts, v: &View) -> Fit {
         clean: match &v.screen {
             Screen::Clean(c) => clean_visible(c, b).len().max(1),
             _ => clean_fit(b),
+        },
+        dupes: match &v.screen {
+            Screen::Dupes(d) => dupe_visible(d, b).len().max(1),
+            _ => 1,
         },
     }
 }
@@ -754,7 +993,7 @@ fn start_rects(g: &Shared, f: &Fonts, n: usize) -> Vec<(Hit, Rect)> {
         let t = 52.0 + i as f32 * 60.0;
         out.push((Hit::ScanDrive(i), (X0, t, X1, t + 56.0)));
     }
-    let y = 52.0 + n as f32 * 60.0 + 12.0;
+    let y = start_buttons_y(n);
     let w1 = quiet_w(g, f, "Scan a folder", true);
     out.insert(0, (Hit::ScanFolder, (X0, y, X0 + w1, y + 28.0)));
     let w2 = quiet_w(g, f, "Safe to clean", true);
@@ -765,6 +1004,8 @@ fn start_rects(g: &Shared, f: &Fonts, n: usize) -> Vec<(Hit, Rect)> {
             (X0 + w1 + 8.0, y, X0 + w1 + 8.0 + w2, y + 28.0),
         ),
     );
+    let o = option_top(n);
+    out.push((Hit::DupesOption, (X0 - 8.0, o, X1 + 8.0, o + OPTION_H)));
     out
 }
 
@@ -783,12 +1024,13 @@ fn header_buttons(g: &Shared, f: &Fonts, live: bool) -> Vec<(Hit, Rect)> {
     }
     let w1 = quiet_w(g, f, "Scan again", true);
     let w2 = quiet_w(g, f, "Safe to clean", true);
+    let w3 = quiet_w(g, f, "Duplicates", true);
+    let x2 = X1 - w1 - 4.0;
+    let x3 = x2 - w2 - 4.0;
     vec![
         (Hit::ScanAgain, (X1 - w1, 18.0, X1, 46.0)),
-        (
-            Hit::OpenClean,
-            (X1 - w1 - 4.0 - w2, 18.0, X1 - w1 - 4.0, 46.0),
-        ),
+        (Hit::OpenClean, (x2 - w2, 18.0, x2, 46.0)),
+        (Hit::OpenDupes, (x3 - w3, 18.0, x3, 46.0)),
     ]
 }
 
@@ -1042,9 +1284,96 @@ fn review_rects(r: &ReviewView, g: &Shared, f: &Fonts, v: &View, b: f32) -> Vec<
     ];
     let aw = g.text_width(if r.all { "Select none" } else { "Select all" }, &f.small) + 12.0;
     out.push((Hit::SelectAll, (X1 - aw, 50.0, X1, 70.0)));
-    for (k, i) in (r.first..r.rows.len().min(r.first + review_rows(b))).enumerate() {
+    for (k, i) in (r.first..r.len.min(r.first + review_rows(b))).enumerate() {
         let top = REVIEW_TOP + k as f32 * FILE_ROW;
         out.push((Hit::File(i), (X0 - 8.0, top, X1 + 8.0, top + ROW)));
+    }
+    out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion)));
+    out
+}
+
+/// "Select all extra copies" in the filter-chip style, right aligned under the header.
+fn dupes_all_rect(g: &Shared, f: &Fonts, d: &DupesView) -> Rect {
+    let w = g.text_width(dupes_all_label(d), &f.small_medium) + 24.0;
+    (X1 - w, 56.0, X1, 84.0)
+}
+
+fn dupes_all_label(d: &DupesView) -> &'static str {
+    if d.all {
+        "Select none"
+    } else {
+        "Select all extra copies"
+    }
+}
+
+/// The card that holds the estimate, the running check or the empty result: its rect, the
+/// text's left edge and width.
+fn dupes_block(g: &Shared, f: &Fonts, d: &DupesView) -> Option<(Rect, f32, f32)> {
+    let tx = X0 + 56.0;
+    let tw = X1 - 16.0 - tx;
+    let y1 = DUPES_TOP + 16.0 + 24.0;
+    let bottom = match &d.body {
+        DupesBody::Offer {
+            body, cost, check, ..
+        } => {
+            let y2 = y1 + wrap_h(g, body, &f.small_wrap, tw) + 6.0;
+            let y3 = y2 + wrap_h(g, cost, &f.small_wrap, tw);
+            if *check {
+                y3 + 14.0 + 28.0 + 16.0
+            } else {
+                y3 + 16.0
+            }
+        }
+        DupesBody::Running { .. } => y1 + 16.0 + 16.0 + 16.0,
+        DupesBody::Empty { body, .. } => y1 + wrap_h(g, body, &f.small_wrap, tw) + 16.0,
+        DupesBody::Groups(_) => return None,
+    };
+    Some(((X0, DUPES_TOP, X1, bottom), tx, tw))
+}
+
+/// Check now (under the estimate) or Stop (top right of the running card).
+fn dupes_block_button(g: &Shared, f: &Fonts, d: &DupesView) -> Option<(Hit, Rect)> {
+    let (r, tx, _) = dupes_block(g, f, d)?;
+    match &d.body {
+        DupesBody::Offer { check: true, .. } => {
+            let w = quiet_w(g, f, "Check now", true);
+            Some((Hit::DupesCheck, (tx, r.3 - 16.0 - 28.0, tx + w, r.3 - 16.0)))
+        }
+        DupesBody::Running { .. } => {
+            let w = quiet_w(g, f, "Stop", true);
+            Some((
+                Hit::DupesStop,
+                (r.2 - 16.0 - w, r.1 + 12.0, r.2 - 16.0, r.1 + 40.0),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// A copy's keep column: "Keep" on the keeper, "Keep this" on the others.
+fn keep_rect(top: f32) -> Rect {
+    let r = X1 - DATE_W - 12.0;
+    let cy = top + ROW / 2.0;
+    (r - KEEP_W, cy - 11.0, r, cy + 11.0)
+}
+
+fn dupes_rects(g: &Shared, f: &Fonts, d: &DupesView, v: &View, b: f32) -> Vec<(Hit, Rect)> {
+    let mut out = vec![(Hit::Back, (X0, 14.0, X0 + 28.0, 42.0))];
+    out.extend(dupes_block_button(g, f, d));
+    if let DupesBody::Groups(groups) = &d.body {
+        out.push((Hit::DupesAll, dupes_all_rect(g, f, d)));
+        for (e, top) in dupe_visible(d, b) {
+            if let DupeEntry::Row(gi, k) = e {
+                let Some(row) = groups[gi].rows.get(k) else {
+                    continue;
+                };
+                if !row.keep {
+                    out.push((Hit::DupeCheck(gi, k), (X0 - 8.0, top, X0 + 24.0, top + ROW)));
+                }
+                out.push((Hit::DupeKeep(gi, k), keep_rect(top)));
+                out.push((Hit::DupeRow(gi, k), (X0 - 8.0, top, X1 + 8.0, top + ROW)));
+            }
+        }
     }
     out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion)));
     out
@@ -1079,10 +1408,11 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     }
     let b = body_h(g, f, v);
     let mut out = match &v.screen {
-        Screen::Start(d) => start_rects(g, f, d.len()),
+        Screen::Start(d, _) => start_rects(g, f, d.len()),
         Screen::Results(r) => results_rects(g, f, r, v, b),
         Screen::Clean(c) => clean_rects(g, f, c, v, b),
         Screen::Review(r) => review_rects(r, g, f, v, b),
+        Screen::Dupes(d) => dupes_rects(g, f, d, v, b),
     };
     for (i, ((top, h), c)) in card_tops(g, f, v).into_iter().zip(&v.cards).enumerate() {
         if let Some(label) = &c.button {
@@ -1604,6 +1934,7 @@ fn draw_start(
     t: &Theme,
     f: &Fonts,
     drives: &[DriveRow],
+    dupes: bool,
     v: &View,
     hover: Option<Hit>,
 ) {
@@ -1695,6 +2026,38 @@ fn draw_start(
             true,
         );
     }
+    // "Also find duplicate files", off by default, with what it costs under it.
+    let n = drives.len();
+    let o = option_top(n);
+    let row = (X0 - 8.0, o, X1 + 8.0, o + OPTION_H);
+    if hover == Some(Hit::DupesOption) {
+        fill_rr(dc, row, 10.0, hover_fill(t));
+    }
+    if v.kb && v.cursor == Some(n) {
+        focus_ring(dc, t, row, 10.0);
+    }
+    checkbox(g, dc, t, X0, o + 13.0, dupes, 1.0);
+    text(
+        dc,
+        "Also find duplicate files",
+        &f.title,
+        X0 + 28.0,
+        o + 4.0,
+        400.0,
+        18.0,
+        &ink,
+    );
+    clipped_text(
+        g,
+        dc,
+        crate::disk_model::dupe_cost_words(None),
+        &f.small,
+        X0 + 28.0,
+        o + 22.0,
+        X1 - X0 - 28.0,
+        16.0,
+        &muted,
+    );
     for (h, r) in start_rects(g, f, drives.len()).into_iter().take(2) {
         let (label, icon) = if h == Hit::ScanFolder {
             ("Scan a folder", Icon::Folder)
@@ -1767,6 +2130,7 @@ fn draw_head(
         let (label, icon) = match h {
             Hit::Stop => ("Stop", Icon::Stop),
             Hit::ScanAgain => ("Scan again", Icon::Refresh),
+            Hit::OpenDupes => ("Duplicates", Icon::Layers),
             _ => ("Safe to clean", Icon::Shield),
         };
         quiet_button(
@@ -2410,7 +2774,7 @@ fn draw_strip(
     clipped_text(g, dc, &d.name, &f.title, X0, top, nw, STRIP_H, &ink);
     let px = X0 + nw + 10.0;
     let room = size_r - sw - pw - 16.0 - px;
-    let path = middle_cut(&d.path, room, |s| g.text_width(s, &f.small));
+    let path = cut_path(g, &d.path, room, &f.small);
     text(
         dc,
         &path,
@@ -3113,7 +3477,7 @@ fn draw_review(
             &muted
         },
     );
-    if r.rows.is_empty() {
+    if r.len == 0 {
         text(
             dc,
             "Nothing left to review here",
@@ -3126,16 +3490,19 @@ fn draw_review(
         );
     }
     let n = review_rows(b);
-    let shown = r.rows.len().min(r.first + n);
+    let shown = r.len.min(r.first + n);
     for (k, i) in (r.first..shown).enumerate() {
         let (dy, a) = ripple(&v.motion, k);
         let top = REVIEW_TOP + k as f32 * FILE_ROW + dy;
+        let Some(row) = i.checked_sub(r.rows_from).and_then(|j| r.rows.get(j)) else {
+            continue;
+        };
         draw_file_row(
             g,
             dc,
             t,
             f,
-            &r.rows[i],
+            row,
             top,
             hover == Some(Hit::File(i)),
             v.kb && v.cursor == Some(i),
@@ -3148,11 +3515,250 @@ fn draw_review(
         W - 4.0,
         REVIEW_TOP,
         n as f32 * FILE_ROW,
-        r.rows.len(),
+        r.len,
         n,
         r.first,
     );
     draw_sel_bar(g, dc, t, f, v, b, &r.selected, r.can_recycle, true, hover);
+}
+
+fn draw_dupes(
+    g: &Shared,
+    dc: &ID2D1DeviceContext,
+    t: &Theme,
+    f: &Fonts,
+    d: &DupesView,
+    v: &View,
+    hover: Option<Hit>,
+) {
+    let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
+    let b = body_h(g, f, v);
+    // The header, as on Safe to clean: back on the left, the total on the right.
+    let back = (X0, 14.0, X0 + 28.0, 42.0);
+    fill_rr(
+        dc,
+        back,
+        14.0,
+        if hover == Some(Hit::Back) {
+            t.button_hover
+        } else {
+            t.chip
+        },
+    );
+    draw_icon(g, dc, Icon::ArrowLeft, X0 + 14.0, 28.0, 14.0, &ink);
+    let title = "Duplicates";
+    let tw = g.text_width(title, &f.panel_title);
+    text(
+        dc,
+        title,
+        &f.panel_title,
+        X0 + 38.0,
+        14.0,
+        tw + 2.0,
+        28.0,
+        &ink,
+    );
+    let base = 14.0 + baseline_in(g, title, &f.panel_title, 28.0);
+    let lw = g.text_width(d.total_label, &f.body);
+    let totw = g.text_width(&d.total, &f.heading);
+    let tx = X1 - lw - totw;
+    clipped_text(
+        g,
+        dc,
+        &d.place,
+        &f.body,
+        X0 + 38.0 + tw + 8.0,
+        base - baseline_in(g, &d.place, &f.body, 18.0),
+        tx - 16.0 - (X0 + 38.0 + tw + 8.0),
+        18.0,
+        &muted,
+    );
+    let ty = base - baseline_in(g, &d.total, &f.heading, 24.0);
+    text(dc, &d.total, &f.heading, tx, ty, totw + 2.0, 24.0, &ink);
+    text(
+        dc,
+        d.total_label,
+        &f.body,
+        tx + totw,
+        base - baseline_in(g, d.total_label, &f.body, 18.0),
+        lw + 2.0,
+        18.0,
+        &muted,
+    );
+    // The line under it: what the check found, and select all in the filter-chip style.
+    text(dc, &d.sub, &f.small, X0, 62.0, 420.0, 16.0, &muted);
+    if let DupesBody::Groups(_) = &d.body {
+        let r = dupes_all_rect(g, f, d);
+        if hover == Some(Hit::DupesAll) {
+            fill_rr(dc, r, 14.0, hover_fill(t));
+        }
+        edge_rr(dc, r, 14.0, t.hair, 1.0);
+        center_text(
+            g,
+            dc,
+            dupes_all_label(d),
+            &f.small_medium,
+            (r.0 + r.2) / 2.0,
+            r.1,
+            28.0,
+            &ink,
+        );
+    }
+    // Before, during and after a check with nothing to list: one card.
+    if let Some((r, tx, tw)) = dupes_block(g, f, d) {
+        let (dy, a) = ripple(&v.motion, 0);
+        let r = (r.0, r.1 + dy, r.2, r.3 + dy);
+        fill_rr(dc, r, 12.0, with_alpha(t.raised, a));
+        let ink_a = brush(dc, with_alpha(t.text, a));
+        let muted_a = brush(dc, with_alpha(t.muted, a));
+        let y0 = r.1 + 16.0;
+        let y1 = y0 + 24.0;
+        let (icon, title) = match &d.body {
+            DupesBody::Offer { title, .. } => (Icon::Layers, title.as_str()),
+            DupesBody::Running { stage, .. } => (Icon::Search, *stage),
+            DupesBody::Empty { title, .. } => (Icon::Tick, title.as_str()),
+            DupesBody::Groups(_) => (Icon::Layers, ""),
+        };
+        chip(g, dc, t, X0 + 28.0, y0 + 9.0, 14.0, icon, false);
+        let button = dupes_block_button(g, f, d);
+        let title_w = match &button {
+            Some((Hit::DupesStop, br)) => br.0 - 12.0 - tx,
+            _ => tw,
+        };
+        clipped_text(g, dc, title, &f.title, tx, y0, title_w, 18.0, &ink_a);
+        match &d.body {
+            DupesBody::Offer { body, cost, .. } => {
+                let hb = wrap_h(g, body, &f.small_wrap, tw);
+                text(dc, body, &f.small_wrap, tx, y1, tw, hb + 2.0, &muted_a);
+                let y2 = y1 + hb + 6.0;
+                let hc = wrap_h(g, cost, &f.small_wrap, tw);
+                text(dc, cost, &f.small_wrap, tx, y2, tw, hc + 2.0, &muted_a);
+            }
+            DupesBody::Running { line, frac, .. } => {
+                track_bar(dc, t, tx, y1 + 4.0, tw, 4.0, *frac);
+                text(dc, line, &f.small, tx, y1 + 16.0, tw, 16.0, &muted_a);
+            }
+            DupesBody::Empty { body, .. } => {
+                let hb = wrap_h(g, body, &f.small_wrap, tw);
+                text(dc, body, &f.small_wrap, tx, y1, tw, hb + 2.0, &muted_a);
+            }
+            DupesBody::Groups(_) => {}
+        }
+        if let Some((h, br)) = button {
+            let (label, icon) = if h == Hit::DupesStop {
+                ("Stop", Icon::Stop)
+            } else {
+                ("Check now", Icon::Search)
+            };
+            let br = (br.0, br.1 + dy, br.2, br.3 + dy);
+            quiet_button(g, dc, t, f, br, label, Some(icon), hover == Some(h), true);
+        }
+    }
+    // The groups: a heading per group, then each copy with its keep column and date.
+    if let DupesBody::Groups(groups) = &d.body {
+        // The keyboard's row number of the first copy shown: copies before `first`.
+        let mut row_pos = d.first;
+        let mut seen = 0;
+        for gr in groups {
+            if seen >= d.first {
+                break;
+            }
+            row_pos -= 1;
+            seen += 1 + gr.len;
+        }
+        let visible = dupe_visible(d, b);
+        for (k, &(e, top)) in visible.iter().enumerate() {
+            let (dy, a) = ripple(&v.motion, k);
+            let top = top + dy;
+            // At rest (no ripple) the rows share the screen's brushes.
+            let (ink_a, muted_a) = if a >= 1.0 {
+                (ink.clone(), muted.clone())
+            } else {
+                (
+                    brush(dc, with_alpha(t.text, a)),
+                    brush(dc, with_alpha(t.muted, a)),
+                )
+            };
+            match e {
+                DupeEntry::Group(gi) => {
+                    let gr = &groups[gi];
+                    let y = top + DUPE_HEAD - 22.0;
+                    let sw = g.text_width(&gr.sub, &f.small);
+                    clipped_text(
+                        g,
+                        dc,
+                        &gr.name,
+                        &f.title,
+                        X0,
+                        y,
+                        X1 - X0 - sw - 16.0,
+                        18.0,
+                        &ink_a,
+                    );
+                    right_text(g, dc, &gr.sub, &f.small, X1, y + 1.0, 16.0, &muted_a);
+                }
+                DupeEntry::Row(gi, ki) => {
+                    let Some(row) = groups[gi].rows.get(ki) else {
+                        row_pos += 1;
+                        continue;
+                    };
+                    let rect = (X0 - 8.0, top, X1 + 8.0, top + ROW);
+                    let hovered = matches!(hover, Some(Hit::DupeRow(x, y) | Hit::DupeCheck(x, y) | Hit::DupeKeep(x, y)) if (x, y) == (gi, ki));
+                    let focused = v.kb && v.cursor == Some(row_pos);
+                    row_pos += 1;
+                    if row.checked {
+                        fill_rr(dc, rect, 8.0, with_alpha(t.chip, a));
+                    } else if hovered {
+                        fill_rr(dc, rect, 8.0, with_alpha(hover_fill(t), a));
+                    }
+                    if focused {
+                        focus_ring(dc, t, rect, 8.0);
+                    }
+                    let cy = top + ROW / 2.0;
+                    if !row.keep {
+                        checkbox(g, dc, t, X0, cy, row.checked, a);
+                    }
+                    right_text(g, dc, &row.date, &f.small, X1, top, ROW, &muted_a);
+                    let kr = keep_rect(top);
+                    let tf = tag_font(g, f);
+                    if row.keep {
+                        edge_rr(dc, kr, 11.0, with_alpha(t.text, 0.4 * a), 1.0);
+                        center_text(g, dc, "Keep", &tf, (kr.0 + kr.2) / 2.0, kr.1, 22.0, &ink_a);
+                    } else if hovered || focused {
+                        let on = hover == Some(Hit::DupeKeep(gi, ki));
+                        fill_rr(dc, kr, 11.0, if on { t.button_hover } else { t.chip });
+                        center_text(
+                            g,
+                            dc,
+                            "Keep this",
+                            &tf,
+                            (kr.0 + kr.2) / 2.0,
+                            kr.1,
+                            22.0,
+                            if on { &ink_a } else { &muted_a },
+                        );
+                    }
+                    let px = X0 + 28.0;
+                    let room = kr.0 - 12.0 - px;
+                    let cut = cut_path(g, &row.path, room, &f.body);
+                    text(dc, &cut, &f.body, px, top, room + 2.0, ROW, &ink_a);
+                }
+            }
+        }
+        let n_entries = dupe_entry_count(d);
+        let shown = visible.len();
+        draw_scroll_thumb(
+            dc,
+            t,
+            W - 4.0,
+            DUPES_TOP,
+            bar_top(b) - 8.0 - DUPES_TOP,
+            n_entries,
+            shown,
+            d.first,
+        );
+    }
+    draw_sel_bar(g, dc, t, f, v, b, &d.selected, d.can_recycle, true, hover);
 }
 
 fn draw_cards(
@@ -3317,7 +3923,7 @@ fn draw_confirm(
                 clipped_text(g, dc, name, &f.title, x0 + 14.0, ry, room, rh, &ink);
             } else {
                 clipped_text(g, dc, name, &f.title, x0 + 14.0, ry + 6.0, room, 18.0, &ink);
-                let p = middle_cut(sub, room, |s| g.text_width(s, &f.small));
+                let p = cut_path(g, sub, room, &f.small);
                 text(
                     dc,
                     &p,
@@ -3444,10 +4050,11 @@ pub fn draw(
     draw_band(g, dc, t, f, under);
     unsafe { dc.SetTransform(&shift(TOP)) };
     match &v.screen {
-        Screen::Start(d) => draw_start(g, dc, t, f, d, v, under),
+        Screen::Start(d, dupes) => draw_start(g, dc, t, f, d, *dupes, v, under),
         Screen::Results(r) => draw_results(g, dc, t, f, r, v, under),
         Screen::Clean(c) => draw_clean(g, dc, t, f, c, v, under),
         Screen::Review(r) => draw_review(g, dc, t, f, r, v, under),
+        Screen::Dupes(d) => draw_dupes(g, dc, t, f, d, v, under),
     }
     draw_cards(g, dc, t, f, v, under);
     if let Some(c) = &v.confirm {
@@ -3472,6 +4079,7 @@ pub enum Scroll {
     Files,
     Review,
     Clean,
+    Dupes,
 }
 
 /// (x, y) in window coordinates.
@@ -3488,6 +4096,7 @@ pub fn scroll_target(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<
         },
         Screen::Review(_) => Some(Scroll::Review),
         Screen::Clean(_) if (CLEAN_TOP..bar_top(b)).contains(&y) => Some(Scroll::Clean),
+        Screen::Dupes(_) if (DUPES_TOP..bar_top(b)).contains(&y) => Some(Scroll::Dupes),
         _ => None,
     }
 }
@@ -3537,6 +4146,10 @@ mod tests {
         );
         assert!(files_rows(b) > 7);
         assert!(review_rows(b) > 9);
+        // disk.rs puts words only in these windows; they hold every row the lists can show.
+        assert!(FOLDER_WINDOW > folder_rows(b));
+        assert!(REVIEW_WINDOW >= review_rows(b));
+        assert!(DUPES_WINDOW as f32 * DUPE_HEAD >= bar_top(b) - DUPES_TOP);
     }
 
     #[test]
@@ -3650,6 +4263,90 @@ mod tests {
     fn the_close_button_sits_in_the_band() {
         let c = close_rect();
         assert!(c.3 <= TOP && c.2 <= W && c.1 > 0.0);
+    }
+
+    #[test]
+    fn the_duplicates_option_sits_between_the_drives_and_the_buttons() {
+        for n in 0..5 {
+            let o = option_top(n);
+            assert!(o >= 52.0 + n as f32 * 60.0, "under the last drive row");
+            assert!(start_buttons_y(n) >= o + OPTION_H, "above the buttons");
+            assert_eq!(start_h(n), start_buttons_y(n) + 28.0 + 16.0);
+        }
+    }
+
+    #[test]
+    fn a_copy_row_keeps_room_for_its_path_keep_column_and_date() {
+        let k = keep_rect(100.0);
+        assert!(
+            k.2 + 12.0 <= X1 - DATE_W + 0.01,
+            "the keep column clears the date"
+        );
+        assert!(k.0 - (X0 + 28.0) >= 400.0, "the path keeps most of the row");
+        assert!(k.1 >= 100.0 && k.3 <= 100.0 + ROW);
+    }
+
+    #[test]
+    fn duplicate_entries_list_each_heading_then_its_copies() {
+        let row = || DupeRowView {
+            path: r"C:\a\b.mp4".into(),
+            date: "6 Nov 2025".into(),
+            keep: false,
+            checked: false,
+        };
+        let group = |n: usize| DupeGroupView {
+            len: n,
+            name: "b.mp4".into(),
+            sub: String::new(),
+            rows: (0..n).map(|_| row()).collect(),
+        };
+        let mut d = DupesView {
+            place: String::new(),
+            total: String::new(),
+            total_label: " to reclaim",
+            sub: String::new(),
+            body: DupesBody::Groups(vec![group(2), group(3)]),
+            first: 0,
+            selected: None,
+            all: false,
+            can_recycle: true,
+        };
+        use DupeEntry::{Group, Row};
+        assert_eq!(
+            dupe_entries(&d),
+            [
+                Group(0),
+                Row(0, 0),
+                Row(0, 1),
+                Group(1),
+                Row(1, 0),
+                Row(1, 1),
+                Row(1, 2)
+            ]
+        );
+        assert_eq!(dupe_entry_count(&d), 7);
+        for first in 0..=8 {
+            assert_eq!(
+                dupe_entries_from(&d, first).collect::<Vec<_>>(),
+                dupe_entries(&d).into_iter().skip(first).collect::<Vec<_>>(),
+                "skipping whole groups lands on the same entry ({first})"
+            );
+        }
+        let b = H - TOP;
+        let shown = dupe_visible(&d, b);
+        assert!(
+            shown.len() <= DUPES_WINDOW,
+            "the window covers every shown entry"
+        );
+        assert!(shown
+            .iter()
+            .all(|(e, top)| top + dupe_entry_h(*e) <= bar_top(b)));
+        d.body = DupesBody::Running {
+            stage: "Comparing whole files…",
+            line: String::new(),
+            frac: 0.5,
+        };
+        assert!(dupe_entries(&d).is_empty(), "no list while a check runs");
     }
 
     #[test]

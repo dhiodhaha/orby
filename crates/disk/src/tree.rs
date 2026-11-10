@@ -37,8 +37,15 @@ pub struct Node {
     dirs: u64,
     modified: Option<SystemTime>,
     hidden: bool,
+    flags: u8,
     children: Vec<NodeId>,
 }
+
+/// [`Node`] flags from the listing: a system file, data not on this disk (cloud placeholder or
+/// offline), any reparse point.
+pub(crate) const F_SYSTEM: u8 = 1;
+pub(crate) const F_NOT_LOCAL: u8 = 2;
+pub(crate) const F_REPARSE: u8 = 4;
 
 impl Node {
     pub fn name(&self) -> &OsStr {
@@ -76,6 +83,18 @@ impl Node {
     }
     pub fn hidden(&self) -> bool {
         self.hidden
+    }
+    /// Windows marks it as a system file.
+    pub fn system(&self) -> bool {
+        self.flags & F_SYSTEM != 0
+    }
+    /// A cloud placeholder or offline file: its data is not on this disk.
+    pub fn not_local(&self) -> bool {
+        self.flags & F_NOT_LOCAL != 0
+    }
+    /// Any reparse point, including the ones the scan treats as plain files or folders.
+    pub fn reparse(&self) -> bool {
+        self.flags & F_REPARSE != 0
     }
 }
 
@@ -129,6 +148,7 @@ pub(crate) struct NewEntry {
     pub allocated: u64,
     pub modified: Option<SystemTime>,
     pub hidden: bool,
+    pub flags: u8,
 }
 
 #[derive(Debug)]
@@ -151,6 +171,7 @@ impl Tree {
             dirs: 0,
             modified,
             hidden: false,
+            flags: 0,
             children: Vec::new(),
         };
         Tree { root_path, nodes: vec![root], skipped: Vec::new(), status: ScanStatus::Running }
@@ -188,6 +209,7 @@ impl Tree {
                 dirs: 0,
                 modified: e.modified,
                 hidden: e.hidden,
+                flags: e.flags,
                 children: Vec::new(),
             });
             self.nodes[dir.ix()].children.push(id);
@@ -352,10 +374,10 @@ mod tests {
     use super::*;
 
     fn file(name: &str, size: u64) -> NewEntry {
-        NewEntry { name: OsStr::new(name).into(), kind: NodeKind::File, size, allocated: size, modified: None, hidden: false }
+        NewEntry { name: OsStr::new(name).into(), kind: NodeKind::File, size, allocated: size, modified: None, hidden: false, flags: 0 }
     }
     fn dir(name: &str) -> NewEntry {
-        NewEntry { name: OsStr::new(name).into(), kind: NodeKind::Dir, size: 0, allocated: 0, modified: None, hidden: false }
+        NewEntry { name: OsStr::new(name).into(), kind: NodeKind::Dir, size: 0, allocated: 0, modified: None, hidden: false, flags: 0 }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 mod category;
 mod clean;
+mod dupes;
 mod recycle;
 mod rules;
 mod scan;
@@ -14,6 +15,10 @@ mod tree;
 
 pub use category::{Category, TypeShare};
 pub use clean::{safe_to_clean, Candidate, CleanPlaces, Suggestion, SuggestionKind, Tag};
+pub use dupes::{
+    candidates, check_duplicate_removal, drive_kind, find_duplicates, recycle_duplicates, Candidates, DriveKind, DupeFile, DupeGroup,
+    DupeOptions, DupeProgress, DupeRemoval, DupeReport, DupeStage, DUPE_EDGE, DUPE_MIN_SIZE, DUPE_SKIPPED_NAMES,
+};
 pub use recycle::{has_recycle_bin, move_to_recycle_bin, recycle_bin_size, RecycleError, RecycleReport};
 pub use rules::{
     check_removal, is_unfinished_download, measure_rules, never_touch, recycle_rule_items, Group, Measured, Refusal, Rule, RuleEnv,

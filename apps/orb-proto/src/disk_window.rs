@@ -3,9 +3,12 @@
 //! and a click elsewhere leaves it open; Esc (after the confirm sheet), its close button, Alt+F4
 //! or the taskbar close it. disk.rs owns the state, disk_panel.rs draws; this file is the window.
 
+use std::time::Instant;
+
 use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -29,10 +32,58 @@ pub struct Win {
     tracking: bool,
     /// The frame timer runs only while something in the window moves.
     ticking: bool,
+    /// Frames drawn since the window opened (for the frame log).
+    frames: u64,
 }
 
-/// The window's frame timer (on its own hwnd), about 60 per second while anything moves.
+/// The window's frame timer (on its own hwnd), one per display refresh while anything moves.
 const TIMER_FRAME: usize = 1;
+
+/// `ORB_DISK_FRAMES=1` writes one log line per Disk frame with what it cost. Off by default:
+/// a frame line every 16 ms would flood the log.
+fn frame_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ORB_DISK_FRAMES").is_some_and(|v| v != "0"))
+}
+
+/// The frame timer's period: one display refresh (13 ms at 74 Hz), and never more than 15 ms.
+///
+/// A USER timer fires on the system clock's tick, 15.6 ms unless a finer clock was asked for,
+/// so the old 16 ms timer missed every other tick: frames came 15.6 or 31.2 ms apart, about 39
+/// a second (`disk::tests::frame_cost_of_a_big_list` measures 25.5 ms on average, and 15.3 ms
+/// for a 10 ms timer). At 15 ms or less it fires on every tick even on the coarse clock. While
+/// the timer runs the window also asks for a 1 ms clock (`timeBeginPeriod`), so a 74 Hz screen
+/// gets its 13 ms, and gives it back the moment nothing moves: an idle window costs nothing.
+fn frame_ms() -> u32 {
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let hz = unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut dm) }
+        .as_bool()
+        .then_some(dm.dmDisplayFrequency)
+        .filter(|&hz| hz > 1)
+        .unwrap_or(60);
+    (1000 / hz).clamp(6, 15)
+}
+
+/// Starts or stops the frame timer and the fine clock with it.
+fn set_ticking(app: &mut App, on: bool) {
+    if on == app.disk.win.ticking {
+        return;
+    }
+    app.disk.win.ticking = on;
+    let hwnd = app.disk.win.hwnd;
+    unsafe {
+        if on {
+            timeBeginPeriod(1);
+            SetTimer(Some(hwnd), TIMER_FRAME, frame_ms(), None);
+        } else {
+            let _ = KillTimer(Some(hwnd), TIMER_FRAME);
+            timeEndPeriod(1);
+        }
+    }
+}
 
 impl Default for Win {
     fn default() -> Self {
@@ -45,6 +96,7 @@ impl Default for Win {
             mouse: None,
             tracking: false,
             ticking: false,
+            frames: 0,
         }
     }
 }
@@ -93,9 +145,8 @@ pub fn close(app: &mut App) {
     app.disk.win.open = false;
     app.disk.win.hover = None;
     app.disk.win.mouse = None;
-    app.disk.win.ticking = false;
+    set_ticking(app, false);
     unsafe {
-        let _ = KillTimer(Some(app.disk.win.hwnd), TIMER_FRAME);
         let _ = ShowWindow(app.disk.win.hwnd, SW_HIDE);
     }
     // The swap chain is about 2 MB at 756 × 704; let it go while the window is hidden.
@@ -140,8 +191,11 @@ fn render(app: &mut App) {
     if !app.disk.win.open {
         return;
     }
+    let t0 = Instant::now();
     disk::prepare(app);
-    let (lw, lh) = disk::size(app);
+    // One view per frame: the size and the drawing both read it.
+    let v = disk::view(app);
+    let (lw, lh) = dp::size(&app.g, &app.fonts, &v);
     let (w, h) = (px(app, lw).ceil() as u32, px(app, lh).ceil() as u32);
     let hwnd = app.disk.win.hwnd;
     match app.disk.win.surface.as_mut() {
@@ -155,21 +209,51 @@ fn render(app: &mut App) {
     let Some(s) = app.disk.win.surface.as_ref() else {
         return;
     };
+    let t1 = Instant::now();
     let dc = s.begin(&app.g);
-    disk::draw(app, dc, app.disk.win.hover);
+    dp::draw(&app.g, dc, &app.theme, &app.fonts, &v, app.disk.win.hover);
     s.end(&app.g);
+    app.disk.win.frames += 1;
+    if frame_log() {
+        let (view_ms, draw_ms) = (
+            (t1 - t0).as_secs_f64() * 1000.0,
+            t1.elapsed().as_secs_f64() * 1000.0,
+        );
+        let n = app.disk.win.frames;
+        log_line(
+            app,
+            &format!(
+                "disk: frame {n} {:.2} ms (view {view_ms:.2}, draw {draw_ms:.2})",
+                view_ms + draw_ms
+            ),
+        );
+    }
     // Keep drawing frames while something moves; stop the moment it all rests.
     let moving = disk::animating(app);
-    if moving != app.disk.win.ticking {
-        app.disk.win.ticking = moving;
-        unsafe {
-            if moving {
-                SetTimer(Some(hwnd), TIMER_FRAME, 16, None);
-            } else {
-                let _ = KillTimer(Some(hwnd), TIMER_FRAME);
-            }
-        }
+    set_ticking(app, moving);
+}
+
+/// Draw at the next WM_PAINT. Windows makes WM_PAINT only once the input queue is empty, so a
+/// burst of wheel or mouse messages costs one frame instead of one each.
+fn invalidate(app: &App) {
+    unsafe {
+        let _ = InvalidateRect(Some(app.disk.win.hwnd), None, false);
     }
+}
+
+/// The data moved under the pointer (a scroll): the hover follows what is now under the
+/// cursor, and the frame comes with the next WM_PAINT.
+pub fn refresh_soon(app: &mut App) {
+    if !app.disk.win.open {
+        return;
+    }
+    disk::prepare(app);
+    let h = app.disk.win.mouse.and_then(|(x, y)| disk::hit(app, x, y));
+    if h != app.disk.win.hover {
+        app.disk.win.hover = h;
+        disk::on_hover(app, h);
+    }
+    invalidate(app);
 }
 
 /// Redraw after the data behind the window changed; the hover follows what is now under the
@@ -241,10 +325,10 @@ pub unsafe extern "system" fn disk_proc(
                 if h != app.disk.win.hover {
                     app.disk.win.hover = h;
                     disk::on_hover(app, h);
-                    render(app);
+                    invalidate(app);
                 } else if matches!(h, Some(Hit::Tile(_))) {
                     // The label card follows the pointer across a tile.
-                    render(app);
+                    invalidate(app);
                 }
             });
             return LRESULT(0);
@@ -262,6 +346,11 @@ pub unsafe extern "system" fn disk_proc(
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == TIMER_FRAME => {
+            with_app(render);
+            return LRESULT(0);
+        }
+        WM_PAINT => {
+            let _ = ValidateRect(Some(hwnd), None);
             with_app(render);
             return LRESULT(0);
         }

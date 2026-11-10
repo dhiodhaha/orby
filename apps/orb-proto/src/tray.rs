@@ -41,6 +41,7 @@ pub const MENU_DISK_LOW_8: usize = 42;
 pub const MENU_DISK_LOW_2: usize = 43;
 pub const MENU_DISK_CHECK: usize = 44;
 pub const MENU_DISK_FIND_C: usize = 45;
+pub const MENU_DISK_DUPES: usize = 46;
 pub const MENU_HISTORY: usize = 50;
 pub const MENU_HISTORY_DRINK: usize = 51;
 pub const MENU_HISTORY_FOCUS: usize = 52;
@@ -121,6 +122,12 @@ pub fn tray_menu(hwnd: HWND) {
             w!("Paste a link into Downloads"),
         );
         let _ = AppendMenuW(menu, MF_STRING, MENU_DISK, w!("Open the Disk panel"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_DISK_DUPES,
+            w!("Open Duplicates in Disk"),
+        );
         let _ = AppendMenuW(menu, MF_STRING, MENU_HISTORY, w!("Open History"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_NOTICES, w!("Open Notices"));
         let _ = AppendMenuW(
@@ -369,6 +376,9 @@ pub fn on_command(hwnd: HWND, id: usize) {
         }
         MENU_DISK_CHECK => {
             with_app(disk::check_space);
+        }
+        MENU_DISK_DUPES => {
+            with_app(disk::open_dupes);
         }
         MENU_DISK_FIND_C => {
             with_app(|app| disk::find_big_folders(app, 'C'));

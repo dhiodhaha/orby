@@ -3,7 +3,7 @@
 //! That keeps the tree lock-free and lets the progress callback read it directly.
 
 use crate::sys;
-use crate::tree::{NewEntry, NodeId, NodeKind, ScanStatus, SkipReason, Skipped, Tree};
+use crate::tree::{NewEntry, NodeId, NodeKind, ScanStatus, SkipReason, Skipped, Tree, F_NOT_LOCAL, F_REPARSE, F_SYSTEM};
 use std::ffi::OsString;
 use std::fs::{self, DirEntry};
 use std::io;
@@ -250,6 +250,9 @@ fn entry(e: &DirEntry, cluster: Option<u64>) -> io::Result<NewEntry> {
         size,
         allocated,
         modified: md.modified().ok(),
+        flags: if facts.system { F_SYSTEM } else { 0 }
+            | if facts.not_local { F_NOT_LOCAL } else { 0 }
+            | if facts.reparse || ft.is_symlink() { F_REPARSE } else { 0 },
     })
 }
 

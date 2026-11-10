@@ -1,6 +1,7 @@
 //! Disk on app_disk: the low-space pill, scans on a worker thread with the orb's ring and the
-//! Scanning screen, Results (treemap, folders, files, types), Safe to clean with Review, the
-//! confirm sheet, Move to Recycle Bin on a worker thread, and Undo. It all shows in the Disk
+//! Scanning screen, Results (treemap, folders, files, types), Safe to clean with Review,
+//! Duplicates (app_disk's three-stage check on its own thread), the confirm sheet, Move to
+//! Recycle Bin on a worker thread, and Undo. It all shows in the Disk
 //! window (disk_window.rs), a real window like Settings.
 //!
 //! Nothing here deletes. The only remove action is `app_disk::move_to_recycle_bin`, and it runs
@@ -23,7 +24,6 @@ use app_habits::held::Priority;
 use serde::{Deserialize, Serialize};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -115,6 +115,7 @@ enum Place {
     Results,
     Clean,
     Review,
+    Dupes,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -123,11 +124,22 @@ enum Source {
     Clean(SuggestionKind),
     /// Cleaning-rule folders (with or without suggestions in the same move).
     Rules,
+    /// Extra copies from Duplicates, each moved only while its kept copy is there.
+    Dupes,
 }
 
 enum Msg {
     Live(u64, Live),
-    Scanned(u64, Result<Tree, ScanError>, Duration),
+    /// The tree, and stage 1 of the duplicate check with the drive's type (worked out on the
+    /// scan's thread, so the window gets the estimate with the results).
+    Scanned(
+        u64,
+        Result<Tree, ScanError>,
+        Duration,
+        Option<(ad::Candidates, ad::DriveKind)>,
+    ),
+    DupeProgress(u64, ad::DupeProgress),
+    Dupes(u64, ad::DupeReport),
     Suggestions(Vec<ad::Suggestion>, Option<u64>),
     /// The cleaning rules' folders, measured (crates/disk/src/rules.rs).
     Rules(ad::Measured),
@@ -156,7 +168,17 @@ enum Clean {
     Ready {
         list: Vec<ad::Suggestion>,
         bin: Option<u64>,
+        /// Per suggestion: every item is a file (`all_files`), asked of the file system once
+        /// when the list arrives or shrinks rather than on every frame.
+        files: Vec<bool>,
     },
+}
+
+/// Whether every item of each suggestion is a file (the old downloads line says `files` then).
+fn all_files(list: &[ad::Suggestion]) -> Vec<bool> {
+    list.iter()
+        .map(|s| s.items.iter().all(|c| c.path.is_file()))
+        .collect()
 }
 
 struct Review {
@@ -166,6 +188,43 @@ struct Review {
     first: usize,
 }
 
+/// Duplicates: stage 1 from the last scan, and the check of stages 2 and 3.
+#[derive(Default)]
+struct Dupes {
+    cands: Option<Arc<ad::Candidates>>,
+    kind: Option<ad::DriveKind>,
+    run: DupeRun,
+    next_id: u64,
+    first: usize,
+}
+
+enum DupeRun {
+    /// Not checked yet, or Stop was pressed.
+    Idle {
+        stopped: bool,
+    },
+    Running {
+        id: u64,
+        cancel: Arc<AtomicBool>,
+        progress: Option<ad::DupeProgress>,
+    },
+    Done {
+        list: m::DupeList,
+        skipped: u64,
+    },
+}
+
+impl Default for DupeRun {
+    fn default() -> Self {
+        DupeRun::Idle { stopped: false }
+    }
+}
+
+/// The hash cache, next to disk.json.
+fn dupes_cache() -> PathBuf {
+    store::data_dir().join("dupes-cache.json")
+}
+
 struct Confirm {
     items: Vec<(PathBuf, u64)>,
     /// What the sheet lists: Check first or not, name, the muted line, bytes. One line can stand
@@ -173,6 +232,8 @@ struct Confirm {
     lines: Vec<(bool, String, String, u64)>,
     /// The cleaning-rule folders among `items`, each with its rule.
     rules: Vec<(&'static ad::Rule, PathBuf)>,
+    /// Extra copies among `items`, each with the copy that stays.
+    dupes: Vec<ad::DupeRemoval>,
     source: Source,
     on_move: bool,
 }
@@ -323,6 +384,10 @@ struct Anim {
     suffix_a: Fade,
     suffix_text: String,
     rolls: HashMap<String, Roll>,
+    /// The results level (its folder and removal generation) whose rows the rolls last took
+    /// their targets from. A level's rows only change with these, so a frame does not format
+    /// a key for each of a big folder's thousands of rows again.
+    rows_synced: Option<(NodeId, u64)>,
     shimmer_from: Instant,
 }
 
@@ -344,6 +409,7 @@ impl Default for Anim {
             suffix_a: Fade::new(0.0),
             suffix_text: String::new(),
             rolls: HashMap::new(),
+            rows_synced: None,
             shimmer_from: now,
         }
     }
@@ -361,6 +427,9 @@ struct Saved {
     /// Free percent at the last low-space pill, per drive letter.
     #[serde(default)]
     low_space: BTreeMap<String, f64>,
+    /// "Also find duplicate files" on the drive list.
+    #[serde(default)]
+    find_dupes: bool,
 }
 
 pub struct Disk {
@@ -400,7 +469,10 @@ pub struct Disk {
     pub attention: bool,
     spin_from: Instant,
     last_ring: Option<Ring>,
-    drives: Vec<(PathBuf, String, DriveSpace)>,
+    drives: Vec<(PathBuf, String, DriveSpace, ad::DriveKind)>,
+    /// "Also find duplicate files": every scan runs the check when it ends (kept in disk.json).
+    find_dupes: bool,
+    dupes: Dupes,
     /// Safe to clean: the suggestions ticked, the filter, the list's first entry.
     clean_checked: BTreeSet<usize>,
     /// The cleaning rules with something to offer, and which are ticked (disk_model::CleanList).
@@ -429,6 +501,7 @@ impl Disk {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let find_dupes = saved.find_dupes;
         let watch = saved
             .low_space
             .iter()
@@ -478,6 +551,8 @@ impl Disk {
             spin_from: Instant::now(),
             last_ring: None,
             drives: Vec::new(),
+            find_dupes,
+            dupes: Dupes::default(),
             clean_checked: BTreeSet::new(),
             rules: None,
             filter: Filter::All,
@@ -497,7 +572,11 @@ impl Disk {
                 LowSpaceWatch::Armed => None,
             })
             .collect();
-        if let Ok(s) = serde_json::to_string_pretty(&Saved { low_space }) {
+        let saved = Saved {
+            low_space,
+            find_dupes: self.find_dupes,
+        };
+        if let Ok(s) = serde_json::to_string_pretty(&saved) {
             let _ = std::fs::create_dir_all(self.file.parent().unwrap_or(Path::new(".")));
             let tmp = self.file.with_extension("json.tmp");
             if std::fs::write(&tmp, s).is_ok() {
@@ -763,9 +842,20 @@ pub fn scan_path(app: &mut App, root: PathBuf, user: bool) {
             },
             &c,
         );
-        rep.send(Msg::Scanned(id, res, t0.elapsed()));
+        let took = t0.elapsed();
+        // Stage 1 of the duplicate check opens no file, so every scan gets the estimate.
+        let dupes = res.as_ref().ok().map(|t| {
+            let opts = ad::DupeOptions::for_current_user(None, SystemTime::now());
+            (ad::candidates(t, &opts), ad::drive_kind(&r))
+        });
+        rep.send(Msg::Scanned(id, res, took, dupes));
     });
     log_line(app, &format!("disk: scanning {}", root.display()));
+    stop_dupes(app);
+    app.disk.dupes = Dupes {
+        next_id: app.disk.dupes.next_id,
+        ..Dupes::default()
+    };
     app.disk.attention = false;
     let volume = if m::is_drive_root(&root) {
         volume_label(&root)
@@ -856,14 +946,48 @@ pub fn on_msg(app: &mut App) {
                     }
                 }
             }
-            Msg::Scanned(id, res, took) => on_scanned(app, id, res, took),
+            Msg::Scanned(id, res, took, dupes) => {
+                let current = matches!(&app.disk.scan, Scan::Running { id: cur, .. } if *cur == id);
+                if let (true, Some((cands, kind))) = (current && res.is_ok(), dupes) {
+                    log_line(
+                        app,
+                        &format!(
+                            "disk: {} same-size groups, up to {} possible duplicates ({kind:?})",
+                            cands.groups,
+                            m::size(cands.possible)
+                        ),
+                    );
+                    app.disk.dupes.cands = Some(Arc::new(cands));
+                    app.disk.dupes.kind = Some(kind);
+                }
+                on_scanned(app, id, res, took);
+                let complete = app
+                    .disk
+                    .done()
+                    .is_some_and(|d| d.tree.status() == ScanStatus::Complete);
+                if current && complete && app.disk.find_dupes {
+                    start_dupes(app);
+                }
+            }
+            Msg::DupeProgress(id, p) => {
+                if let DupeRun::Running {
+                    id: cur, progress, ..
+                } = &mut app.disk.dupes.run
+                {
+                    if *cur == id {
+                        *progress = Some(p);
+                    }
+                }
+            }
+            Msg::Dupes(id, report) => on_dupes(app, id, report),
             Msg::Suggestions(list, bin) => {
                 let total: u64 = list.iter().map(|s| s.total()).sum();
                 log_line(
                     app,
                     &format!("disk: safe to clean read, {} to review", m::size(total)),
                 );
-                app.disk.clean = Clean::Ready { list, bin };
+                let files = all_files(&list);
+                app.disk.clean = Clean::Ready { list, bin, files };
                 app.disk.clean_checked.clear();
                 if let Some(r) = &mut app.disk.review {
                     if let Clean::Ready { list, .. } = &app.disk.clean {
@@ -1004,6 +1128,353 @@ fn on_scanned(app: &mut App, id: u64, res: Result<Tree, ScanError>, took: Durati
         }
     }
     orb::render_orb(app);
+}
+
+// ---- duplicates ----
+
+/// Check now (or the end of a scan with "Also find duplicate files"): stages 2 and 3 on a
+/// worker thread, over stage 1's files from the last scan.
+fn start_dupes(app: &mut App) {
+    if matches!(app.disk.dupes.run, DupeRun::Running { .. }) {
+        return;
+    }
+    let Some(cands) = app.disk.dupes.cands.clone() else {
+        return;
+    };
+    if cands.files.is_empty() {
+        app.disk.dupes.run = DupeRun::Done {
+            list: m::DupeList::default(),
+            skipped: 0,
+        };
+        return;
+    }
+    let id = app.disk.dupes.next_id;
+    app.disk.dupes.next_id += 1;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (rep, c) = (reporter(app), Arc::clone(&cancel));
+    std::thread::spawn(move || {
+        let opts = ad::DupeOptions::for_current_user(Some(dupes_cache()), SystemTime::now());
+        let report = ad::find_duplicates(&cands, &opts, |p| rep.send(Msg::DupeProgress(id, p)), &c);
+        rep.send(Msg::Dupes(id, report));
+    });
+    log_line(
+        app,
+        &format!(
+            "disk: checking {} files for duplicates",
+            app.disk.dupes.cands.as_ref().map_or(0, |c| c.files.len())
+        ),
+    );
+    app.disk.dupes.run = DupeRun::Running {
+        id,
+        cancel,
+        progress: None,
+    };
+}
+
+/// Stop: the check ends within one read per thread and keeps nothing half checked.
+fn stop_dupes(app: &mut App) {
+    if let DupeRun::Running { cancel, .. } = &app.disk.dupes.run {
+        cancel.store(true, Ordering::Relaxed);
+        log_line(app, "disk: duplicate check stopped");
+    }
+}
+
+fn on_dupes(app: &mut App, id: u64, report: ad::DupeReport) {
+    if !matches!(&app.disk.dupes.run, DupeRun::Running { id: cur, .. } if *cur == id) {
+        return;
+    }
+    log_line(
+        app,
+        &format!(
+            "disk: duplicates {}: {} groups, {} to reclaim, {} skipped, {} read, {} from the cache, {:?} with {} thread(s)",
+            if report.stopped { "stopped" } else { "checked" },
+            report.groups.len(),
+            m::size(report.reclaimable()),
+            report.skipped,
+            m::size(report.bytes_read),
+            report.from_cache,
+            report.drive,
+            report.threads
+        ),
+    );
+    app.disk.dupes.run = if report.stopped {
+        DupeRun::Idle { stopped: true }
+    } else {
+        let mut list = m::DupeList::new(&report.groups);
+        // Anything moved from Results since the scan stays out.
+        let moved: Vec<PathBuf> = list
+            .sets
+            .iter()
+            .flat_map(|s| s.copies.iter().map(|c| c.path.clone()))
+            .filter(|p| {
+                app.disk
+                    .done()
+                    .and_then(|d| {
+                        d.tree
+                            .find(p)
+                            .map(|id| app.disk.removed.is_gone(&d.tree, id))
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        list.mark(&moved, true);
+        DupeRun::Done {
+            list,
+            skipped: report.skipped,
+        }
+    };
+    app.disk.dupes.first = 0;
+    if app.disk.place == Place::Dupes {
+        app.disk.cursor = None;
+        enter_rows(app);
+    }
+}
+
+fn open_dupes_place(app: &mut App) {
+    app.disk.place = Place::Dupes;
+    app.disk.cursor = None;
+    app.disk.note = None;
+    app.disk.dupes.first = 0;
+    enter_rows(app);
+    log_line(app, "disk: duplicates");
+}
+
+/// Tray 46: the Disk window on Duplicates (on the drive list when there is no scan yet).
+pub fn open_dupes(app: &mut App) {
+    open(app);
+    if app.disk.done().is_some() {
+        open_dupes_place(app);
+        refresh(app);
+    }
+}
+
+fn dupe_list(app: &App) -> Option<&m::DupeList> {
+    match &app.disk.dupes.run {
+        DupeRun::Done { list, .. } => Some(list),
+        _ => None,
+    }
+}
+
+fn dupe_list_mut(app: &mut App) -> Option<&mut m::DupeList> {
+    match &mut app.disk.dupes.run {
+        DupeRun::Done { list, .. } => Some(list),
+        _ => None,
+    }
+}
+
+/// The shown group and copy of each row, in screen order (the keyboard's rows).
+fn dupe_rows(app: &App) -> Vec<(usize, usize)> {
+    let Some(list) = dupe_list(app) else {
+        return Vec::new();
+    };
+    list.shown()
+        .iter()
+        .enumerate()
+        .flat_map(|(g, &i)| {
+            let s = &list.sets[i];
+            (0..s.copies.len())
+                .filter(|&k| !s.copies[k].gone)
+                .enumerate()
+                .map(move |(row, _)| (g, row))
+        })
+        .collect()
+}
+
+/// A shown group and row to the set and copy behind it.
+fn dupe_at(app: &App, g: usize, row: usize) -> Option<(usize, usize)> {
+    let list = dupe_list(app)?;
+    let set = *list.shown().get(g)?;
+    let s = &list.sets[set];
+    let copy = (0..s.copies.len())
+        .filter(|&k| !s.copies[k].gone)
+        .nth(row)?;
+    Some((set, copy))
+}
+
+fn toggle_dupe(app: &mut App, g: usize, row: usize) {
+    if let Some((set, copy)) = dupe_at(app, g, row) {
+        if let Some(l) = dupe_list_mut(app) {
+            l.sets[set].toggle(copy);
+        }
+    }
+}
+
+fn keep_dupe(app: &mut App, g: usize, row: usize) {
+    if let Some((set, copy)) = dupe_at(app, g, row) {
+        if let Some(l) = dupe_list_mut(app) {
+            l.sets[set].set_keeper(copy);
+        }
+    }
+}
+
+/// The extra copies among `paths`, each with the copy that stays (for a retry).
+fn dupe_pairs(app: &App, paths: &[PathBuf]) -> Vec<ad::DupeRemoval> {
+    let Some(list) = dupe_list(app) else {
+        return Vec::new();
+    };
+    paths
+        .iter()
+        .filter_map(|p| {
+            list.sets.iter().find_map(|s| {
+                let keep = &s.copies[s.keeper()].path;
+                (s.copies.iter().any(|c| &c.path == p) && keep != p).then(|| ad::DupeRemoval {
+                    path: p.clone(),
+                    size: s.size,
+                    keep: keep.clone(),
+                })
+            })
+        })
+        .collect()
+}
+
+/// "6 Nov 2025".
+fn dupe_date(t: Option<SystemTime>) -> String {
+    t.map(|t| {
+        let s = stamp(t);
+        format!("{} {}", m::day_month(s), s.year)
+    })
+    .unwrap_or_default()
+}
+
+fn dupes_view(app: &App, now: Instant) -> dp::DupesView {
+    let d = &app.disk.dupes;
+    let place = match app.disk.done() {
+        Some(done) => format!(
+            "{}, from the {} scan",
+            m::place_name(done.tree.root_path()),
+            m::when(stamp(done.at), now_stamp())
+                .rsplit(' ')
+                .next()
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let possible = d.cands.as_ref().map_or(0, |c| c.possible);
+    let groups_found = d.cands.as_ref().map_or(0, |c| c.groups);
+    let cost = m::dupe_cost_words(d.kind);
+    let (n, bytes) = selection(app).unwrap_or((0, 0));
+    let can_recycle = app.disk.done().is_some_and(|x| x.bin);
+    let mut view = dp::DupesView {
+        place,
+        total: format!("up to {}", dp::size_label(possible)),
+        total_label: " possible",
+        sub: m::plural(
+            groups_found as u64,
+            "group shares a size",
+            "groups share a size",
+        ),
+        body: dp::DupesBody::Offer {
+            title: String::new(),
+            body: String::new(),
+            cost,
+            check: false,
+        },
+        first: d.first,
+        selected: selected_words(n, bytes),
+        all: false,
+        can_recycle,
+    };
+    view.body = match &d.run {
+        DupeRun::Idle { stopped } if groups_found > 0 => dp::DupesBody::Offer {
+            title: format!("Possible duplicates: up to {}", dp::size_label(possible)),
+            body: if *stopped {
+                "Check stopped, so nothing is listed. Files that share a size might be copies. Only a check can tell.".into()
+            } else {
+                "Files that share a size might be copies. This is an upper bound until Orby compares them.".into()
+            },
+            cost,
+            check: true,
+        },
+        DupeRun::Idle { .. } => dp::DupesBody::Empty {
+            title: "No possible duplicates".into(),
+            body: "No two files of 1 MB or more share a size, so nothing needs a check.".into(),
+        },
+        DupeRun::Running { progress, .. } => {
+            let (stage, line, frac) = match progress {
+                Some(p) => {
+                    let (line, frac) = m::dupe_progress_words(p);
+                    (m::dupe_stage_words(p.stage), line, frac)
+                }
+                None => ("Getting ready…", String::new(), 0.0),
+            };
+            dp::DupesBody::Running { stage, line, frac }
+        }
+        DupeRun::Done { list, skipped } => {
+            let shown = list.shown();
+            let total = rolled(app, "dupes", list.reclaimable() as f64, now) as u64;
+            view.total = dp::size_label(total);
+            view.total_label = " to reclaim";
+            let skipped_words = if *skipped > 0 {
+                format!(
+                    " · {} skipped (in use or unreadable)",
+                    m::plural(*skipped, "file", "files")
+                )
+            } else {
+                String::new()
+            };
+            view.sub = format!(
+                "{}{skipped_words}",
+                m::plural(shown.len() as u64, "group", "groups")
+            );
+            view.all = list.all_extras_picked();
+            if shown.is_empty() {
+                dp::DupesBody::Empty {
+                    title: "No duplicates found".into(),
+                    body: "Files of 1 MB or more that share a size turned out to be different."
+                        .into(),
+                }
+            } else {
+                dp::DupesBody::Groups(dupe_groups(list, &shown, d.first))
+            }
+        }
+    };
+    view
+}
+
+/// The shown groups, with names, words and rows only for the groups that reach into the
+/// list's window from `first` (`dp::DUPES_WINDOW` entries). A C: check can list 10,000 copies;
+/// paths, dates (a time zone call each) and words for all of them every frame made scrolling
+/// slow, so the rest carry only their row count.
+fn dupe_groups(list: &m::DupeList, shown: &[usize], first: usize) -> Vec<dp::DupeGroupView> {
+    let end = first + dp::DUPES_WINDOW;
+    let mut at = 0;
+    shown
+        .iter()
+        .map(|&i| {
+            let s = &list.sets[i];
+            let len = s.copies.iter().filter(|c| !c.gone).count();
+            let entries = at..at + 1 + len;
+            at = entries.end;
+            if entries.end <= first || entries.start >= end {
+                return dp::DupeGroupView {
+                    len,
+                    ..Default::default()
+                };
+            }
+            let rows: Vec<dp::DupeRowView> = s
+                .copies
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.gone)
+                .map(|(k, c)| dp::DupeRowView {
+                    path: c.path.display().to_string(),
+                    date: dupe_date(c.modified),
+                    keep: k == s.keeper(),
+                    checked: s.is_picked(k),
+                })
+                .collect();
+            let name = s.copies[s.keeper()]
+                .path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            dp::DupeGroupView {
+                len,
+                name,
+                sub: m::dupe_group_words(len, s.reclaimable()),
+                rows,
+            }
+        })
+        .collect()
 }
 
 /// "C: 438 GB used", or "clippy 1.5 GB" for a folder.
@@ -1208,6 +1679,7 @@ fn ask(
         items,
         lines,
         rules: Vec::new(),
+        dupes: Vec::new(),
         source,
         on_move: false,
     });
@@ -1222,11 +1694,14 @@ fn confirm_move(app: &mut App) {
     // Cleaning-rule folders go through `recycle_rule_items`, which checks each path again
     // (never-touch list, inside its rule, no junctions); everything else goes straight to the bin.
     let rules = c.rules;
+    // Extra copies go through `recycle_duplicates`, which checks each again and moves it only
+    // while its kept copy is still there.
+    let dupes = c.dupes;
     let paths: Vec<PathBuf> = c
         .items
         .iter()
         .map(|(p, _)| p.clone())
-        .filter(|p| !rules.iter().any(|(_, q)| q == p))
+        .filter(|p| !rules.iter().any(|(_, q)| q == p) && !dupes.iter().any(|d| &d.path == p))
         .collect();
     app.disk.asked = c.items;
     log_line(
@@ -1247,6 +1722,11 @@ fn confirm_move(app: &mut App) {
         };
         if !rules.is_empty() {
             let r = ad::recycle_rule_items(&ad::RuleEnv::from_process(), &rules);
+            report.moved.extend(r.moved);
+            report.failed.extend(r.failed);
+        }
+        if !dupes.is_empty() {
+            let r = ad::recycle_duplicates(&ad::RuleEnv::from_process(), &dupes);
             report.moved.extend(r.moved);
             report.failed.extend(r.failed);
         }
@@ -1345,10 +1825,11 @@ fn mark_moved(app: &mut App, moved: &[PathBuf]) {
         }
         app.disk.removed_gen += 1;
     }
-    if let Clean::Ready { list, .. } = &mut app.disk.clean {
+    if let Clean::Ready { list, files, .. } = &mut app.disk.clean {
         for s in list.iter_mut() {
             s.items.retain(|c| !moved.contains(&c.path));
         }
+        *files = all_files(list);
     }
     if let Some(r) = &mut app.disk.review {
         r.items.retain(|c| !moved.contains(&c.path));
@@ -1359,6 +1840,9 @@ fn mark_moved(app: &mut App, moved: &[PathBuf]) {
     if let Some(r) = &mut app.disk.rules {
         r.forget(moved);
         r.select_tier(m::TierFilter::All, false);
+    }
+    if let Some(l) = dupe_list_mut(app) {
+        l.mark(moved, true);
     }
     app.disk.sel = None;
 }
@@ -1393,6 +1877,9 @@ pub fn undo(app: &mut App) {
             }
         }
         app.disk.removed_gen += 1;
+    }
+    if let Some(l) = dupe_list_mut(app) {
+        l.mark(&back, false);
     }
     if matches!(last.source, Source::Clean(_) | Source::Rules)
         || matches!(app.disk.clean, Clean::Ready { .. })
@@ -1606,7 +2093,7 @@ pub fn open(app: &mut App) {
     }
     app.disk.place = match (&app.disk.scan, app.disk.place) {
         (Scan::Running { .. }, _) => Place::Scanning,
-        (Scan::Done(_), Place::Clean | Place::Review) => app.disk.place,
+        (Scan::Done(_), Place::Clean | Place::Review | Place::Dupes) => app.disk.place,
         (Scan::Done(_), _) => Place::Results,
         (_, Place::Clean | Place::Review) => app.disk.place,
         _ => Place::Start,
@@ -1626,7 +2113,7 @@ fn to_start(app: &mut App) {
         .filter_map(|r| {
             ad::drive_space(&r)
                 .ok()
-                .map(|s| (r.clone(), volume_label(&r), s))
+                .map(|s| (r.clone(), volume_label(&r), s, ad::drive_kind(&r)))
         })
         .collect();
 }
@@ -1879,6 +2366,7 @@ fn selection(app: &App) -> Option<(usize, u64)> {
                 .sum();
             (r.checked.len(), bytes)
         }
+        Place::Dupes => dupe_list(app)?.selection(),
         _ => return None,
     };
     (n > 0).then_some((n, bytes))
@@ -2092,7 +2580,8 @@ fn live_text(app: &App) -> Option<(String, String, Option<f32>, String)> {
 }
 
 /// The folder rows, the tiles and the headline numbers the targets of the rolls come from.
-fn number_targets(app: &App) -> Vec<(String, f64)> {
+/// A finished scan's level rows are left out unless `level_rows`.
+fn number_targets(app: &App, level_rows: bool) -> Vec<(String, f64)> {
     let mut out = Vec::new();
     match &app.disk.scan {
         Scan::Running { live, .. } => {
@@ -2121,7 +2610,7 @@ fn number_targets(app: &App) -> Vec<(String, f64)> {
                     app.disk.removed.size(&d.tree, d.tree.root()) as f64,
                 )),
             }
-            if let Some(l) = &app.disk.level {
+            if let Some(l) = app.disk.level.as_ref().filter(|_| level_rows) {
                 for r in &l.rows {
                     out.push((format!("row:{}", r.name), r.size as f64));
                     out.push((format!("pct:{}", r.name), r.percent));
@@ -2129,6 +2618,9 @@ fn number_targets(app: &App) -> Vec<(String, f64)> {
             }
         }
         _ => {}
+    }
+    if let Some(l) = dupe_list(app) {
+        out.push(("dupes".to_string(), l.reclaimable() as f64));
     }
     out
 }
@@ -2277,10 +2769,37 @@ fn results_view(app: &App, now: Instant) -> Option<dp::ResultsView> {
         })
         .collect();
     let biggest = l.rows.first().map_or(1, |r| r.size.max(1));
+    // Words only for the rows that can show: the biggest (tiles, the capacity bar), the list's
+    // window from `first`, and the selected or lit one. A folder can hold tens of thousands of
+    // entries; the rest keep only the numbers the tail row adds up.
+    let tile_rows = l
+        .tiles
+        .iter()
+        .filter_map(|t| t.row)
+        .max()
+        .map_or(0, |i| i + 1)
+        .max(8);
+    let window = app.disk.first..app.disk.first + dp::FOLDER_WINDOW;
+    let (sel, lit) = (app.disk.sel, focus_row(app));
     let rows: Vec<dp::ListRow> = l
         .rows
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
+            if i >= tile_rows && !window.contains(&i) && Some(i) != sel && Some(i) != lit {
+                return dp::ListRow {
+                    name: String::new(),
+                    bytes: r.size,
+                    size: String::new(),
+                    pct: String::new(),
+                    pct_v: r.percent,
+                    bar: r.size as f32 / biggest as f32,
+                    dir: r.dir,
+                    tag: None,
+                    checked: app.disk.checked.contains(&r.id),
+                    counting: false,
+                };
+            }
             let size = rolled(app, &format!("row:{}", r.name), r.size as f64, now) as u64;
             let pct = rolled(app, &format!("pct:{}", r.name), r.percent, now);
             dp::ListRow {
@@ -2406,14 +2925,13 @@ fn kind_words(kind: SuggestionKind) -> (&'static str, Icon) {
 }
 
 /// A suggestion's one line of plain truth.
-fn kind_body(s: &ad::Suggestion) -> String {
+fn kind_body(s: &ad::Suggestion, all_files: bool) -> String {
     match s.kind {
         SuggestionKind::OldDownloads => {
             let cutoff = SystemTime::now()
                 .checked_sub(Duration::from_secs(u64::from(OLD_DAYS) * 86_400))
                 .map(|t| m::day_month(stamp(t)))
                 .unwrap_or_default();
-            let all_files = s.items.iter().all(|c| c.path.is_file());
             let what = if all_files {
                 m::plural(s.items.len() as u64, "file", "files")
             } else {
@@ -2447,7 +2965,7 @@ fn clean_view(app: &App) -> dp::CleanView {
     };
     let (n, bytes) = selection(app).unwrap_or((0, 0));
     match &app.disk.clean {
-        Clean::Ready { list, bin } => {
+        Clean::Ready { list, bin, files } => {
             let filter = tier_filter(app.disk.filter);
             let shown: Vec<&ad::Suggestion> = list.iter().filter(|s| !s.items.is_empty()).collect();
             let rule_counts = app
@@ -2475,7 +2993,7 @@ fn clean_view(app: &App) -> dp::CleanView {
                         index: i,
                         icon,
                         title: title.into(),
-                        body: kind_body(s),
+                        body: kind_body(s, files.get(i).copied().unwrap_or(false)),
                         check_first: s.kind.tag() == ad::Tag::CheckFirst,
                         size: dp::size_label(s.total()),
                         checked: app.disk.clean_checked.contains(&i),
@@ -2575,10 +3093,14 @@ fn review_view(app: &App) -> Option<dp::ReviewView> {
     let r = app.disk.review.as_ref()?;
     let (title, _) = kind_words(r.kind);
     let total: u64 = r.items.iter().map(|c| c.size).sum();
+    // Only the rows that can show: each asks the file system whether it is a folder.
+    let rows_from = r.first.min(r.items.len());
     let rows = r
         .items
         .iter()
         .enumerate()
+        .skip(rows_from)
+        .take(dp::REVIEW_WINDOW)
         .map(|(i, c)| {
             let name = c.path.file_name().map_or_else(
                 || c.path.display().to_string(),
@@ -2623,6 +3145,8 @@ fn review_view(app: &App) -> Option<dp::ReviewView> {
             m::plural(r.items.len() as u64, "item", "items"),
             dp::size_label(total)
         ),
+        len: r.items.len(),
+        rows_from,
         rows,
         first: r.first,
         selected: selected_words(n, bytes),
@@ -2776,8 +3300,13 @@ fn motion(app: &App, now: Instant) -> dp::Motion {
     } else {
         (now.saturating_duration_since(a.map_at).as_secs_f32() * 1000.0 / REFLOW_MS).min(1.0)
     };
-    let from = match screen_tiles(app) {
-        Some((tiles, names)) if reflow_p < 1.0 => tiles
+    let tiles = if reflow_p < 1.0 {
+        screen_tiles(app)
+    } else {
+        None
+    };
+    let from = match tiles {
+        Some((tiles, names)) => tiles
             .iter()
             .map(|t| a.map_from.get(&tile_key(t, |i| names[i].clone())).copied())
             .collect(),
@@ -2834,9 +3363,17 @@ fn screen_tiles(app: &App) -> Option<(Vec<dp::MapTile>, Vec<String>)> {
         }
         Scan::Done(_) if app.disk.place == Place::Results => {
             let l = app.disk.level.as_ref()?;
+            // Names up to the last row with a tile (the biggest few), not the whole level: a
+            // folder can hold tens of thousands of entries and this runs every frame.
+            let n = l
+                .tiles
+                .iter()
+                .filter_map(|t| t.row)
+                .max()
+                .map_or(0, |i| i + 1);
             Some((
                 l.tiles.clone(),
-                l.rows.iter().map(|r| r.name.clone()).collect(),
+                l.rows.iter().take(n).map(|r| r.name.clone()).collect(),
             ))
         }
         _ => None,
@@ -2854,7 +3391,10 @@ fn sync_motion(app: &mut App) {
             .iter()
             .map(|t| (tile_key(t, |i| names[i].clone()), t.rect))
             .collect();
-        let p = (now.saturating_duration_since(app.disk.anim.map_at).as_secs_f32() * 1000.0
+        let p = (now
+            .saturating_duration_since(app.disk.anim.map_at)
+            .as_secs_f32()
+            * 1000.0
             / REFLOW_MS)
             .min(1.0);
         let e = reflow_ease(app, p);
@@ -2882,7 +3422,10 @@ fn sync_motion(app: &mut App) {
         }
     }
     // Numbers roll toward their new values; a number seen for the first time just shows.
-    for (key, target) in number_targets(app) {
+    let level_key = app.disk.level.as_ref().map(|l| (l.at, l.removed_gen));
+    let level_rows = level_key != app.disk.anim.rows_synced;
+    app.disk.anim.rows_synced = level_key;
+    for (key, target) in number_targets(app, level_rows) {
         let a = &mut app.disk.anim;
         match a.rolls.get_mut(&key) {
             Some(r) if (r.to - target).abs() > 1e-9 => {
@@ -2992,13 +3535,15 @@ pub fn on_hover(app: &mut App, h: Option<Hit>) {
     }
 }
 
-fn view(app: &App) -> View {
+/// The window's content as it is now; build it once per frame.
+pub fn view(app: &App) -> View {
     let now = Instant::now();
     let screen = match app.disk.place {
         Place::Scanning => live_results(app, now).map(Screen::Results),
         Place::Results => results_view(app, now).map(Screen::Results),
         Place::Clean => Some(Screen::Clean(clean_view(app))),
         Place::Review => review_view(app).map(Screen::Review),
+        Place::Dupes => Some(Screen::Dupes(dupes_view(app, now))),
         Place::Start => None,
     }
     .unwrap_or_else(|| {
@@ -3006,16 +3551,22 @@ fn view(app: &App) -> View {
             app.disk
                 .drives
                 .iter()
-                .map(|(r, label, s)| dp::DriveRow {
+                .map(|(r, label, s, kind)| dp::DriveRow {
                     name: format!("{} {label}", m::drive_label(r)),
                     free: format!(
-                        "{} free of {}",
+                        "{} free of {}{}",
                         m::size_round(s.free),
-                        m::size_round(s.total)
+                        m::size_round(s.total),
+                        match kind {
+                            ad::DriveKind::Ssd => " · SSD",
+                            ad::DriveKind::Hdd => " · hard drive",
+                            ad::DriveKind::Unknown => "",
+                        }
                     ),
                     used: s.used_percent() as f32 / 100.0,
                 })
                 .collect(),
+            app.disk.find_dupes,
         )
     });
     View {
@@ -3038,10 +3589,6 @@ pub fn size(app: &App) -> (f32, f32) {
 pub fn prepare(app: &mut App) {
     level(app);
     sync_motion(app);
-}
-
-pub fn draw(app: &App, dc: &ID2D1DeviceContext, hover: Option<Hit>) {
-    dp::draw(&app.g, dc, &app.theme, &app.fonts, &view(app), hover);
 }
 
 pub fn hit(app: &App, x: f32, y: f32) -> Option<Hit> {
@@ -3180,6 +3727,25 @@ fn keep_visible(app: &mut App) {
                 *first = at.saturating_sub(1);
             } else if at >= *first + fit.clean {
                 *first = at + 1 - fit.clean;
+            }
+        }
+        Place::Dupes => {
+            let Screen::Dupes(d) = &view(app).screen else {
+                return;
+            };
+            let Some(at) = dp::dupe_entry_iter(d)
+                .enumerate()
+                .filter(|(_, e)| matches!(e, dp::DupeEntry::Row(..)))
+                .nth(c)
+                .map(|(k, _)| k)
+            else {
+                return;
+            };
+            let first = &mut app.disk.dupes.first;
+            if at <= *first {
+                *first = at.saturating_sub(1);
+            } else if at >= *first + fit.dupes {
+                *first = at + 1 - fit.dupes;
             }
         }
         _ => {}
@@ -3329,6 +3895,40 @@ fn ask_for_selection(app: &mut App) {
             let lines = path_lines(&items, true);
             ask(app, items, lines, Source::Tree);
         }
+        Place::Dupes => {
+            let Some(list) = dupe_list(app) else { return };
+            let mut picked = list.removals();
+            if picked.is_empty() {
+                // Nothing ticked: Delete takes the copy under the keyboard, never a keeper.
+                let at = app
+                    .disk
+                    .cursor
+                    .and_then(|c| dupe_rows(app).get(c).copied())
+                    .and_then(|(g, row)| dupe_at(app, g, row));
+                if let Some((set, copy)) = at {
+                    let s = &list.sets[set];
+                    if copy != s.keeper() {
+                        picked.push((
+                            s.copies[copy].path.clone(),
+                            s.size,
+                            s.copies[s.keeper()].path.clone(),
+                        ));
+                    }
+                }
+            }
+            let items: Vec<(PathBuf, u64)> =
+                picked.iter().map(|(p, sz, _)| (p.clone(), *sz)).collect();
+            // Your own files: every line asks for a look.
+            let lines = path_lines(&items, true);
+            let removals = picked
+                .into_iter()
+                .map(|(path, size, keep)| ad::DupeRemoval { path, size, keep })
+                .collect();
+            ask(app, items, lines, Source::Dupes);
+            if let Some(c) = &mut app.disk.confirm {
+                c.dupes = removals;
+            }
+        }
         _ => {}
     }
 }
@@ -3346,6 +3946,9 @@ fn open_selection(app: &mut App) {
                     .map(|c| c.path.clone())
                     .collect()
             })
+            .unwrap_or_default(),
+        Place::Dupes => dupe_list(app)
+            .map(|l| l.removals().into_iter().map(|(p, _, _)| p).collect())
             .unwrap_or_default(),
         _ => {
             let ids = top_checked(app);
@@ -3372,6 +3975,11 @@ fn clear_selection(app: &mut App) {
                 r.checked.clear();
             }
         }
+        Place::Dupes => {
+            if let Some(l) = dupe_list_mut(app) {
+                l.clear();
+            }
+        }
         _ => app.disk.checked.clear(),
     }
 }
@@ -3396,9 +4004,16 @@ fn card_action(app: &mut App, i: usize) {
                 // Rule folders that stayed go through the rule checks again.
                 let paths: Vec<PathBuf> = stayed.iter().map(|(p, _)| p.clone()).collect();
                 let rules = rule_pairs(app, &paths);
+                // So are extra copies, each with the copy that stays.
+                let dupes = if source == Source::Dupes {
+                    dupe_pairs(app, &paths)
+                } else {
+                    Vec::new()
+                };
                 ask(app, stayed, lines, source);
                 if let Some(c) = &mut app.disk.confirm {
                     c.rules = rules;
+                    c.dupes = dupes;
                 }
             }
         }
@@ -3456,6 +4071,12 @@ pub fn click(app: &mut App, h: Hit) {
             enter_rows(app);
         }
         Hit::Back => match app.disk.place {
+            Place::Dupes if app.disk.done().is_some() => {
+                app.disk.place = Place::Results;
+                app.disk.cursor = None;
+                enter_rows(app);
+            }
+            Place::Dupes => to_start(app),
             Place::Clean if app.disk.clean_from == Place::Results && app.disk.done().is_some() => {
                 app.disk.place = Place::Results;
                 enter_rows(app);
@@ -3546,14 +4167,46 @@ pub fn click(app: &mut App, h: Hit) {
             disk_window::close(app);
             return;
         }
+        Hit::OpenDupes => open_dupes_place(app),
+        Hit::DupesOption => toggle_find_dupes(app),
+        Hit::DupesCheck => {
+            start_dupes(app);
+            enter_rows(app);
+        }
+        Hit::DupesStop => stop_dupes(app),
+        Hit::DupesAll => {
+            if let Some(l) = dupe_list_mut(app) {
+                let on = !l.all_extras_picked();
+                l.pick_extras(on);
+            }
+        }
+        Hit::DupeRow(g, row) | Hit::DupeCheck(g, row) => {
+            app.disk.cursor = dupe_rows(app).iter().position(|&x| x == (g, row));
+            toggle_dupe(app, g, row);
+        }
+        Hit::DupeKeep(g, row) => {
+            app.disk.cursor = dupe_rows(app).iter().position(|&x| x == (g, row));
+            keep_dupe(app, g, row);
+        }
     }
     refresh(app);
+}
+
+/// "Also find duplicate files" on the drive list, kept in disk.json.
+fn toggle_find_dupes(app: &mut App) {
+    app.disk.find_dupes = !app.disk.find_dupes;
+    app.disk.save();
+    log_line(
+        app,
+        &format!("disk: find duplicate files {}", app.disk.find_dupes),
+    );
 }
 
 /// The length of the list the keyboard moves in.
 fn list_len(app: &App) -> usize {
     match app.disk.place {
-        Place::Start => app.disk.drives.len(),
+        // The drives, then "Also find duplicate files".
+        Place::Start => app.disk.drives.len() + 1,
         Place::Results => match app.disk.tab {
             Tab::Folders => app.disk.level.as_ref().map_or(0, |l| l.rows.len()),
             Tab::Files => app.disk.level.as_ref().map_or(0, |l| l.files.len()),
@@ -3561,6 +4214,7 @@ fn list_len(app: &App) -> usize {
         },
         Place::Clean => clean_order(app).len(),
         Place::Review => app.disk.review.as_ref().map_or(0, |r| r.items.len()),
+        Place::Dupes => dupe_rows(app).len(),
         Place::Scanning => 0,
     }
 }
@@ -3640,6 +4294,15 @@ pub fn on_keydown(app: &mut App, vk: u16) -> bool {
             set_filter(app, all[j]);
         }
         VK_SPACE => match app.disk.place {
+            Place::Start if app.disk.cursor == Some(app.disk.drives.len()) => {
+                toggle_find_dupes(app)
+            }
+            Place::Dupes => {
+                if let Some((g, row)) = app.disk.cursor.and_then(|c| dupe_rows(app).get(c).copied())
+                {
+                    toggle_dupe(app, g, row);
+                }
+            }
             Place::Results if folders => {
                 if let Some(s) = app.disk.sel {
                     toggle_row(app, s);
@@ -3661,6 +4324,16 @@ pub fn on_keydown(app: &mut App, vk: u16) -> bool {
             }
         },
         VK_RETURN => match app.disk.place {
+            Place::Start if app.disk.cursor == Some(app.disk.drives.len()) => {
+                toggle_find_dupes(app)
+            }
+            // Enter makes the copy under the keyboard the one to keep.
+            Place::Dupes => {
+                if let Some((g, row)) = app.disk.cursor.and_then(|c| dupe_rows(app).get(c).copied())
+                {
+                    keep_dupe(app, g, row);
+                }
+            }
             Place::Start => {
                 if let Some(root) = app
                     .disk
@@ -3692,7 +4365,7 @@ pub fn on_keydown(app: &mut App, vk: u16) -> bool {
                 app.disk.place = Place::Clean;
                 enter_rows(app);
             }
-            Place::Clean => click(app, Hit::Back),
+            Place::Clean | Place::Dupes => click(app, Hit::Back),
             Place::Results => up(app),
             _ => {}
         },
@@ -3741,6 +4414,15 @@ pub fn on_wheel(app: &mut App, x: f32, y: f32, delta: i16) {
                     as usize;
             }
         }
+        Some(dp::Scroll::Dupes) => {
+            let n = match &v.screen {
+                Screen::Dupes(d) => dp::dupe_entry_count(d),
+                _ => 0,
+            };
+            app.disk.dupes.first = (app.disk.dupes.first as i64 + step)
+                .clamp(0, n.saturating_sub(fit.dupes) as i64)
+                as usize;
+        }
         Some(dp::Scroll::Clean) => {
             let n = match &v.screen {
                 Screen::Clean(c) => dp::clean_entries(c).len(),
@@ -3752,7 +4434,7 @@ pub fn on_wheel(app: &mut App, x: f32, y: f32, delta: i16) {
         }
         None => return,
     }
-    disk_window::refresh(app);
+    disk_window::refresh_soon(app);
 }
 
 /// A scan's tree takes about 130 bytes per file and folder (a whole drive is hundreds of MB), so it
@@ -3860,6 +4542,9 @@ pub fn shutdown(app: &mut App) {
     if let Scan::Running { cancel, .. } = &app.disk.scan {
         cancel.store(true, Ordering::Relaxed);
     }
+    if let DupeRun::Running { cancel, .. } = &app.disk.dupes.run {
+        cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -3877,6 +4562,18 @@ mod tests {
             done_words(Path::new(r"C:\dev\clippy"), 1536 << 20, Some(s)),
             "clippy 1.5 GB"
         );
+    }
+
+    #[test]
+    fn the_duplicates_option_is_off_by_default_and_kept() {
+        let dir = std::env::temp_dir().join(format!("orb-proto-disk-dupes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut d = Disk::load_from(dir.join("disk.json"));
+        assert!(!d.find_dupes, "off until you tick it");
+        d.find_dupes = true;
+        d.save();
+        assert!(Disk::load_from(d.file.clone()).find_dupes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3916,5 +4613,158 @@ mod tests {
             free: 3
         }));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn synthetic_dupes() -> m::DupeList {
+        let now = SystemTime::now();
+        let groups: Vec<ad::DupeGroup> = (0..2456usize)
+            .map(|g| {
+                let n = if g % 3 == 0 { 6 } else { 3 };
+                let size = ((g as u64 % 500) + 1) << 20;
+                ad::DupeGroup {
+                    size,
+                    files: (0..n)
+                        .map(|k| ad::DupeFile {
+                            path: PathBuf::from(format!(
+                                r"C:\Users\dopamine\AppData\Local\Packages\Some.Long.Package_8wekyb3d8bbwe\LocalCache\folder {k}\sub folder {g}\holiday video {g}.mp4"
+                            )),
+                            size,
+                            modified: Some(now - Duration::from_secs((g * 7 + k) as u64 * 3600)),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        m::DupeList::new(&groups)
+    }
+
+    /// Milliseconds between WM_TIMERs of a `ms` thread timer, averaged over `n` ticks.
+    fn timer_interval(ms: u32, n: u32) -> f64 {
+        use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, SetTimer, MSG, WM_TIMER};
+        unsafe {
+            let id = SetTimer(None, 0, ms, None);
+            let mut msg = MSG::default();
+            let mut start = None;
+            let mut ticks = 0;
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                if msg.message != WM_TIMER {
+                    continue;
+                }
+                match start {
+                    None => start = Some(Instant::now()),
+                    Some(_) => ticks += 1,
+                }
+                if ticks == n {
+                    break;
+                }
+            }
+            let _ = KillTimer(None, id);
+            start.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0 / f64::from(n))
+        }
+    }
+
+    /// The Duplicates list after a C: check (2,456 groups, 9,825 copies) scrolled for 60 frames:
+    /// what one frame costs (the view, the hit test and the drawing). Before the fix a frame
+    /// built every row (6.7 ms a view, two views a frame) and cut every path one character at a
+    /// time (24 ms of drawing), about 38 ms in release. Prints with `--nocapture`; set
+    /// ORB_DISK_FRAMES=1 on the exe for the same numbers per frame in the log.
+    #[test]
+    fn frame_cost_of_a_big_list() {
+        use windows::Win32::Graphics::Direct2D::Common::*;
+        use windows::Win32::Graphics::Direct2D::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Ok(g) = crate::gfx::Shared::new() else {
+            eprintln!("no Direct3D device here; skipped");
+            return;
+        };
+        let fonts = crate::ui::Fonts::new(&g);
+        let theme = crate::ui::theme(false);
+        let list = synthetic_dupes();
+        let copies: usize = list.sets.iter().map(|s| s.copies.len()).sum();
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+            ..Default::default()
+        };
+        let size = D2D_SIZE_U {
+            width: dp::W as u32,
+            height: dp::H as u32,
+        };
+        let bmp = unsafe { g.dc.CreateBitmap(size, None, 0, &props) }.unwrap();
+        let frames = 60;
+        let (mut view_ms, mut draw_ms, mut worst) = (0.0, 0.0, 0.0f64);
+        for f in 0..frames {
+            // Three rows a frame, as a quick wheel scrolls, deep in the list.
+            let first = 5000 + f * 3;
+            let t0 = Instant::now();
+            let shown = list.shown();
+            let v = dp::View {
+                screen: Screen::Dupes(dp::DupesView {
+                    place: "C:, from the 09:12 scan".into(),
+                    total: dp::size_label(list.reclaimable()),
+                    total_label: " to reclaim",
+                    sub: m::plural(shown.len() as u64, "group", "groups"),
+                    body: dp::DupesBody::Groups(dupe_groups(&list, &shown, first)),
+                    first,
+                    selected: None,
+                    all: list.all_extras_picked(),
+                    can_recycle: true,
+                }),
+                cards: Vec::new(),
+                confirm: None,
+                cursor: None,
+                kb: false,
+                room: dp::H,
+                motion: dp::Motion::default(),
+            };
+            std::hint::black_box(dp::size(&g, &fonts, &v));
+            std::hint::black_box(dp::fit(&g, &fonts, &v));
+            std::hint::black_box(dp::hit(&g, &fonts, &v, 300.0, 400.0));
+            let t1 = Instant::now();
+            unsafe {
+                g.dc.SetTarget(&bmp);
+                g.dc.BeginDraw();
+            }
+            dp::draw(
+                &g,
+                &g.dc,
+                &theme,
+                &fonts,
+                &v,
+                Some(dp::Hit::DupeRow(1300, 1)),
+            );
+            unsafe {
+                let _ = g.dc.EndDraw(None, None);
+                g.dc.SetTarget(None);
+            }
+            let (a, b) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+            view_ms += a * 1000.0;
+            draw_ms += b * 1000.0;
+            worst = worst.max((a + b) * 1000.0);
+        }
+        let n = frames as f64;
+        let per = (view_ms + draw_ms) / n;
+        let coarse = timer_interval(16, 20);
+        let ten = timer_interval(10, 20);
+        unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+        let fine = timer_interval(16, 20);
+        unsafe { windows::Win32::Media::timeEndPeriod(1) };
+        eprintln!(
+            "disk: {copies} copies, frame {per:.2} ms (view {:.2}, draw {:.2}), worst {worst:.2} ms; \
+             16 ms timer every {coarse:.1} ms, {fine:.1} ms with a 1 ms clock, 10 ms timer every {ten:.1} ms",
+            view_ms / n,
+            draw_ms / n
+        );
+        // Loose enough for a debug build on a busy machine, tight enough to catch a list that
+        // builds or measures every row again (that cost about 58 ms a frame in debug).
+        assert!(
+            per < 25.0,
+            "a frame of the 10,000-copy list took {per:.1} ms"
+        );
     }
 }
