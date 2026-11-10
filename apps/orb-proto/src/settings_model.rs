@@ -612,12 +612,15 @@ pub fn adjust_words(m: i32) -> String {
     }
 }
 
-/// The file name a path ends in ("Adzan Makkah.mp3").
+/// The file name a path ends in ("Adzan Makkah.mp3"). Splits on both separators, so a path
+/// saved on Windows reads the same on macOS.
 pub fn file_name(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// Audio the adzan can play (winmm MCI opens these by extension).

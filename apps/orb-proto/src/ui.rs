@@ -1124,11 +1124,7 @@ pub fn draw_pill(
         if p.dot {
             cv.fill_ellipse(&ellipse(chip.point.X, cy, 5.0), ink);
         } else {
-            let icon_c = if ember {
-                with_alpha(t.ember, ca)
-            } else {
-                ink
-            };
+            let icon_c = if ember { with_alpha(t.ember, ca) } else { ink };
             paint_icon(cv, p.icon, chip.point.X, cy, 16.0, icon_c);
         }
         cv.text(

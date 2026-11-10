@@ -225,3 +225,104 @@ pub fn run_windows(dir: &Path) -> windows::core::Result<()> {
     }
     Ok(())
 }
+
+/// The same scenes on macOS through Core Graphics and Core Text, plus the orb on Metal.
+#[cfg(target_os = "macos")]
+pub fn run_mac(dir: &Path) {
+    use crate::canvas::Canvas;
+    use crate::mac::cg::Bitmap;
+    use crate::ui;
+
+    let fonts = ui::Fonts::new();
+    let (t, tomorrow) = times();
+    let items = dial_items(&t, tomorrow);
+    let kids = drink_children();
+    let pd = panel_data();
+    let shot = |name: &str, w: f32, h: f32, draw: &dyn Fn(&mut dyn Canvas)| {
+        let b = Bitmap::new(w, h, SCALE);
+        draw(&mut b.canvas());
+        write(dir, name, b.pw as u32, b.ph as u32, b.rgba());
+    };
+    for dark in [false, true] {
+        let th = ui::theme(dark);
+        let tag = if dark { "dark" } else { "light" };
+        shot(&format!("dial-{tag}"), ui::DIAL_W, ui::DIAL_H, &|cv| {
+            ui::draw_dial(
+                cv,
+                &th,
+                &fonts,
+                &items,
+                Some(2),
+                1.0,
+                false,
+                false,
+                None,
+                None,
+                1.0,
+            );
+        });
+        let branch = DialBranch {
+            parent: 4,
+            children: &kids,
+            aimed: Some(1),
+            reveal: 1.0,
+        };
+        shot(
+            &format!("dial-branch-{tag}"),
+            ui::DIAL_W,
+            ui::DIAL_H,
+            &|cv| {
+                ui::draw_dial(
+                    cv,
+                    &th,
+                    &fonts,
+                    &items,
+                    Some(4),
+                    1.0,
+                    false,
+                    false,
+                    Some(&branch),
+                    None,
+                    0.0,
+                );
+            },
+        );
+        for (name, p) in [
+            ("pill-drink", drink_pill()),
+            ("pill-prayer", prayer_pill(&t)),
+        ] {
+            let l = ui::layout_pill(&fonts, &p);
+            let (pw, ph) = (l.w + 2.0 * ui::PILL_PAD, ui::PILL_H + 2.0 * ui::PILL_PAD);
+            shot(&format!("{name}-{tag}"), pw, ph, &|cv| {
+                ui::draw_pill(
+                    cv,
+                    &th,
+                    &fonts,
+                    &p,
+                    &l,
+                    1.0,
+                    true,
+                    PILL_HOVER,
+                    ui::PILL_PAD,
+                    ui::PILL_PAD,
+                );
+            });
+        }
+        let view = panel_view(&pd);
+        shot(
+            &format!("prayer-{tag}"),
+            crate::panel::W,
+            crate::panel::H,
+            &|cv| {
+                crate::panel::draw(cv, &th, &fonts, &view);
+            },
+        );
+    }
+    // The orb at rest: by day (Ashar light) and after Isya (dimmed).
+    for (name, angle, brightness) in [("orb-day", 128.0, 1.0), ("orb-night", 90.0, 0.7)] {
+        match crate::mac::metal::snapshot(angle, brightness, SCALE) {
+            Some((w, h, px)) => write(dir, name, w, h, px),
+            None => eprintln!("{name}: Metal is not available"),
+        }
+    }
+}
