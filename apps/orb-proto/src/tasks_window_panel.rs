@@ -13,9 +13,9 @@ use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use crate::gfx::*;
 use crate::motion::{self, Roll};
 use crate::tasks_panel::clipped_text;
-use crate::ui::{draw_icon, text_num, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{draw_icon, text_num, title_button, with_alpha, Fonts, Icon, Theme};
 
-/// The window's logical width.
+/// The window's logical width when it opens, and the least it can be resized to.
 pub const W: f32 = 600.0;
 /// Its height when the screen has room.
 pub const H: f32 = 680.0;
@@ -24,7 +24,6 @@ pub const MIN_H: f32 = 420.0;
 /// The title band.
 pub const TOP: f32 = 44.0;
 const X0: f32 = 20.0;
-const X1: f32 = W - X0;
 const FIELD_T: f32 = TOP + 16.0;
 const FIELD_B: f32 = FIELD_T + 40.0;
 const TEXT_X: f32 = X0 + 38.0;
@@ -87,7 +86,11 @@ pub struct MenuV {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
+    /// The window's logical size: `W` wide when it opens, wider when resized or maximized.
+    pub w: f32,
     pub h: f32,
+    /// Maximized: square corners.
+    pub max: bool,
     pub open_n: usize,
     pub field: FieldV,
     pub line: String,
@@ -105,6 +108,8 @@ pub struct View {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Hit {
     Close,
+    /// The title band's maximize / restore button.
+    Max,
     Field,
     Add,
     Header(usize),
@@ -168,39 +173,74 @@ pub fn reveal(v: &View, i: usize) -> f32 {
     s.clamp(0.0, max_scroll(v))
 }
 
-fn close_rect() -> Rect {
-    (W - 8.0 - 28.0, 8.0, W - 8.0, 36.0)
+/// The content column's widest. A wider window (maximized) centres the column instead of
+/// stretching the rows, so a due date stays near its title.
+const COL: f32 = 720.0;
+
+/// The content column: its left offset in the window, and the view as the column sees it
+/// (`w` is the column's width). The title band keeps the window's own width.
+fn column(v: &View) -> (f32, View) {
+    let cw = v.w.min(COL);
+    let off = ((v.w - cw) / 2.0).floor();
+    (off, View { w: cw, ..v.clone() })
 }
 
-fn add_rect(g: &Shared, f: &Fonts) -> Rect {
-    let w = g.text_width("Add", &f.title) + 28.0;
-    (X1 - 4.0 - w, FIELD_T + 4.0, X1 - 4.0, FIELD_B - 4.0)
+fn translate(x: f32) -> windows_numerics::Matrix3x2 {
+    windows_numerics::Matrix3x2 {
+        M11: 1.0,
+        M12: 0.0,
+        M21: 0.0,
+        M22: 1.0,
+        M31: x,
+        M32: 0.0,
+    }
 }
 
-fn undo_rect(h: f32) -> Rect {
-    (X0, h - 12.0 - UNDO_H, X1, h - 12.0)
+/// The right edge of the content: 20 px in from the column's right edge.
+fn x1(w: f32) -> f32 {
+    w - X0
 }
 
-fn undo_button(h: f32) -> Rect {
-    let r = undo_rect(h);
+fn close_rect(w: f32) -> Rect {
+    (w - 8.0 - 28.0, 8.0, w - 8.0, 36.0)
+}
+
+/// Maximize / restore, just left of close.
+fn max_rect(w: f32) -> Rect {
+    let c = close_rect(w);
+    (c.0 - 4.0 - 28.0, c.1, c.0 - 4.0, c.3)
+}
+
+fn add_rect(g: &Shared, f: &Fonts, w: f32) -> Rect {
+    let bw = g.text_width("Add", &f.title) + 28.0;
+    let r = x1(w) - 4.0;
+    (r - bw, FIELD_T + 4.0, r, FIELD_B - 4.0)
+}
+
+fn undo_rect(v: &View) -> Rect {
+    (X0, v.h - 12.0 - UNDO_H, x1(v.w), v.h - 12.0)
+}
+
+fn undo_button(v: &View) -> Rect {
+    let r = undo_rect(v);
     let cy = (r.1 + r.3) / 2.0;
     (r.2 - 10.0 - 72.0, cy - 16.0, r.2 - 10.0, cy + 16.0)
 }
 
 /// The parts of a task row on screen at `top`: (due label's left edge, due button, delete
 /// button). The buttons sit just left of the due label.
-fn row_parts(g: &Shared, f: &Fonts, r: &RowV, top: f32) -> (f32, Rect, Rect) {
+fn row_parts(g: &Shared, f: &Fonts, r: &RowV, top: f32, w: f32) -> (f32, Rect, Rect) {
     let fmt = if r.overdue { &f.small_medium } else { &f.small };
     let due_w = g.text_width(&r.due, fmt) + if r.repeat { 16.0 } else { 0.0 };
-    let lane = X1 - 12.0 - due_w;
+    let lane = x1(w) - 12.0 - due_w;
     let cy = top + ROW / 2.0;
     let del = (lane - 10.0 - 28.0, cy - 14.0, lane - 10.0, cy + 14.0);
     let due = (del.0 - 4.0 - 28.0, cy - 14.0, del.0 - 4.0, cy + 14.0);
     (lane, due, del)
 }
 
-fn edit_rect(g: &Shared, f: &Fonts, r: &RowV, top: f32) -> Rect {
-    let (lane, _, _) = row_parts(g, f, r, top);
+fn edit_rect(g: &Shared, f: &Fonts, r: &RowV, top: f32, w: f32) -> Rect {
+    let (lane, _, _) = row_parts(g, f, r, top, w);
     let cy = top + ROW / 2.0;
     (X0 + 34.0, cy - 15.0, lane - 10.0, cy + 15.0)
 }
@@ -211,9 +251,9 @@ fn menu_rect(v: &View, m: &MenuV, g: &Shared, f: &Fonts) -> Option<Rect> {
         return None;
     };
     let top = top - v.scroll;
-    let (_, due, _) = row_parts(g, f, r, top);
+    let (_, due, _) = row_parts(g, f, r, top, v.w);
     let mh = m.rows.len() as f32 * MENU_ROW + 12.0;
-    let l = ((due.0 + due.2) / 2.0 - MENU_W / 2.0).clamp(X0, X1 - MENU_W);
+    let l = ((due.0 + due.2) / 2.0 - MENU_W / 2.0).clamp(X0, x1(v.w) - MENU_W);
     let below = top + ROW + 4.0;
     let t = if below + mh > list_bottom(v.h, v.undo.is_some()) {
         top - 4.0 - mh
@@ -240,12 +280,18 @@ fn visible(v: &View) -> Vec<(usize, f32, f32)> {
 }
 
 pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
-    if inside(&close_rect(), x, y) {
+    if inside(&close_rect(v.w), x, y) {
         return Some(Hit::Close);
+    }
+    if inside(&max_rect(v.w), x, y) {
+        return Some(Hit::Max);
     }
     if y < TOP {
         return None;
     }
+    let (off, col) = column(v);
+    let (v, x) = (&col, x - off);
+    let x1 = x1(v.w);
     if let Some(m) = &v.menu {
         if let Some(r) = menu_rect(v, m, g, f) {
             if inside(&r, x, y) {
@@ -256,24 +302,24 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
         }
     }
     if v.undo.is_some() {
-        if inside(&undo_button(v.h), x, y) {
+        if inside(&undo_button(v), x, y) {
             return Some(Hit::Undo);
         }
-        if inside(&undo_rect(v.h), x, y) {
+        if inside(&undo_rect(v), x, y) {
             return None;
         }
     }
-    if inside(&add_rect(g, f), x, y) {
+    if inside(&add_rect(g, f, v.w), x, y) {
         return Some(Hit::Add);
     }
-    if inside(&(X0, FIELD_T, X1, FIELD_B), x, y) {
+    if inside(&(X0, FIELD_T, x1, FIELD_B), x, y) {
         return Some(Hit::Field);
     }
     if y < LIST_T || y > list_bottom(v.h, v.undo.is_some()) {
         return None;
     }
     for (i, top, h) in visible(v) {
-        if !(top..top + h).contains(&y) || !(X0..=X1).contains(&x) {
+        if !(top..top + h).contains(&y) || !(X0..=x1).contains(&x) {
             continue;
         }
         return match &v.items[i] {
@@ -281,9 +327,9 @@ pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
             ItemV::Header { .. } => None,
             ItemV::Task(r) => {
                 if v.editing.as_ref().is_some_and(|(e, _)| *e == i) {
-                    return inside(&edit_rect(g, f, r, top), x, y).then_some(Hit::Edit(i));
+                    return inside(&edit_rect(g, f, r, top, v.w), x, y).then_some(Hit::Edit(i));
                 }
-                let (_, due, del) = row_parts(g, f, r, top);
+                let (_, due, del) = row_parts(g, f, r, top, v.w);
                 if x < X0 + 36.0 {
                     Some(Hit::Check(i))
                 } else if inside(&del, x, y) {
@@ -328,19 +374,23 @@ fn byte_at(g: &Shared, fmt: &IDWriteTextFormat, fv: &FieldV, local: f32) -> usiz
 
 /// The add field's byte nearest a click at window x.
 pub fn field_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
-    let room = add_rect(g, f).0 - 10.0 - TEXT_X;
+    let (off, col) = column(v);
+    let (v, x) = (&col, x - off);
+    let room = add_rect(g, f, v.w).0 - 10.0 - TEXT_X;
     let local = x - TEXT_X + text_scroll(g, &f.body, &v.field, room);
     byte_at(g, &f.body, &v.field, local)
 }
 
 /// The inline edit's byte nearest a click at window x.
 pub fn edit_byte_at(g: &Shared, f: &Fonts, v: &View, x: f32) -> usize {
+    let (off, col) = column(v);
+    let (v, x) = (&col, x - off);
     let Some((i, fv)) = &v.editing else { return 0 };
     let (Some((top, _)), Some(ItemV::Task(r))) = (item_tops(v).get(*i).copied(), v.items.get(*i))
     else {
         return 0;
     };
-    let er = edit_rect(g, f, r, top - v.scroll);
+    let er = edit_rect(g, f, r, top - v.scroll, v.w);
     let room = er.2 - er.0 - 20.0;
     let local = x - er.0 - 10.0 + text_scroll(g, &f.body, fv, room);
     byte_at(g, &f.body, fv, local)
@@ -420,18 +470,19 @@ fn draw_field(
     hover: Option<Hit>,
 ) {
     let fv = &v.field;
+    let x1 = x1(v.w);
     let cy = (FIELD_T + FIELD_B) / 2.0;
     unsafe {
         if fv.focused {
             dc.DrawRoundedRectangle(
-                &rrect(X0 - 2.5, FIELD_T - 2.5, X1 + 2.5, FIELD_B + 2.5, 22.5),
+                &rrect(X0 - 2.5, FIELD_T - 2.5, x1 + 2.5, FIELD_B + 2.5, 22.5),
                 &brush(dc, with_alpha(t.text, 0.10)),
                 4.0,
                 None,
             );
         }
         dc.FillRoundedRectangle(
-            &rrect(X0, FIELD_T, X1, FIELD_B, 20.0),
+            &rrect(X0, FIELD_T, x1, FIELD_B, 20.0),
             &brush(dc, t.surface),
         );
         let edge = if fv.focused {
@@ -440,15 +491,15 @@ fn draw_field(
             t.hair
         };
         dc.DrawRoundedRectangle(
-            &rrect(X0 + 0.5, FIELD_T + 0.5, X1 - 0.5, FIELD_B - 0.5, 19.5),
+            &rrect(X0 + 0.5, FIELD_T + 0.5, x1 - 0.5, FIELD_B - 0.5, 19.5),
             &brush(dc, edge),
             1.0,
             None,
         );
     }
-    crate::depth::lip(g, dc, t, X0, FIELD_T, X1, FIELD_B, 20.0, 1.0);
+    crate::depth::lip(g, dc, t, X0, FIELD_T, x1, FIELD_B, 20.0, 1.0);
     draw_icon(g, dc, Icon::Plus, X0 + 20.0, cy, 15.0, &brush(dc, t.muted));
-    let add = add_rect(g, f);
+    let add = add_rect(g, f, v.w);
     let can = !fv.text.trim().is_empty();
     let fill = match (can, hover == Some(Hit::Add)) {
         (true, true) => with_alpha(t.text, 0.86),
@@ -495,6 +546,7 @@ fn draw_header(
     first: bool,
     hovered: bool,
     ring: bool,
+    x1: f32,
 ) {
     let ItemV::Header {
         name,
@@ -510,14 +562,14 @@ fn draw_header(
         unsafe {
             dc.DrawLine(
                 pt(X0, top + 6.5),
-                pt(X1, top + 6.5),
+                pt(x1, top + 6.5),
                 &brush(dc, t.hair),
                 1.0,
                 None,
             )
         };
     }
-    let r = (X0, top + 8.0, X1, top + HEAD);
+    let r = (X0, top + 8.0, x1, top + HEAD);
     if hovered {
         unsafe { dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 8.0), &brush(dc, t.raised)) };
     }
@@ -543,14 +595,14 @@ fn draw_header(
             } else {
                 Icon::ChevronRight
             },
-            X1 - 18.0,
+            x1 - 18.0,
             (r.1 + r.3) / 2.0,
             12.0,
             &muted,
         );
-        X1 - 32.0
+        x1 - 32.0
     } else {
-        X1 - 12.0
+        x1 - 12.0
     };
     motion::rolling_text_right(
         g,
@@ -604,6 +656,7 @@ fn draw_task(
 ) {
     let ink = brush(dc, t.text);
     let muted = brush(dc, t.muted);
+    let x1 = x1(v.w);
     let cy = top + ROW / 2.0;
     let editing = v
         .editing
@@ -616,11 +669,11 @@ fn draw_task(
     let lit = (hov || ring || menu_here) && editing.is_none();
     if hov || menu_here {
         unsafe {
-            dc.FillRoundedRectangle(&rrect(X0, top, X1, top + ROW, 8.0), &brush(dc, t.raised))
+            dc.FillRoundedRectangle(&rrect(X0, top, x1, top + ROW, 8.0), &brush(dc, t.raised))
         };
     }
     if ring {
-        focus_ring(dc, t, (X0, top, X1, top + ROW), 8.0);
+        focus_ring(dc, t, (X0, top, x1, top + ROW), 8.0);
     }
     // The 18 px rounded checkbox; a done task is filled with a tick.
     let (bx, by) = (X0 + 11.0, cy - 9.0);
@@ -646,14 +699,14 @@ fn draw_task(
             );
         }
     }
-    let (lane, due_b, del_b) = row_parts(g, f, r, top);
+    let (lane, due_b, del_b) = row_parts(g, f, r, top, v.w);
     let due_fmt = if r.overdue { &f.small_medium } else { &f.small };
     right_text(
         g,
         dc,
         &r.due,
         due_fmt,
-        X1 - 12.0,
+        x1 - 12.0,
         top,
         ROW,
         if r.overdue { &ink } else { &muted },
@@ -662,7 +715,7 @@ fn draw_task(
         draw_icon(g, dc, Icon::Repeat, lane + 7.0, cy, 11.0, &muted);
     }
     if let Some(fv) = editing {
-        let er = edit_rect(g, f, r, top);
+        let er = edit_rect(g, f, r, top, v.w);
         unsafe {
             dc.FillRoundedRectangle(&rrect(er.0, er.1, er.2, er.3, 15.0), &brush(dc, t.surface));
             dc.DrawRoundedRectangle(
@@ -775,7 +828,7 @@ fn draw_undo(
     hover: Option<Hit>,
 ) {
     let Some(title) = &v.undo else { return };
-    let r = undo_rect(v.h);
+    let r = undo_rect(v);
     let cy = (r.1 + r.3) / 2.0;
     unsafe {
         dc.FillRoundedRectangle(&rrect(r.0, r.1, r.2, r.3, 12.0), &brush(dc, t.surface));
@@ -796,7 +849,7 @@ fn draw_undo(
     let label = "Deleted";
     let lw = g.text_width(label, &f.title);
     text(dc, label, &f.title, r.0 + 46.0, r.1, lw + 2.0, UNDO_H, &ink);
-    let b = undo_button(v.h);
+    let b = undo_button(v);
     clipped_text(
         g,
         dc,
@@ -829,9 +882,14 @@ pub fn draw(
     hover: Option<Hit>,
 ) {
     let (ink, muted, hair) = (brush(dc, t.text), brush(dc, t.muted), brush(dc, t.hair));
+    let w = v.w;
+    // A maximized window has square corners (it has no rounded region then either).
+    let rad = if v.max { 0.0 } else { 16.0 };
     unsafe {
-        dc.FillRoundedRectangle(&rrect(0.0, 0.0, W, v.h, 16.0), &brush(dc, t.panel));
-        dc.DrawRoundedRectangle(&rrect(0.5, 0.5, W - 0.5, v.h - 0.5, 15.5), &hair, 1.0, None);
+        dc.FillRoundedRectangle(&rrect(0.0, 0.0, w, v.h, rad), &brush(dc, t.panel));
+        if !v.max {
+            dc.DrawRoundedRectangle(&rrect(0.5, 0.5, w - 0.5, v.h - 0.5, 15.5), &hair, 1.0, None);
+        }
     }
     // The title band: "Tasks", how many are open, the close button.
     let tw = g.text_width("Tasks", &f.title);
@@ -848,25 +906,33 @@ pub fn draw(
         TOP,
         &muted,
     );
-    let cr = close_rect();
-    if hover == Some(Hit::Close) {
-        unsafe {
-            dc.FillRoundedRectangle(
-                &rrect(cr.0, cr.1, cr.2, cr.3, 14.0),
-                &brush(dc, t.button_hover),
-            )
-        };
-    }
-    draw_icon(
+    let max_icon = if v.max { Icon::Restore } else { Icon::Maximize };
+    title_button(g, dc, t, max_rect(w), max_icon, hover == Some(Hit::Max));
+    title_button(
         g,
         dc,
+        t,
+        close_rect(w),
         Icon::Close,
-        (cr.0 + cr.2) / 2.0,
-        (cr.1 + cr.3) / 2.0,
-        14.0,
-        &muted,
+        hover == Some(Hit::Close),
     );
-    unsafe { dc.DrawLine(pt(1.0, TOP - 0.5), pt(W - 1.0, TOP - 0.5), &hair, 1.0, None) };
+    let inset = if v.max { 0.0 } else { 1.0 };
+    unsafe {
+        dc.DrawLine(
+            pt(inset, TOP - 0.5),
+            pt(w - inset, TOP - 0.5),
+            &hair,
+            1.0,
+            None,
+        )
+    };
+
+    // Everything below the title band draws in the content column.
+    let win_w = w;
+    let (off, col) = column(v);
+    let v = &col;
+    let (w, x1) = (v.w, self::x1(v.w));
+    unsafe { dc.SetTransform(&translate(off)) };
 
     draw_field(g, dc, t, f, v, hover);
     clipped_text(
@@ -876,7 +942,7 @@ pub fn draw(
         &f.small,
         X0 + 14.0,
         FIELD_B + 6.0,
-        X1 - X0 - 28.0,
+        x1 - X0 - 28.0,
         18.0,
         &muted,
     );
@@ -887,7 +953,7 @@ pub fn draw(
             &D2D_RECT_F {
                 left: X0 - 4.0,
                 top: LIST_T,
-                right: X1 + 4.0,
+                right: x1 + 4.0,
                 bottom,
             },
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -895,8 +961,8 @@ pub fn draw(
     };
     if let Some((title, tip)) = &v.empty {
         let cy = LIST_T + 80.0;
-        center_text(g, dc, title, &f.panel_title, W / 2.0, cy, 20.0, &ink);
-        center_text(g, dc, tip, &f.small, W / 2.0, cy + 22.0, 18.0, &muted);
+        center_text(g, dc, title, &f.panel_title, w / 2.0, cy, 20.0, &ink);
+        center_text(g, dc, tip, &f.small, w / 2.0, cy + 22.0, 18.0, &muted);
     }
     // Rows ripple in from the top of what shows, on open.
     for (k, (i, top, _)) in visible(v).into_iter().enumerate() {
@@ -912,6 +978,7 @@ pub fn draw(
                     i == 0,
                     hover == Some(Hit::Header(i)),
                     v.ring == Some(i),
+                    x1,
                 ),
                 ItemV::Task(r) => draw_task(g, dc, t, f, v, i, r, top, hover),
             }
@@ -925,14 +992,17 @@ pub fn draw(
         let top = LIST_T + (room - len) * (v.scroll / max).clamp(0.0, 1.0);
         unsafe {
             dc.FillRoundedRectangle(
-                &rrect(W - 9.0, top, W - 6.0, top + len, 1.5),
+                &rrect(w - 9.0, top, w - 6.0, top + len, 1.5),
                 &brush(dc, t.track),
             )
         };
     }
     draw_menu(g, dc, t, f, v, hover);
     draw_undo(g, dc, t, f, v, hover);
-    crate::depth::lip(g, dc, t, 0.0, 0.0, W, v.h, 16.0, 1.0);
+    unsafe { dc.SetTransform(&translate(0.0)) };
+    if !v.max {
+        crate::depth::lip(g, dc, t, 0.0, 0.0, win_w, v.h, 16.0, 1.0);
+    }
 }
 
 #[cfg(test)]
@@ -967,7 +1037,9 @@ mod tests {
         }];
         items.extend((0..n).map(|_| row()));
         View {
+            w: W,
             h: H,
+            max: false,
             open_n: n,
             field: field(),
             line: String::new(),
@@ -1009,6 +1081,29 @@ mod tests {
         for (_, top, h) in visible(&v) {
             assert!(top + h > LIST_T && top < b);
         }
-        assert!(b < undo_rect(v.h).1);
+        assert!(b < undo_rect(&v).1);
+    }
+
+    #[test]
+    fn a_wider_window_widens_the_rows_and_keeps_the_buttons_right() {
+        let mut v = view(3, true);
+        v.w = 1400.0;
+        assert_eq!(
+            close_rect(v.w).2,
+            1400.0 - 8.0,
+            "close stays at the right edge"
+        );
+        assert!(
+            max_rect(v.w).2 < close_rect(v.w).0,
+            "maximize sits left of close"
+        );
+        assert!(max_rect(v.w).0 > 1300.0);
+        let (off, col) = column(&v);
+        assert_eq!(col.w, COL, "the content column stops widening");
+        assert_eq!(off, (1400.0 - COL) / 2.0, "and sits in the middle");
+        assert_eq!(undo_rect(&col).2, COL - X0, "the Undo bar spans the column");
+        assert_eq!(undo_button(&col).2, COL - X0 - 10.0, "Undo stays right");
+        let at_default = View { w: W, ..v.clone() };
+        assert_eq!(column(&at_default), (0.0, at_default.clone()), "no change at 600");
     }
 }

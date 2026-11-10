@@ -1424,7 +1424,12 @@ fn dupes_view(app: &App, now: Instant) -> dp::DupesView {
                         .into(),
                 }
             } else {
-                dp::DupesBody::Groups(dupe_groups(list, &shown, d.first))
+                dp::DupesBody::Groups(dupe_groups(
+                    list,
+                    &shown,
+                    d.first,
+                    dp::dupes_window(app.disk.win.room),
+                ))
             }
         }
     };
@@ -1432,11 +1437,16 @@ fn dupes_view(app: &App, now: Instant) -> dp::DupesView {
 }
 
 /// The shown groups, with names, words and rows only for the groups that reach into the
-/// list's window from `first` (`dp::DUPES_WINDOW` entries). A C: check can list 10,000 copies;
+/// list's window from `first` (`window` entries, `dp::dupes_window`). A C: check can list 10,000 copies;
 /// paths, dates (a time zone call each) and words for all of them every frame made scrolling
 /// slow, so the rest carry only their row count.
-fn dupe_groups(list: &m::DupeList, shown: &[usize], first: usize) -> Vec<dp::DupeGroupView> {
-    let end = first + dp::DUPES_WINDOW;
+fn dupe_groups(
+    list: &m::DupeList,
+    shown: &[usize],
+    first: usize,
+    window: usize,
+) -> Vec<dp::DupeGroupView> {
+    let end = first + window;
     let mut at = 0;
     shown
         .iter()
@@ -2135,7 +2145,13 @@ fn level(app: &mut App) {
     if !matches!(app.disk.scan, Scan::Done(_)) {
         return;
     }
-    let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.room, &cards(app));
+    let map = dp::map_rect(
+        &app.g,
+        &app.fonts,
+        app.disk.win.w,
+        app.disk.win.room,
+        &cards(app),
+    );
     let Scan::Done(d) = &app.disk.scan else {
         return;
     };
@@ -2150,8 +2166,6 @@ fn level(app: &mut App) {
     }
     let tree = &d.tree;
     let removed = &app.disk.removed;
-    let rows = m::rows(tree, removed, at);
-    let summary = m::summarize(tree, removed, at, TOP_FILES);
     let inner_of = |id: NodeId| {
         m::rows(tree, removed, id)
             .into_iter()
@@ -2159,18 +2173,35 @@ fn level(app: &mut App) {
             .map(|r| (r.name, r.size))
             .collect()
     };
-    let inner = |i: usize, rect: Rect| -> Vec<(Rect, String, u64)> {
-        if !rows[i].dir {
-            return Vec::new();
-        }
-        m::treemap(&rows[i..=i], rect, &inner_of)
-            .into_iter()
-            .next()
-            .map(|t| t.inner)
-            .unwrap_or_default()
+    let lay_out = |rows: &[Row]| {
+        let inner = |i: usize, rect: Rect| -> Vec<(Rect, String, u64)> {
+            if !rows[i].dir {
+                return Vec::new();
+            }
+            m::treemap(&rows[i..=i], rect, &inner_of)
+                .into_iter()
+                .next()
+                .map(|t| t.inner)
+                .unwrap_or_default()
+        };
+        let sizes: Vec<u64> = rows.iter().map(|r| r.size).collect();
+        fit_tiles(&sizes, map, 0, &inner)
     };
-    let sizes: Vec<u64> = rows.iter().map(|r| r.size).collect();
-    let tiles = fit_tiles(&sizes, map, 0, &inner);
+    // Only the window's size changed (a drag, a snap, maximize): the same rows, laid out again
+    // in the new rectangle. The rows and the summary walk the tree; a resize must not.
+    if let Some(l) = app
+        .disk
+        .level
+        .as_mut()
+        .filter(|l| l.at == at && l.removed_gen == app.disk.removed_gen)
+    {
+        l.tiles = lay_out(&l.rows);
+        l.map = map;
+        return;
+    }
+    let rows = m::rows(tree, removed, at);
+    let summary = m::summarize(tree, removed, at, TOP_FILES);
+    let tiles = lay_out(&rows);
     let files = summary
         .top
         .iter()
@@ -2690,7 +2721,7 @@ fn live_results(app: &App, now: Instant) -> Option<dp::ResultsView> {
             }
         })
         .collect();
-    let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.room, &[]);
+    let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.w, app.disk.win.room, &[]);
     let sizes: Vec<u64> = live.rows.iter().map(|r| r.size).collect();
     let skeleton = space.map_or(0, |s| s.used().saturating_sub(live.on_disk));
     let tiles = fit_tiles(&sizes, map, skeleton, &|_, _| Vec::new());
@@ -2779,7 +2810,7 @@ fn results_view(app: &App, now: Instant) -> Option<dp::ResultsView> {
         .max()
         .map_or(0, |i| i + 1)
         .max(8);
-    let window = app.disk.first..app.disk.first + dp::FOLDER_WINDOW;
+    let window = app.disk.first..app.disk.first + dp::folder_window(app.disk.win.room);
     let (sel, lit) = (app.disk.sel, focus_row(app));
     let rows: Vec<dp::ListRow> = l
         .rows
@@ -3100,7 +3131,7 @@ fn review_view(app: &App) -> Option<dp::ReviewView> {
         .iter()
         .enumerate()
         .skip(rows_from)
-        .take(dp::REVIEW_WINDOW)
+        .take(dp::review_window(app.disk.win.room))
         .map(|(i, c)| {
             let name = c.path.file_name().map_or_else(
                 || c.path.display().to_string(),
@@ -3353,7 +3384,7 @@ fn reflow_ease(app: &App, p: f32) -> f32 {
 fn screen_tiles(app: &App) -> Option<(Vec<dp::MapTile>, Vec<String>)> {
     match &app.disk.scan {
         Scan::Running { space, live, .. } if app.disk.place == Place::Scanning => {
-            let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.room, &[]);
+            let map = dp::map_rect(&app.g, &app.fonts, app.disk.win.w, app.disk.win.room, &[]);
             let sizes: Vec<u64> = live.rows.iter().map(|r| r.size).collect();
             let skeleton = space.map_or(0, |s| s.used().saturating_sub(live.on_disk));
             Some((
@@ -3575,7 +3606,9 @@ pub fn view(app: &App) -> View {
         confirm: confirm_view(app),
         cursor: app.disk.cursor,
         kb: app.disk.kb,
+        w: app.disk.win.w,
         room: app.disk.win.room,
+        max: app.disk.win.max,
         motion: motion(app, now),
     }
 }
@@ -4167,6 +4200,10 @@ pub fn click(app: &mut App, h: Hit) {
             disk_window::close(app);
             return;
         }
+        Hit::Max => {
+            crate::frame::toggle(app.disk.win.hwnd);
+            return;
+        }
         Hit::OpenDupes => open_dupes_place(app),
         Hit::DupesOption => toggle_find_dupes(app),
         Hit::DupesCheck => {
@@ -4680,7 +4717,6 @@ mod tests {
         let fonts = crate::ui::Fonts::new(&g);
         let theme = crate::ui::theme(false);
         let list = synthetic_dupes();
-        let copies: usize = list.sets.iter().map(|s| s.copies.len()).sum();
         let props = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -4691,11 +4727,51 @@ mod tests {
             bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
             ..Default::default()
         };
+        // At the size it opens at, and maximized on a 2560 × 1440 screen (the list then shows
+        // about twice the rows, each twice as wide).
+        let mut out = Vec::new();
+        for (w, room) in [(dp::W, dp::H), (2560.0, 1392.0)] {
+            let per = frame_cost_at(&g, &fonts, &theme, &props, &list, w, room);
+            out.push(per);
+        }
+        let copies: usize = list.sets.iter().map(|s| s.copies.len()).sum();
+        let coarse = timer_interval(16, 20);
+        let ten = timer_interval(10, 20);
+        unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+        let fine = timer_interval(16, 20);
+        unsafe { windows::Win32::Media::timeEndPeriod(1) };
+        eprintln!(
+            "disk: {copies} copies; 16 ms timer every {coarse:.1} ms, {fine:.1} ms with a 1 ms \
+             clock, 10 ms timer every {ten:.1} ms"
+        );
+        // Loose enough for a debug build on a busy machine, tight enough to catch a list that
+        // builds or measures every row again (that cost about 58 ms a frame in debug).
+        // Maximized it draws about twice the rows (3.5 ms against 2.6 in release on the dev PC).
+        for (per, what) in out.iter().zip(["", " maximized"]) {
+            assert!(
+                *per < 25.0,
+                "a{what} frame of the 10,000-copy list took {per:.1} ms"
+            );
+        }
+    }
+
+    /// One frame's cost (view, hit test, drawing) of the Duplicates list in a `w` × `room` window,
+    /// averaged over 60 frames of quick scrolling.
+    fn frame_cost_at(
+        g: &crate::gfx::Shared,
+        fonts: &crate::ui::Fonts,
+        theme: &crate::ui::Theme,
+        props: &windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1,
+        list: &m::DupeList,
+        w: f32,
+        room: f32,
+    ) -> f64 {
+        use windows::Win32::Graphics::Direct2D::Common::*;
         let size = D2D_SIZE_U {
-            width: dp::W as u32,
-            height: dp::H as u32,
+            width: w as u32,
+            height: room as u32,
         };
-        let bmp = unsafe { g.dc.CreateBitmap(size, None, 0, &props) }.unwrap();
+        let bmp = unsafe { g.dc.CreateBitmap(size, None, 0, props) }.unwrap();
         let frames = 60;
         let (mut view_ms, mut draw_ms, mut worst) = (0.0, 0.0, 0.0f64);
         for f in 0..frames {
@@ -4709,7 +4785,12 @@ mod tests {
                     total: dp::size_label(list.reclaimable()),
                     total_label: " to reclaim",
                     sub: m::plural(shown.len() as u64, "group", "groups"),
-                    body: dp::DupesBody::Groups(dupe_groups(&list, &shown, first)),
+                    body: dp::DupesBody::Groups(dupe_groups(
+                        list,
+                        &shown,
+                        first,
+                        dp::dupes_window(room),
+                    )),
                     first,
                     selected: None,
                     all: list.all_extras_picked(),
@@ -4719,25 +4800,20 @@ mod tests {
                 confirm: None,
                 cursor: None,
                 kb: false,
-                room: dp::H,
+                w,
+                room,
+                max: false,
                 motion: dp::Motion::default(),
             };
-            std::hint::black_box(dp::size(&g, &fonts, &v));
-            std::hint::black_box(dp::fit(&g, &fonts, &v));
-            std::hint::black_box(dp::hit(&g, &fonts, &v, 300.0, 400.0));
+            std::hint::black_box(dp::size(g, fonts, &v));
+            std::hint::black_box(dp::fit(g, fonts, &v));
+            std::hint::black_box(dp::hit(g, fonts, &v, 300.0, 400.0));
             let t1 = Instant::now();
             unsafe {
                 g.dc.SetTarget(&bmp);
                 g.dc.BeginDraw();
             }
-            dp::draw(
-                &g,
-                &g.dc,
-                &theme,
-                &fonts,
-                &v,
-                Some(dp::Hit::DupeRow(1300, 1)),
-            );
+            dp::draw(g, &g.dc, theme, fonts, &v, Some(dp::Hit::DupeRow(1300, 1)));
             unsafe {
                 let _ = g.dc.EndDraw(None, None);
                 g.dc.SetTarget(None);
@@ -4749,22 +4825,11 @@ mod tests {
         }
         let n = frames as f64;
         let per = (view_ms + draw_ms) / n;
-        let coarse = timer_interval(16, 20);
-        let ten = timer_interval(10, 20);
-        unsafe { windows::Win32::Media::timeBeginPeriod(1) };
-        let fine = timer_interval(16, 20);
-        unsafe { windows::Win32::Media::timeEndPeriod(1) };
         eprintln!(
-            "disk: {copies} copies, frame {per:.2} ms (view {:.2}, draw {:.2}), worst {worst:.2} ms; \
-             16 ms timer every {coarse:.1} ms, {fine:.1} ms with a 1 ms clock, 10 ms timer every {ten:.1} ms",
+            "disk: {w} x {room}: frame {per:.2} ms (view {:.2}, draw {:.2}), worst {worst:.2} ms",
             view_ms / n,
             draw_ms / n
         );
-        // Loose enough for a debug build on a busy machine, tight enough to catch a list that
-        // builds or measures every row again (that cost about 58 ms a frame in debug).
-        assert!(
-            per < 25.0,
-            "a frame of the 10,000-copy list took {per:.1} ms"
-        );
+        per
     }
 }

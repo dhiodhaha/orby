@@ -45,6 +45,7 @@ mod downloads_model;
 mod downloads_panel;
 mod drink_panel;
 mod focus_panel;
+mod frame;
 mod gfx;
 mod habits;
 mod history;

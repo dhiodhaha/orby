@@ -16,16 +16,32 @@ use crate::disk_model::Rect;
 use crate::gfx::*;
 use crate::motion;
 use crate::tasks_panel::clipped_text;
-use crate::ui::{draw_icon, with_alpha, Fonts, Icon, Theme};
+use crate::ui::{draw_icon, title_button, with_alpha, Fonts, Icon, Theme};
 
-/// The window's logical width.
+/// The window's logical width when it opens, and the least it can be resized to. Resized or
+/// maximized, everything takes `View::w` instead: the treemap and the list share the extra width,
+/// right-aligned parts stay on the right.
 pub const W: f32 = 756.0;
 /// The window's logical height when the screen has room for it.
 pub const H: f32 = 704.0;
-/// The title band on every screen: "Disk" and the close button. Its empty part drags the window.
+/// The title band on every screen: "Disk", maximize and close. Its empty part drags the window.
 pub const TOP: f32 = 44.0;
 const X0: f32 = 20.0;
-const X1: f32 = W - X0;
+
+/// The content's right edge in a window `vw` wide.
+fn x1(vw: f32) -> f32 {
+    vw - X0
+}
+
+/// The treemap's right edge: 3/7 of the room the map and the list share (300 px at `W`).
+fn map_r(vw: f32) -> f32 {
+    X0 + ((x1(vw) - X0 - 16.0) * 3.0 / 7.0).floor()
+}
+
+/// The folder list's left edge, 16 px right of the treemap.
+fn list_l(vw: f32) -> f32 {
+    map_r(vw) + 16.0
+}
 const ROW: f32 = 36.0;
 const FILE_ROW: f32 = 40.0;
 /// Results, top to bottom (y under the band): header row, headline, capacity bar, legend,
@@ -35,10 +51,6 @@ const CBAR_Y: f32 = 104.0;
 const LEG_Y: f32 = 124.0;
 const TOOL_Y: f32 = 158.0;
 pub const BODY_Y: f32 = 202.0;
-/// The treemap's right edge and the list beside it.
-const MAP_R: f32 = 320.0;
-const LIST_L: f32 = 336.0;
-const LIST_R: f32 = X1;
 /// The list's column header ("Name", "%", "Size") and the gap under it.
 const LIST_HEAD: f32 = 20.0;
 /// The detail strip under the map, and the selection bar where one shows.
@@ -405,8 +417,13 @@ pub struct View {
     /// The keyboard's row, drawn with a focus ring after a key press.
     pub cursor: Option<usize>,
     pub kb: bool,
-    /// The window height the screen has room for (at most `H`); the lists fill it.
+    /// The window's logical width: `W` when it opens, more when resized or maximized.
+    pub w: f32,
+    /// The window height there is room for (`H` or less when it opens, the window's own height
+    /// once resized or maximized); the lists fill it.
     pub room: f32,
+    /// Maximized: square corners.
+    pub max: bool,
     pub motion: Motion,
 }
 
@@ -461,6 +478,8 @@ pub enum Hit {
     Sheet,
     /// The title band's close button.
     Close,
+    /// The title band's maximize / restore button.
+    Max,
     /// Duplicates in the Results header.
     OpenDupes,
     /// "Also find duplicate files" on the drive list.
@@ -687,17 +706,17 @@ fn results_min() -> f32 {
     BODY_Y + LIST_HEAD + (MIN_ROWS + 1) as f32 * ROW + 4.0 + BAR_H
 }
 
-fn card_h(g: &Shared, f: &Fonts, c: &Card) -> f32 {
-    let body = wrap_h(g, &c.body, &f.small_wrap, W - X0 * 2.0 - 64.0);
+fn card_h(g: &Shared, f: &Fonts, c: &Card, vw: f32) -> f32 {
+    let body = wrap_h(g, &c.body, &f.small_wrap, vw - X0 * 2.0 - 64.0);
     12.0 + 18.0 + 4.0 + body + if c.button.is_some() { 10.0 + 28.0 } else { 0.0 } + 12.0
 }
 
 /// The cards' block under the screen: each card, 8 px between, 12 px under the last.
-fn cards_h(g: &Shared, f: &Fonts, cards: &[Card]) -> f32 {
+fn cards_h(g: &Shared, f: &Fonts, cards: &[Card], vw: f32) -> f32 {
     if cards.is_empty() {
         return 0.0;
     }
-    cards.iter().map(|c| card_h(g, f, c) + 8.0).sum::<f32>() + 4.0
+    cards.iter().map(|c| card_h(g, f, c, vw) + 8.0).sum::<f32>() + 4.0
 }
 
 /// The screen's height above the cards (below the title band).
@@ -706,7 +725,7 @@ fn body_from(room: f32, cards: f32, min: f32) -> f32 {
 }
 
 fn body_h(g: &Shared, f: &Fonts, v: &View) -> f32 {
-    body_from(v.room, cards_h(g, f, &v.cards), min_body(v))
+    body_from(v.room, cards_h(g, f, &v.cards, v.w), min_body(v))
 }
 
 /// Folder rows beside the treemap at this body height; the tail row comes after them.
@@ -714,16 +733,18 @@ fn folder_rows(b: f32) -> usize {
     (((b - BAR_H - 4.0 - BODY_Y - LIST_HEAD) / ROW).floor() as usize).max(MIN_ROWS + 1) - 1
 }
 
-/// More folder rows than the list can show at the full height: the window disk.rs puts words
-/// in.
-pub const FOLDER_WINDOW: usize = ((H - TOP - BODY_Y - LIST_HEAD) / ROW) as usize + 1;
+/// More folder rows than the list can show in a window `room` tall (`H` at least): the window
+/// disk.rs puts words in.
+pub fn folder_window(room: f32) -> usize {
+    ((room.max(H) - TOP - BODY_Y - LIST_HEAD) / ROW) as usize + 1
+}
 
 /// The treemap's rectangle: as tall as the list header, the rows and the tail row beside it.
-fn map_at(b: f32) -> Rect {
+fn map_at(b: f32, vw: f32) -> Rect {
     (
         X0,
         BODY_Y,
-        MAP_R,
+        map_r(vw),
         BODY_Y + LIST_HEAD + (folder_rows(b) + 1) as f32 * ROW + 4.0,
     )
 }
@@ -732,9 +753,9 @@ fn list_top() -> f32 {
     BODY_Y + LIST_HEAD
 }
 
-fn list_at(b: f32) -> Rect {
-    let m = map_at(b);
-    (LIST_L, list_top(), LIST_R, m.3)
+fn list_at(b: f32, vw: f32) -> Rect {
+    let m = map_at(b, vw);
+    (list_l(vw), list_top(), x1(vw), m.3)
 }
 
 fn bar_top(b: f32) -> f32 {
@@ -745,9 +766,11 @@ fn files_rows(b: f32) -> usize {
     (((bar_top(b) - 8.0 - BODY_Y) / FILE_ROW).floor() as usize).max(1)
 }
 
-/// The most Review rows the list can show at once (at the full height): the window disk.rs
-/// fills rows for.
-pub const REVIEW_WINDOW: usize = ((H - TOP - REVIEW_TOP) / FILE_ROW) as usize + 1;
+/// The most Review rows the list can show at once in a window `room` tall (`H` at least): the
+/// window disk.rs fills rows for.
+pub fn review_window(room: f32) -> usize {
+    ((room.max(H) - TOP - REVIEW_TOP) / FILE_ROW) as usize + 1
+}
 
 fn review_rows(b: f32) -> usize {
     (((bar_top(b) - 8.0 - REVIEW_TOP) / FILE_ROW).floor() as usize).max(1)
@@ -815,9 +838,11 @@ pub enum DupeEntry {
     Row(usize, usize),
 }
 
-/// The most Duplicates entries the list can show at once (all headings at the full height),
-/// plus one: the window disk.rs fills rows for.
-pub const DUPES_WINDOW: usize = ((H - TOP - DUPES_TOP) / DUPE_HEAD) as usize + 2;
+/// The most Duplicates entries the list can show at once in a window `room` tall (all headings,
+/// `H` at least), plus one: the window disk.rs fills rows for.
+pub fn dupes_window(room: f32) -> usize {
+    ((room.max(H) - TOP - DUPES_TOP) / DUPE_HEAD) as usize + 2
+}
 
 /// Every entry of the Duplicates list, in order (none before a check has found groups),
 /// without collecting them: the list can run to thousands.
@@ -910,10 +935,10 @@ pub fn fit(g: &Shared, f: &Fonts, v: &View) -> Fit {
     }
 }
 
-/// The treemap's rectangle for Results at this room with these cards (disk.rs lays the tiles
-/// out in it before it builds the view).
-pub fn map_rect(g: &Shared, f: &Fonts, room: f32, cards: &[Card]) -> Rect {
-    map_at(body_from(room, cards_h(g, f, cards), results_min()))
+/// The treemap's rectangle for Results in a window `vw` wide with this room and these cards
+/// (disk.rs lays the tiles out in it before it builds the view).
+pub fn map_rect(g: &Shared, f: &Fonts, vw: f32, room: f32, cards: &[Card]) -> Rect {
+    map_at(body_from(room, cards_h(g, f, cards, vw), results_min()), vw)
 }
 
 /// Each card's top and height, stacked under the screen.
@@ -922,7 +947,7 @@ fn card_tops(g: &Shared, f: &Fonts, v: &View) -> Vec<(f32, f32)> {
     v.cards
         .iter()
         .map(|c| {
-            let h = card_h(g, f, c);
+            let h = card_h(g, f, c, v.w);
             let r = (y, h);
             y += h + 8.0;
             r
@@ -962,11 +987,11 @@ fn sheet_h(g: &Shared, f: &Fonts, c: &ConfirmView) -> f32 {
 
 /// The area under the title band: the screen, its cards, room for the confirm sheet.
 fn body_size(g: &Shared, f: &Fonts, v: &View) -> (f32, f32) {
-    let mut h = body_h(g, f, v) + cards_h(g, f, &v.cards);
+    let mut h = body_h(g, f, v) + cards_h(g, f, &v.cards, v.w);
     if let Some(c) = &v.confirm {
         h = h.max(sheet_h(g, f, c) + 32.0);
     }
-    (W, h.ceil())
+    (v.w, h.ceil())
 }
 
 /// The window's logical size: `room` tall, taller only when a screen and its cards need it.
@@ -987,11 +1012,11 @@ fn tall_w(g: &Shared, f: &Fonts, label: &str, icon: bool) -> f32 {
     g.text_width(label, &f.title) + 28.0 + if icon { 20.0 } else { 0.0 }
 }
 
-fn start_rects(g: &Shared, f: &Fonts, n: usize) -> Vec<(Hit, Rect)> {
+fn start_rects(g: &Shared, f: &Fonts, n: usize, vw: f32) -> Vec<(Hit, Rect)> {
     let mut out = Vec::new();
     for i in 0..n {
         let t = 52.0 + i as f32 * 60.0;
-        out.push((Hit::ScanDrive(i), (X0, t, X1, t + 56.0)));
+        out.push((Hit::ScanDrive(i), (X0, t, x1(vw), t + 56.0)));
     }
     let y = start_buttons_y(n);
     let w1 = quiet_w(g, f, "Scan a folder", true);
@@ -1005,7 +1030,7 @@ fn start_rects(g: &Shared, f: &Fonts, n: usize) -> Vec<(Hit, Rect)> {
         ),
     );
     let o = option_top(n);
-    out.push((Hit::DupesOption, (X0 - 8.0, o, X1 + 8.0, o + OPTION_H)));
+    out.push((Hit::DupesOption, (X0 - 8.0, o, x1(vw) + 8.0, o + OPTION_H)));
     out
 }
 
@@ -1017,31 +1042,31 @@ fn chip_rect(g: &Shared, f: &Fonts, r: &ResultsView) -> Rect {
 }
 
 /// Scan again and Safe to clean (or Stop while scanning), right aligned in the header row.
-fn header_buttons(g: &Shared, f: &Fonts, live: bool) -> Vec<(Hit, Rect)> {
+fn header_buttons(g: &Shared, f: &Fonts, live: bool, vw: f32) -> Vec<(Hit, Rect)> {
     if live {
         let w = quiet_w(g, f, "Stop", true);
-        return vec![(Hit::Stop, (X1 - w, 18.0, X1, 46.0))];
+        return vec![(Hit::Stop, (x1(vw) - w, 18.0, x1(vw), 46.0))];
     }
     let w1 = quiet_w(g, f, "Scan again", true);
     let w2 = quiet_w(g, f, "Safe to clean", true);
     let w3 = quiet_w(g, f, "Duplicates", true);
-    let x2 = X1 - w1 - 4.0;
+    let x2 = x1(vw) - w1 - 4.0;
     let x3 = x2 - w2 - 4.0;
     vec![
-        (Hit::ScanAgain, (X1 - w1, 18.0, X1, 46.0)),
+        (Hit::ScanAgain, (x1(vw) - w1, 18.0, x1(vw), 46.0)),
         (Hit::OpenClean, (x2 - w2, 18.0, x2, 46.0)),
         (Hit::OpenDupes, (x3 - w3, 18.0, x3, 46.0)),
     ]
 }
 
 /// The segmented control, right aligned on the toolbar.
-fn tabs_rects(g: &Shared, f: &Fonts) -> [(Tab, Rect); 3] {
+fn tabs_rects(g: &Shared, f: &Fonts, vw: f32) -> [(Tab, Rect); 3] {
     let ws: Vec<f32> = ["Folders", "Files", "Types"]
         .iter()
         .map(|l| g.text_width(l, &f.small_medium) + 24.0)
         .collect();
     let total: f32 = ws.iter().sum::<f32>() + 4.0 + 4.0;
-    let mut x = X1 - total + 2.0;
+    let mut x = x1(vw) - total + 2.0;
     let mut out = [(Tab::Folders, (0.0, 0.0, 0.0, 0.0)); 3];
     for (i, tab) in [Tab::Folders, Tab::Files, Tab::Types]
         .into_iter()
@@ -1090,13 +1115,13 @@ fn crumb_layout(
 }
 
 /// The capacity bar's segments: (index, left, right). Each is at least 4 px, 2 px apart.
-fn seg_layout(segs: &[Seg]) -> Vec<(usize, f32, f32)> {
+fn seg_layout(segs: &[Seg], vw: f32) -> Vec<(usize, f32, f32)> {
     let n = segs.len();
     if n == 0 {
         return Vec::new();
     }
     let gaps = 2.0 * (n - 1) as f32;
-    let room = (X1 - X0 - gaps).max(1.0);
+    let room = (x1(vw) - X0 - gaps).max(1.0);
     let total: f64 = segs.iter().map(|s| s.bytes as f64).sum::<f64>().max(1.0);
     let mut ws: Vec<f32> = segs
         .iter()
@@ -1122,17 +1147,24 @@ fn seg_layout(segs: &[Seg]) -> Vec<(usize, f32, f32)> {
 }
 
 /// A folder row's columns from the right: (mini bar left, percent right, size right).
-fn row_cols() -> (f32, f32, f32) {
-    let size_r = LIST_R - 6.0;
+fn row_cols(vw: f32) -> (f32, f32, f32) {
+    let size_r = x1(vw) - 6.0;
     let pct_r = size_r - SIZE_W - 10.0;
     let bar_l = pct_r - PCT_W - 10.0 - MINI_W;
     (bar_l, pct_r, size_r)
 }
 
 /// The bottom-right buttons of a selection bar: (open?, clear, primary).
-fn sel_bar_rects(g: &Shared, f: &Fonts, b: f32, open: bool, primary_w: f32) -> Vec<(Hit, Rect)> {
+fn sel_bar_rects(
+    g: &Shared,
+    f: &Fonts,
+    b: f32,
+    open: bool,
+    primary_w: f32,
+    vw: f32,
+) -> Vec<(Hit, Rect)> {
     let t = bar_top(b) + 12.0;
-    let r = W - 12.0;
+    let r = vw - 12.0;
     let mut out = vec![(Hit::SelRecycle, (r - primary_w, t, r, t + 32.0))];
     let cw = tall_w(g, f, "Clear", false);
     let cx = r - primary_w - 8.0;
@@ -1157,24 +1189,25 @@ fn primary_w(g: &Shared, f: &Fonts, m: &Motion) -> f32 {
     w0 + (w1 - w0) * m.suffix.clamp(0.0, 1.2)
 }
 
-fn strip_open_rect(g: &Shared, f: &Fonts, b: f32) -> Rect {
+fn strip_open_rect(g: &Shared, f: &Fonts, b: f32, vw: f32) -> Rect {
     let w = quiet_w(g, f, "Open in Explorer", true);
     let t = b - STRIP_H / 2.0 - 14.0;
-    (W - 8.0 - w, t, W - 8.0, t + 28.0)
+    (vw - 8.0 - w, t, vw - 8.0, t + 28.0)
 }
 
 fn results_rects(g: &Shared, f: &Fonts, r: &ResultsView, v: &View, b: f32) -> Vec<(Hit, Rect)> {
+    let vw = v.w;
     let live = r.scanning;
-    let mut out: Vec<(Hit, Rect)> = header_buttons(g, f, live);
+    let mut out: Vec<(Hit, Rect)> = header_buttons(g, f, live, vw);
     if live || v.motion.veil > 0.0 {
         // Only Stop answers while the veil is up; the bar and the list fill in under it.
         return out;
     }
     out.push((Hit::Drive, chip_rect(g, f, r)));
-    for (i, l, rr) in seg_layout(&r.segs) {
+    for (i, l, rr) in seg_layout(&r.segs, vw) {
         out.push((Hit::Seg(i), (l, CBAR_Y - 4.0, rr, CBAR_Y + 16.0)));
     }
-    let tabs = tabs_rects(g, f);
+    let tabs = tabs_rects(g, f, vw);
     for (i, x, w) in crumb_layout(g, f, r, tabs[0].1 .0 - 12.0) {
         if let Some(i) = i {
             out.push((
@@ -1195,22 +1228,32 @@ fn results_rects(g: &Shared, f: &Fonts, r: &ResultsView, v: &View, b: f32) -> Ve
             }
             for (k, i) in (r.first..r.rows.len().min(r.first + folder_rows(b))).enumerate() {
                 let top = list_top() + k as f32 * ROW;
-                out.push((Hit::RowCheck(i), (LIST_L, top, LIST_L + 30.0, top + ROW)));
-                out.push((Hit::Row(i), (LIST_L, top, LIST_R, top + ROW)));
+                out.push((
+                    Hit::RowCheck(i),
+                    (list_l(vw), top, list_l(vw) + 30.0, top + ROW),
+                ));
+                out.push((Hit::Row(i), (list_l(vw), top, x1(vw), top + ROW)));
             }
             if r.selected.is_some() {
-                out.extend(sel_bar_rects(g, f, b, false, primary_w(g, f, &v.motion)));
+                out.extend(sel_bar_rects(
+                    g,
+                    f,
+                    b,
+                    false,
+                    primary_w(g, f, &v.motion),
+                    vw,
+                ));
             } else if r.detail.is_some() {
-                out.push((Hit::StripOpen, strip_open_rect(g, f, b)));
+                out.push((Hit::StripOpen, strip_open_rect(g, f, b, vw)));
             }
         }
         Tab::Files => {
             let n = files_rows(b);
             for (k, i) in (r.files_first..r.files.len().min(r.files_first + n)).enumerate() {
                 let top = BODY_Y + k as f32 * FILE_ROW;
-                out.push((Hit::File(i), (X0 - 8.0, top, X1 + 8.0, top + ROW)));
+                out.push((Hit::File(i), (X0 - 8.0, top, x1(vw) + 8.0, top + ROW)));
             }
-            out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion)));
+            out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion), vw));
         }
         Tab::Types => {}
     }
@@ -1239,16 +1282,17 @@ fn filter_rects(g: &Shared, f: &Fonts, c: &CleanView) -> [(Filter, Rect); 3] {
     out
 }
 
-fn clean_header_total_x(g: &Shared, f: &Fonts, c: &CleanView) -> f32 {
-    X1 - g.text_width(" to review", &f.body) - g.text_width(&c.total, &f.heading)
+fn clean_header_total_x(g: &Shared, f: &Fonts, c: &CleanView, vw: f32) -> f32 {
+    x1(vw) - g.text_width(" to review", &f.body) - g.text_width(&c.total, &f.heading)
 }
 
-fn extra_button(g: &Shared, f: &Fonts, label: &str, top: f32) -> Rect {
+fn extra_button(g: &Shared, f: &Fonts, label: &str, top: f32, vw: f32) -> Rect {
     let w = quiet_w(g, f, label, false);
-    (X1 - w, top + 12.0, X1, top + 40.0)
+    (x1(vw) - w, top + 12.0, x1(vw), top + 40.0)
 }
 
 fn clean_rects(g: &Shared, f: &Fonts, c: &CleanView, v: &View, b: f32) -> Vec<(Hit, Rect)> {
+    let vw = v.w;
     let mut out = vec![(Hit::Back, (X0, 14.0, X0 + 28.0, 42.0))];
     for (fl, r) in filter_rects(g, f, c) {
         out.push((Hit::Filter(fl), r));
@@ -1264,38 +1308,46 @@ fn clean_rects(g: &Shared, f: &Fonts, c: &CleanView, v: &View, b: f32) -> Vec<(H
                 if row.can_review {
                     out.push((
                         Hit::Clean(row.index),
-                        (X0 + 24.0, top, X1 + 8.0, top + CLEAN_ROW),
+                        (X0 + 24.0, top, x1(vw) + 8.0, top + CLEAN_ROW),
                     ));
                 }
             }
-            Entry::Bin => out.push((Hit::BinOpen, extra_button(g, f, "Open", top))),
-            Entry::System => out.push((Hit::Settings, extra_button(g, f, "Settings", top))),
+            Entry::Bin => out.push((Hit::BinOpen, extra_button(g, f, "Open", top, vw))),
+            Entry::System => out.push((Hit::Settings, extra_button(g, f, "Settings", top, vw))),
             _ => {}
         }
     }
-    out.extend(sel_bar_rects(g, f, b, false, primary_w(g, f, &v.motion)));
+    out.extend(sel_bar_rects(
+        g,
+        f,
+        b,
+        false,
+        primary_w(g, f, &v.motion),
+        vw,
+    ));
     out
 }
 
 fn review_rects(r: &ReviewView, g: &Shared, f: &Fonts, v: &View, b: f32) -> Vec<(Hit, Rect)> {
+    let vw = v.w;
     let mut out = vec![
         (Hit::Back, (X0, 16.0, X0 + 28.0, 44.0)),
-        (Hit::ReviewFolder, (X1 - 28.0, 16.0, X1, 44.0)),
+        (Hit::ReviewFolder, (x1(vw) - 28.0, 16.0, x1(vw), 44.0)),
     ];
     let aw = g.text_width(if r.all { "Select none" } else { "Select all" }, &f.small) + 12.0;
-    out.push((Hit::SelectAll, (X1 - aw, 50.0, X1, 70.0)));
+    out.push((Hit::SelectAll, (x1(vw) - aw, 50.0, x1(vw), 70.0)));
     for (k, i) in (r.first..r.len.min(r.first + review_rows(b))).enumerate() {
         let top = REVIEW_TOP + k as f32 * FILE_ROW;
-        out.push((Hit::File(i), (X0 - 8.0, top, X1 + 8.0, top + ROW)));
+        out.push((Hit::File(i), (X0 - 8.0, top, x1(vw) + 8.0, top + ROW)));
     }
-    out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion)));
+    out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion), vw));
     out
 }
 
 /// "Select all extra copies" in the filter-chip style, right aligned under the header.
-fn dupes_all_rect(g: &Shared, f: &Fonts, d: &DupesView) -> Rect {
+fn dupes_all_rect(g: &Shared, f: &Fonts, d: &DupesView, vw: f32) -> Rect {
     let w = g.text_width(dupes_all_label(d), &f.small_medium) + 24.0;
-    (X1 - w, 56.0, X1, 84.0)
+    (x1(vw) - w, 56.0, x1(vw), 84.0)
 }
 
 fn dupes_all_label(d: &DupesView) -> &'static str {
@@ -1308,9 +1360,9 @@ fn dupes_all_label(d: &DupesView) -> &'static str {
 
 /// The card that holds the estimate, the running check or the empty result: its rect, the
 /// text's left edge and width.
-fn dupes_block(g: &Shared, f: &Fonts, d: &DupesView) -> Option<(Rect, f32, f32)> {
+fn dupes_block(g: &Shared, f: &Fonts, d: &DupesView, vw: f32) -> Option<(Rect, f32, f32)> {
     let tx = X0 + 56.0;
-    let tw = X1 - 16.0 - tx;
+    let tw = x1(vw) - 16.0 - tx;
     let y1 = DUPES_TOP + 16.0 + 24.0;
     let bottom = match &d.body {
         DupesBody::Offer {
@@ -1328,12 +1380,12 @@ fn dupes_block(g: &Shared, f: &Fonts, d: &DupesView) -> Option<(Rect, f32, f32)>
         DupesBody::Empty { body, .. } => y1 + wrap_h(g, body, &f.small_wrap, tw) + 16.0,
         DupesBody::Groups(_) => return None,
     };
-    Some(((X0, DUPES_TOP, X1, bottom), tx, tw))
+    Some(((X0, DUPES_TOP, x1(vw), bottom), tx, tw))
 }
 
 /// Check now (under the estimate) or Stop (top right of the running card).
-fn dupes_block_button(g: &Shared, f: &Fonts, d: &DupesView) -> Option<(Hit, Rect)> {
-    let (r, tx, _) = dupes_block(g, f, d)?;
+fn dupes_block_button(g: &Shared, f: &Fonts, d: &DupesView, vw: f32) -> Option<(Hit, Rect)> {
+    let (r, tx, _) = dupes_block(g, f, d, vw)?;
     match &d.body {
         DupesBody::Offer { check: true, .. } => {
             let w = quiet_w(g, f, "Check now", true);
@@ -1351,17 +1403,18 @@ fn dupes_block_button(g: &Shared, f: &Fonts, d: &DupesView) -> Option<(Hit, Rect
 }
 
 /// A copy's keep column: "Keep" on the keeper, "Keep this" on the others.
-fn keep_rect(top: f32) -> Rect {
-    let r = X1 - DATE_W - 12.0;
+fn keep_rect(top: f32, vw: f32) -> Rect {
+    let r = x1(vw) - DATE_W - 12.0;
     let cy = top + ROW / 2.0;
     (r - KEEP_W, cy - 11.0, r, cy + 11.0)
 }
 
 fn dupes_rects(g: &Shared, f: &Fonts, d: &DupesView, v: &View, b: f32) -> Vec<(Hit, Rect)> {
+    let vw = v.w;
     let mut out = vec![(Hit::Back, (X0, 14.0, X0 + 28.0, 42.0))];
-    out.extend(dupes_block_button(g, f, d));
+    out.extend(dupes_block_button(g, f, d, vw));
     if let DupesBody::Groups(groups) = &d.body {
-        out.push((Hit::DupesAll, dupes_all_rect(g, f, d)));
+        out.push((Hit::DupesAll, dupes_all_rect(g, f, d, vw)));
         for (e, top) in dupe_visible(d, b) {
             if let DupeEntry::Row(gi, k) = e {
                 let Some(row) = groups[gi].rows.get(k) else {
@@ -1370,12 +1423,15 @@ fn dupes_rects(g: &Shared, f: &Fonts, d: &DupesView, v: &View, b: f32) -> Vec<(H
                 if !row.keep {
                     out.push((Hit::DupeCheck(gi, k), (X0 - 8.0, top, X0 + 24.0, top + ROW)));
                 }
-                out.push((Hit::DupeKeep(gi, k), keep_rect(top)));
-                out.push((Hit::DupeRow(gi, k), (X0 - 8.0, top, X1 + 8.0, top + ROW)));
+                out.push((Hit::DupeKeep(gi, k), keep_rect(top, vw)));
+                out.push((
+                    Hit::DupeRow(gi, k),
+                    (X0 - 8.0, top, x1(vw) + 8.0, top + ROW),
+                ));
             }
         }
     }
-    out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion)));
+    out.extend(sel_bar_rects(g, f, b, true, primary_w(g, f, &v.motion), vw));
     out
 }
 
@@ -1400,6 +1456,7 @@ fn sheet_buttons(g: &Shared, f: &Fonts, s: Rect, c: &ConfirmView) -> [(Hit, Rect
 
 /// The hit rects under the title band, in its coordinates (y from the band's bottom edge).
 fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
+    let vw = v.w;
     if let Some(c) = &v.confirm {
         let s = sheet_rect(g, f, v, c);
         let mut out: Vec<(Hit, Rect)> = sheet_buttons(g, f, s, c).to_vec();
@@ -1408,7 +1465,7 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
     }
     let b = body_h(g, f, v);
     let mut out = match &v.screen {
-        Screen::Start(d, _) => start_rects(g, f, d.len()),
+        Screen::Start(d, _) => start_rects(g, f, d.len(), vw),
         Screen::Results(r) => results_rects(g, f, r, v, b),
         Screen::Clean(c) => clean_rects(g, f, c, v, b),
         Screen::Review(r) => review_rects(r, g, f, v, b),
@@ -1428,15 +1485,25 @@ fn layout(g: &Shared, f: &Fonts, v: &View) -> Vec<(Hit, Rect)> {
 }
 
 /// The title band's close button, in window coordinates.
-fn close_rect() -> Rect {
-    (W - 8.0 - 28.0, 8.0, W - 8.0, 36.0)
+fn close_rect(vw: f32) -> Rect {
+    (vw - 8.0 - 28.0, 8.0, vw - 8.0, 36.0)
+}
+
+/// Maximize / restore, just left of close.
+fn max_rect(vw: f32) -> Rect {
+    let c = close_rect(vw);
+    (c.0 - 4.0 - 28.0, c.1, c.0 - 4.0, c.3)
 }
 
 /// What is under (x, y) in window coordinates. The band's empty part is None (it drags the
 /// window); while the confirm sheet is up, only its buttons answer.
 pub fn hit(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Hit> {
-    if v.confirm.is_none() && inside(&close_rect(), x, y) {
+    let vw = v.w;
+    if v.confirm.is_none() && inside(&close_rect(vw), x, y) {
         return Some(Hit::Close);
+    }
+    if v.confirm.is_none() && inside(&max_rect(vw), x, y) {
+        return Some(Hit::Max);
     }
     if y < TOP {
         return None;
@@ -1832,8 +1899,9 @@ fn draw_sel_bar(
     open: bool,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let top = bar_top(b);
-    hairline(dc, t, 0.0, W, top);
+    hairline(dc, t, 0.0, vw, top);
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
     let cy = top + BAR_H / 2.0;
     match selected {
@@ -1864,7 +1932,7 @@ fn draw_sel_bar(
     }
     let pw = primary_w(g, f, &v.motion);
     let any = selected.is_some();
-    for (h, r) in sel_bar_rects(g, f, b, open, pw) {
+    for (h, r) in sel_bar_rects(g, f, b, open, pw, vw) {
         match h {
             Hit::SelRecycle => {
                 let enabled = any && can_recycle;
@@ -1938,6 +2006,7 @@ fn draw_start(
     v: &View,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
     text(
         dc,
@@ -1954,7 +2023,7 @@ fn draw_start(
         dc,
         "What is taking the room",
         &f.small,
-        X1,
+        x1(vw),
         17.0,
         16.0,
         &muted,
@@ -1965,13 +2034,13 @@ fn draw_start(
         if on {
             fill_rr(
                 dc,
-                (X0 - 8.0, top, X1 + 8.0, top + 56.0),
+                (X0 - 8.0, top, x1(vw) + 8.0, top + 56.0),
                 10.0,
                 hover_fill(t),
             );
         }
         if v.kb && v.cursor == Some(i) {
-            focus_ring(dc, t, (X0 - 8.0, top, X1 + 8.0, top + 56.0), 10.0);
+            focus_ring(dc, t, (X0 - 8.0, top, x1(vw) + 8.0, top + 56.0), 10.0);
         }
         chip(
             g,
@@ -1991,7 +2060,7 @@ fn draw_start(
             &f.title,
             X0 + 44.0,
             top + 6.0,
-            X1 - X0 - 56.0 - bw,
+            x1(vw) - X0 - 56.0 - bw,
             18.0,
             &ink,
         );
@@ -2010,7 +2079,7 @@ fn draw_start(
             t,
             X0 + 44.0,
             top + 45.0,
-            X1 - X0 - 56.0 - bw - 12.0,
+            x1(vw) - X0 - 56.0 - bw - 12.0,
             4.0,
             d.used,
         );
@@ -2019,7 +2088,7 @@ fn draw_start(
             dc,
             t,
             f,
-            (X1 - bw, top + 14.0, X1, top + 42.0),
+            (x1(vw) - bw, top + 14.0, x1(vw), top + 42.0),
             "Scan",
             None,
             on,
@@ -2029,7 +2098,7 @@ fn draw_start(
     // "Also find duplicate files", off by default, with what it costs under it.
     let n = drives.len();
     let o = option_top(n);
-    let row = (X0 - 8.0, o, X1 + 8.0, o + OPTION_H);
+    let row = (X0 - 8.0, o, x1(vw) + 8.0, o + OPTION_H);
     if hover == Some(Hit::DupesOption) {
         fill_rr(dc, row, 10.0, hover_fill(t));
     }
@@ -2054,11 +2123,11 @@ fn draw_start(
         &f.small,
         X0 + 28.0,
         o + 22.0,
-        X1 - X0 - 28.0,
+        x1(vw) - X0 - 28.0,
         16.0,
         &muted,
     );
-    for (h, r) in start_rects(g, f, drives.len()).into_iter().take(2) {
+    for (h, r) in start_rects(g, f, drives.len(), vw).into_iter().take(2) {
         let (label, icon) = if h == Hit::ScanFolder {
             ("Scan a folder", Icon::Folder)
         } else {
@@ -2078,6 +2147,7 @@ fn draw_head(
     v: &View,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
     // Drive chip: a 32 px pill with a 24 px round icon chip, the name and the scan stamp.
     let cr = chip_rect(g, f, r);
@@ -2126,7 +2196,7 @@ fn draw_head(
         32.0,
         &muted,
     );
-    for (h, rect) in header_buttons(g, f, r.scanning) {
+    for (h, rect) in header_buttons(g, f, r.scanning, vw) {
         let (label, icon) = match h {
             Hit::Stop => ("Stop", Icon::Stop),
             Hit::ScanAgain => ("Scan again", Icon::Refresh),
@@ -2150,7 +2220,7 @@ fn draw_head(
     let base = HEAD_Y + baseline_in(g, &r.big, &f.big, 30.0);
     let sy = base - baseline_in(g, &r.of, &f.body, 18.0);
     text(dc, &r.of, &f.body, X0 + bw + 8.0, sy, 300.0, 18.0, &muted);
-    right_text(g, dc, &r.right, &f.body, X1, sy, 18.0, &muted);
+    right_text(g, dc, &r.right, &f.body, x1(vw), sy, 18.0, &muted);
     // Capacity bar, by top-level folder.
     let lit = |i: usize| -> f32 {
         let on = match v.motion.focus {
@@ -2164,7 +2234,7 @@ fn draw_head(
             1.0 - 0.7 * v.motion.dim
         }
     };
-    let pieces = seg_layout(&r.segs);
+    let pieces = seg_layout(&r.segs, vw);
     let n = pieces.len();
     for (k, &(i, l, rr)) in pieces.iter().enumerate() {
         let rl = if k == 0 { 6.0 } else { 2.0 };
@@ -2209,7 +2279,7 @@ fn draw_head(
     let mut x = X0;
     for (i, s) in r.segs.iter().enumerate() {
         let w = 14.0 + g.text_width(&s.label, &f.small);
-        if x + w > X1 {
+        if x + w > x1(vw) {
             break;
         }
         let sw = (x, LEG_Y + 4.0, x + 8.0, LEG_Y + 12.0);
@@ -2258,9 +2328,10 @@ fn draw_toolbar(
     f: &Fonts,
     r: &ResultsView,
     hover: Option<Hit>,
+    vw: f32,
 ) {
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
-    let tabs = tabs_rects(g, f);
+    let tabs = tabs_rects(g, f, vw);
     let n = r.crumbs.len();
     let pieces = crumb_layout(g, f, r, tabs[0].1 .0 - 12.0);
     for (k, (i, x, w)) in pieces.iter().enumerate() {
@@ -2356,12 +2427,13 @@ fn draw_folder_row(
     k: usize,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let row = &r.rows[i];
     let (dy, a) = ripple(&v.motion, k);
     let top = list_top() + k as f32 * ROW + dy;
     let ink = brush(dc, with_alpha(t.text, a));
     let muted = brush(dc, with_alpha(t.muted, a));
-    let rect = (LIST_L, top, LIST_R, top + ROW);
+    let rect = (list_l(vw), top, x1(vw), top + ROW);
     let hovered = matches!(hover, Some(Hit::Row(j) | Hit::RowCheck(j)) if j == i)
         || v.motion.focus == Some(Focus::Row(i));
     let selected = r.sel == Some(i);
@@ -2374,21 +2446,21 @@ fn draw_folder_row(
         focus_ring(dc, t, rect, 8.0);
     }
     let cy = top + ROW / 2.0;
-    checkbox(g, dc, t, LIST_L + 6.0, cy, row.checked, a);
+    checkbox(g, dc, t, list_l(vw) + 6.0, cy, row.checked, a);
     square_chip(
         g,
         dc,
         t,
-        LIST_L + 32.0,
+        list_l(vw) + 32.0,
         cy,
         if row.dir { Icon::Folder } else { Icon::File },
         a,
     );
-    let (bar_l, pct_r, size_r) = row_cols();
+    let (bar_l, pct_r, size_r) = row_cols(vw);
     right_text(g, dc, &row.pct, &f.small, pct_r, top, ROW, &muted);
     right_text(g, dc, &row.size, &f.title, size_r, top, ROW, &ink);
     mini_bar(dc, t, bar_l, cy, MINI_W, row.bar, a);
-    let nx = LIST_L + 66.0;
+    let nx = list_l(vw) + 66.0;
     let room = bar_l - 10.0 - nx;
     let nw = g.text_width(&row.name, &f.title);
     let extra = if row.counting {
@@ -2416,6 +2488,7 @@ fn draw_tail_row(
     shown: usize,
     k: usize,
 ) {
+    let vw = v.w;
     let rest = &r.rows[shown..];
     if rest.is_empty() {
         return;
@@ -2424,16 +2497,25 @@ fn draw_tail_row(
     let top = list_top() + k as f32 * ROW + dy;
     let bytes: u64 = rest.iter().map(|x| x.bytes).sum();
     let pct: f64 = rest.iter().map(|x| x.pct_v).sum();
-    let (bar_l, pct_r, size_r) = row_cols();
+    let (bar_l, pct_r, size_r) = row_cols(vw);
     let cy = top + ROW / 2.0;
     let muted = brush(dc, with_alpha(t.muted, a));
-    square_chip(g, dc, t, LIST_L + 32.0, cy, Icon::More, a);
+    square_chip(g, dc, t, list_l(vw) + 32.0, cy, Icon::More, a);
     let more = if rest.len() == 1 {
         "1 more item".to_string()
     } else {
         format!("{} more items", rest.len())
     };
-    text(dc, &more, &f.body, LIST_L + 66.0, top, 200.0, ROW, &muted);
+    text(
+        dc,
+        &more,
+        &f.body,
+        list_l(vw) + 66.0,
+        top,
+        200.0,
+        ROW,
+        &muted,
+    );
     right_text(g, dc, &pct_label(pct), &f.small, pct_r, top, ROW, &muted);
     right_text(
         g,
@@ -2451,35 +2533,37 @@ fn draw_tail_row(
 
 /// A skeleton row while the scan has not reached it: bones with a shimmer passing over them.
 fn draw_skeleton_row(dc: &ID2D1DeviceContext, t: &Theme, v: &View, k: usize, seed: usize) {
+    let vw = v.w;
     let top = list_top() + k as f32 * ROW;
     let cy = top + ROW / 2.0;
-    let bone = |x0: f32, x1: f32| {
-        let mid = (x0 + x1) / 2.0;
+    let (ll, lr) = (list_l(vw), x1(vw));
+    let bone = |l: f32, r: f32| {
+        let mid = (l + r) / 2.0;
         let lift = v.motion.shimmer.map_or(0.0, |s| {
-            let sx = LIST_L - 120.0 + s * (LIST_R - LIST_L + 240.0);
+            let sx = ll - 120.0 + s * (lr - ll + 240.0);
             (1.0 - ((mid - sx).abs() / 120.0)).max(0.0)
         });
         fill_rr(
             dc,
-            (x0, cy - 4.0, x1, cy + 4.0),
+            (l, cy - 4.0, r, cy + 4.0),
             4.0,
             with_alpha(t.text, 0.05 + 0.04 * lift),
         );
     };
     fill_rr(
         dc,
-        (LIST_L + 6.0, cy - 8.0, LIST_L + 22.0, cy + 8.0),
+        (list_l(vw) + 6.0, cy - 8.0, list_l(vw) + 22.0, cy + 8.0),
         5.0,
         t.chip,
     );
     fill_rr(
         dc,
-        (LIST_L + 32.0, cy - 12.0, LIST_L + 56.0, cy + 12.0),
+        (list_l(vw) + 32.0, cy - 12.0, list_l(vw) + 56.0, cy + 12.0),
         7.0,
         t.chip,
     );
-    let (bar_l, pct_r, size_r) = row_cols();
-    let nx = LIST_L + 66.0;
+    let (bar_l, pct_r, size_r) = row_cols(vw);
+    let nx = list_l(vw) + 66.0;
     let name_w = (bar_l - 10.0 - nx) * [0.62, 0.48, 0.7, 0.4, 0.55, 0.34][seed % 6];
     bone(nx, nx + name_w);
     bone(bar_l, bar_l + MINI_W);
@@ -2739,11 +2823,12 @@ fn draw_strip(
     d: &Detail,
     b: f32,
     hover: Option<Hit>,
+    vw: f32,
 ) {
     let top = b - STRIP_H;
-    hairline(dc, t, 0.0, W, top);
+    hairline(dc, t, 0.0, vw, top);
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
-    let open = strip_open_rect(g, f, b);
+    let open = strip_open_rect(g, f, b, vw);
     quiet_button(
         g,
         dc,
@@ -2797,19 +2882,25 @@ fn draw_veil(
     v: &View,
     b: f32,
 ) {
+    let vw = v.w;
     let a = v.motion.veil.clamp(0.0, 1.0);
     if a <= 0.0 {
         return;
     }
     let (top, bottom) = (BODY_Y - 6.0, b - STRIP_H);
-    fill_rr(dc, (0.0, top, W, bottom), 0.0, with_alpha(t.panel, 0.6 * a));
+    fill_rr(
+        dc,
+        (0.0, top, vw, bottom),
+        0.0,
+        with_alpha(t.panel, 0.6 * a),
+    );
     let path_room = 360.0;
     let path = middle_cut(&live.path, path_room, |s| g.text_width(s, &f.body));
     let lw = g.text_width(&live.label, &f.title);
     let pw = g.text_width(&path, &f.body);
     let w = 6.0 + 28.0 + 10.0 + lw + 10.0 + pw + 16.0;
     let cy = (top + bottom) / 2.0;
-    let x = (W - w) / 2.0;
+    let x = (vw - w) / 2.0;
     let rc = (x, cy - 20.0, x + w, cy + 20.0);
     unsafe {
         // A soft shadow tucked under the pill.
@@ -2870,8 +2961,9 @@ fn draw_file_row(
     hovered: bool,
     focused: bool,
     a: f32,
+    vw: f32,
 ) {
-    let (x0, x1) = (X0 - 8.0, X1 + 8.0);
+    let (x0, x1) = (X0 - 8.0, x1(vw) + 8.0);
     let ink = brush(dc, with_alpha(t.text, a));
     let muted = brush(dc, with_alpha(t.muted, a));
     if row.checked {
@@ -2932,21 +3024,22 @@ fn draw_results(
     v: &View,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let muted = brush(dc, t.muted);
     let b = body_h(g, f, v);
     draw_head(g, dc, t, f, r, v, hover);
-    draw_toolbar(g, dc, t, f, r, hover);
+    draw_toolbar(g, dc, t, f, r, hover, vw);
     match r.tab {
         Tab::Folders => {
-            let map = map_at(b);
+            let map = map_at(b, vw);
             draw_treemap(g, dc, t, f, r, v, map);
             // Column header.
-            let (_, pct_r, size_r) = row_cols();
+            let (_, pct_r, size_r) = row_cols(vw);
             text(
                 dc,
                 "Name",
                 &f.small,
-                LIST_L + 66.0,
+                list_l(vw) + 66.0,
                 BODY_Y,
                 80.0,
                 16.0,
@@ -2970,7 +3063,7 @@ fn draw_results(
                         dc,
                         "This folder is empty",
                         &f.body,
-                        LIST_L + 8.0,
+                        list_l(vw) + 8.0,
                         list_top(),
                         260.0,
                         ROW,
@@ -2982,14 +3075,14 @@ fn draw_results(
             match (&r.live, r.scanning) {
                 (Some(live), true) => {
                     let top = b - STRIP_H;
-                    hairline(dc, t, 0.0, W, top);
+                    hairline(dc, t, 0.0, vw, top);
                     text(dc, &live.foot, &f.body, X0, top, 400.0, STRIP_H, &muted);
                     right_text(
                         g,
                         dc,
                         "Results fill in as each folder finishes",
                         &f.body,
-                        X1,
+                        x1(vw),
                         top,
                         STRIP_H,
                         &muted,
@@ -3000,7 +3093,7 @@ fn draw_results(
                 }
                 _ => {
                     if let Some(d) = &r.detail {
-                        draw_strip(g, dc, t, f, d, b, hover);
+                        draw_strip(g, dc, t, f, d, b, hover, vw);
                     }
                 }
             }
@@ -3048,12 +3141,13 @@ fn draw_results(
                     hover == Some(Hit::File(i)),
                     v.kb && v.cursor == Some(i),
                     a,
+                    vw,
                 );
             }
             draw_scroll_thumb(
                 dc,
                 t,
-                W - 4.0,
+                vw - 4.0,
                 BODY_Y,
                 n as f32 * FILE_ROW,
                 r.files.len(),
@@ -3063,7 +3157,7 @@ fn draw_results(
             draw_sel_bar(g, dc, t, f, v, b, &r.selected, r.can_recycle, true, hover);
         }
         Tab::Types => {
-            draw_type_bar(dc, t, r, X0, BODY_Y + 4.0, X1);
+            draw_type_bar(dc, t, r, X0, BODY_Y + 4.0, x1(vw));
             let top_b = r.types.iter().map(|x| x.bytes).max().unwrap_or(1).max(1);
             for (i, ty) in r.types.iter().enumerate() {
                 let (dy, a) = ripple(&v.motion, i);
@@ -3094,7 +3188,7 @@ fn draw_results(
                     ty.bytes as f32 / top_b as f32,
                     a,
                 );
-                right_text(g, dc, &ty.size, &f.title, X1 - 8.0, top, ROW, &ink_a);
+                right_text(g, dc, &ty.size, &f.title, x1(vw) - 8.0, top, ROW, &ink_a);
             }
         }
     }
@@ -3147,6 +3241,7 @@ fn draw_clean(
     v: &View,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
     let b = body_h(g, f, v);
     // Back sits on the left: the band's close button is the only cross.
@@ -3174,7 +3269,7 @@ fn draw_clean(
         &ink,
     );
     let base = 14.0 + baseline_in(g, "Safe to clean", &f.panel_title, 28.0);
-    let tx = clean_header_total_x(g, f, c);
+    let tx = clean_header_total_x(g, f, c, vw);
     clipped_text(
         g,
         dc,
@@ -3262,11 +3357,11 @@ fn draw_clean(
                 let gr = &c.groups[gi];
                 let y = top + entry_h(e) - 20.0;
                 text(dc, &gr.title, &f.small, X0, y, 300.0, 16.0, &muted_a);
-                right_text(g, dc, &gr.sub, &f.small, X1, y, 16.0, &muted_a);
+                right_text(g, dc, &gr.sub, &f.small, x1(vw), y, 16.0, &muted_a);
             }
             Entry::Row(gi, k2) => {
                 let row = &c.groups[gi].rows[k2];
-                let rect = (X0 - 8.0, top, X1 + 8.0, top + CLEAN_ROW);
+                let rect = (X0 - 8.0, top, x1(vw) + 8.0, top + CLEAN_ROW);
                 let hovered =
                     matches!(hover, Some(Hit::Clean(j) | Hit::CleanCheck(j)) if j == row.index);
                 if row.checked {
@@ -3281,8 +3376,8 @@ fn draw_clean(
                 let cy = top + CLEAN_ROW / 2.0;
                 checkbox(g, dc, t, X0, cy, row.checked, a);
                 chip(g, dc, t, X0 + 28.0 + 16.0, cy, 16.0, row.icon, false);
-                right_text(g, dc, &row.size, &f.title, X1, top, CLEAN_ROW, &ink_a);
-                let tag_r = X1 - SIZE_W - 12.0;
+                right_text(g, dc, &row.size, &f.title, x1(vw), top, CLEAN_ROW, &ink_a);
+                let tag_r = x1(vw) - SIZE_W - 12.0;
                 tag(g, dc, t, f, row.check_first, tag_r, cy);
                 let tx = X0 + 72.0;
                 let room = tag_r - 112.0 - 12.0 - tx;
@@ -3310,7 +3405,7 @@ fn draw_clean(
                 );
             }
             Entry::Nothing => {
-                let rc = (X0, top + 4.0, X1, top + 72.0);
+                let rc = (X0, top + 4.0, x1(vw), top + 72.0);
                 fill_rr(dc, rc, 12.0, t.raised);
                 chip(g, dc, t, X0 + 26.0, top + 28.0, 13.0, Icon::Tick, false);
                 text(
@@ -3329,13 +3424,13 @@ fn draw_clean(
                     &f.small,
                     X0 + 48.0,
                     top + 34.0,
-                    X1 - X0 - 60.0,
+                    x1(vw) - X0 - 60.0,
                     16.0,
                     &muted_a,
                 );
             }
             Entry::Extras => {
-                hairline(dc, t, X0, X1, top + 6.0);
+                hairline(dc, t, X0, x1(vw), top + 6.0);
                 text(
                     dc,
                     "Not counted above",
@@ -3375,7 +3470,7 @@ fn draw_clean(
                         Hit::Settings,
                     )
                 };
-                let br = extra_button(g, f, label, top);
+                let br = extra_button(g, f, label, top, vw);
                 quiet_button(g, dc, t, f, br, label, None, hover == Some(hit), true);
                 let tx = X0 + 72.0;
                 let mut room = br.0 - 12.0 - tx;
@@ -3413,7 +3508,7 @@ fn draw_clean(
     draw_scroll_thumb(
         dc,
         t,
-        W - 4.0,
+        vw - 4.0,
         CLEAN_TOP,
         bar_top(b) - 8.0 - CLEAN_TOP,
         n_entries,
@@ -3432,6 +3527,7 @@ fn draw_review(
     v: &View,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
     let b = body_h(g, f, v);
     icon_button(
@@ -3449,7 +3545,7 @@ fn draw_review(
         &f.panel_title,
         X0 + 38.0,
         16.0,
-        X1 - X0 - 76.0,
+        x1(vw) - X0 - 76.0,
         28.0,
         &ink,
     );
@@ -3457,7 +3553,7 @@ fn draw_review(
         g,
         dc,
         t,
-        (X1 - 28.0, 16.0, X1, 44.0),
+        (x1(vw) - 28.0, 16.0, x1(vw), 44.0),
         Icon::External,
         hover == Some(Hit::ReviewFolder),
     );
@@ -3468,7 +3564,7 @@ fn draw_review(
         dc,
         label,
         &f.small,
-        X1,
+        x1(vw),
         52.0,
         16.0,
         if hover == Some(Hit::SelectAll) {
@@ -3507,12 +3603,13 @@ fn draw_review(
             hover == Some(Hit::File(i)),
             v.kb && v.cursor == Some(i),
             a,
+            vw,
         );
     }
     draw_scroll_thumb(
         dc,
         t,
-        W - 4.0,
+        vw - 4.0,
         REVIEW_TOP,
         n as f32 * FILE_ROW,
         r.len,
@@ -3531,6 +3628,7 @@ fn draw_dupes(
     v: &View,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
     let b = body_h(g, f, v);
     // The header, as on Safe to clean: back on the left, the total on the right.
@@ -3561,7 +3659,7 @@ fn draw_dupes(
     let base = 14.0 + baseline_in(g, title, &f.panel_title, 28.0);
     let lw = g.text_width(d.total_label, &f.body);
     let totw = g.text_width(&d.total, &f.heading);
-    let tx = X1 - lw - totw;
+    let tx = x1(vw) - lw - totw;
     clipped_text(
         g,
         dc,
@@ -3588,7 +3686,7 @@ fn draw_dupes(
     // The line under it: what the check found, and select all in the filter-chip style.
     text(dc, &d.sub, &f.small, X0, 62.0, 420.0, 16.0, &muted);
     if let DupesBody::Groups(_) = &d.body {
-        let r = dupes_all_rect(g, f, d);
+        let r = dupes_all_rect(g, f, d, vw);
         if hover == Some(Hit::DupesAll) {
             fill_rr(dc, r, 14.0, hover_fill(t));
         }
@@ -3605,7 +3703,7 @@ fn draw_dupes(
         );
     }
     // Before, during and after a check with nothing to list: one card.
-    if let Some((r, tx, tw)) = dupes_block(g, f, d) {
+    if let Some((r, tx, tw)) = dupes_block(g, f, d, vw) {
         let (dy, a) = ripple(&v.motion, 0);
         let r = (r.0, r.1 + dy, r.2, r.3 + dy);
         fill_rr(dc, r, 12.0, with_alpha(t.raised, a));
@@ -3620,7 +3718,7 @@ fn draw_dupes(
             DupesBody::Groups(_) => (Icon::Layers, ""),
         };
         chip(g, dc, t, X0 + 28.0, y0 + 9.0, 14.0, icon, false);
-        let button = dupes_block_button(g, f, d);
+        let button = dupes_block_button(g, f, d, vw);
         let title_w = match &button {
             Some((Hit::DupesStop, br)) => br.0 - 12.0 - tx,
             _ => tw,
@@ -3691,18 +3789,18 @@ fn draw_dupes(
                         &f.title,
                         X0,
                         y,
-                        X1 - X0 - sw - 16.0,
+                        x1(vw) - X0 - sw - 16.0,
                         18.0,
                         &ink_a,
                     );
-                    right_text(g, dc, &gr.sub, &f.small, X1, y + 1.0, 16.0, &muted_a);
+                    right_text(g, dc, &gr.sub, &f.small, x1(vw), y + 1.0, 16.0, &muted_a);
                 }
                 DupeEntry::Row(gi, ki) => {
                     let Some(row) = groups[gi].rows.get(ki) else {
                         row_pos += 1;
                         continue;
                     };
-                    let rect = (X0 - 8.0, top, X1 + 8.0, top + ROW);
+                    let rect = (X0 - 8.0, top, x1(vw) + 8.0, top + ROW);
                     let hovered = matches!(hover, Some(Hit::DupeRow(x, y) | Hit::DupeCheck(x, y) | Hit::DupeKeep(x, y)) if (x, y) == (gi, ki));
                     let focused = v.kb && v.cursor == Some(row_pos);
                     row_pos += 1;
@@ -3718,8 +3816,8 @@ fn draw_dupes(
                     if !row.keep {
                         checkbox(g, dc, t, X0, cy, row.checked, a);
                     }
-                    right_text(g, dc, &row.date, &f.small, X1, top, ROW, &muted_a);
-                    let kr = keep_rect(top);
+                    right_text(g, dc, &row.date, &f.small, x1(vw), top, ROW, &muted_a);
+                    let kr = keep_rect(top, vw);
                     let tf = tag_font(g, f);
                     if row.keep {
                         edge_rr(dc, kr, 11.0, with_alpha(t.text, 0.4 * a), 1.0);
@@ -3750,7 +3848,7 @@ fn draw_dupes(
         draw_scroll_thumb(
             dc,
             t,
-            W - 4.0,
+            vw - 4.0,
             DUPES_TOP,
             bar_top(b) - 8.0 - DUPES_TOP,
             n_entries,
@@ -3769,9 +3867,10 @@ fn draw_cards(
     v: &View,
     hover: Option<Hit>,
 ) {
+    let vw = v.w;
     let (ink, muted) = (brush(dc, t.text), brush(dc, t.muted));
     for (i, ((top, h), c)) in card_tops(g, f, v).into_iter().zip(&v.cards).enumerate() {
-        let rc = (X0, top, X1, top + h);
+        let rc = (X0, top, x1(vw), top + h);
         fill_rr(dc, rc, 12.0, t.panel);
         edge_rr(dc, rc, 12.0, t.hair, 1.0);
         let (cx, cy) = (X0 + 24.0, top + 24.0);
@@ -3801,7 +3900,7 @@ fn draw_cards(
             &f.title,
             X0 + 48.0,
             top + 12.0,
-            X1 - X0 - 60.0,
+            x1(vw) - X0 - 60.0,
             18.0,
             &ink,
         );
@@ -3811,7 +3910,7 @@ fn draw_cards(
             &f.small_wrap,
             X0 + 48.0,
             top + 34.0,
-            X1 - X0 - 64.0,
+            x1(vw) - X0 - 64.0,
             h - 34.0,
             &muted,
         );
@@ -3995,8 +4094,16 @@ fn draw_confirm(
     focus_ring(dc, t, if c.on_move { mv } else { cancel }, 16.0);
 }
 
-/// The title band: "Disk", the close button, a hairline under them.
-fn draw_band(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, hover: Option<Hit>) {
+/// The title band: "Disk", maximize (restore) and close, a hairline under them.
+fn draw_band(
+    g: &Shared,
+    dc: &ID2D1DeviceContext,
+    t: &Theme,
+    f: &Fonts,
+    v: &View,
+    hover: Option<Hit>,
+) {
+    let vw = v.w;
     text(
         dc,
         "Disk",
@@ -4007,20 +4114,18 @@ fn draw_band(g: &Shared, dc: &ID2D1DeviceContext, t: &Theme, f: &Fonts, hover: O
         TOP,
         &brush(dc, t.text),
     );
-    let cr = close_rect();
-    if hover == Some(Hit::Close) {
-        fill_rr(dc, cr, 14.0, t.button_hover);
-    }
-    draw_icon(
+    let max_icon = if v.max { Icon::Restore } else { Icon::Maximize };
+    title_button(g, dc, t, max_rect(vw), max_icon, hover == Some(Hit::Max));
+    title_button(
         g,
         dc,
+        t,
+        close_rect(vw),
         Icon::Close,
-        (cr.0 + cr.2) / 2.0,
-        (cr.1 + cr.3) / 2.0,
-        14.0,
-        &brush(dc, t.muted),
+        hover == Some(Hit::Close),
     );
-    hairline(dc, t, 1.0, W - 1.0, TOP - 1.0);
+    let inset = if v.max { 0.0 } else { 1.0 };
+    hairline(dc, t, inset, vw - inset, TOP - 1.0);
 }
 
 fn shift(y: f32) -> windows_numerics::Matrix3x2 {
@@ -4045,9 +4150,17 @@ pub fn draw(
     hover: Option<Hit>,
 ) {
     let (w, h) = size(g, f, v);
-    window_bg(dc, t, w, h);
+    // A resized or maximized window is `room` tall to the pixel; the screen's height rounds down.
+    let h = h.max(v.room);
+    // Maximized: square corners, no edge (the window has no rounded region then).
+    let rad = if v.max { 0.0 } else { 16.0 };
+    if v.max {
+        fill_rr(dc, (0.0, 0.0, w, h), 0.0, t.panel);
+    } else {
+        window_bg(dc, t, w, h);
+    }
     let under = if v.confirm.is_some() { None } else { hover };
-    draw_band(g, dc, t, f, under);
+    draw_band(g, dc, t, f, v, under);
     unsafe { dc.SetTransform(&shift(TOP)) };
     match &v.screen {
         Screen::Start(d, dupes) => draw_start(g, dc, t, f, d, *dupes, v, under),
@@ -4061,7 +4174,7 @@ pub fn draw(
         unsafe {
             dc.SetTransform(&shift(0.0));
             dc.FillRoundedRectangle(
-                &rrect(0.0, 0.0, w, h, 16.0),
+                &rrect(0.0, 0.0, w, h, rad),
                 &brush(dc, rgba(0x000000, if t.dark { 0.5 } else { 0.32 })),
             );
             dc.SetTransform(&shift(TOP));
@@ -4084,11 +4197,11 @@ pub enum Scroll {
 
 /// (x, y) in window coordinates.
 pub fn scroll_target(g: &Shared, f: &Fonts, v: &View, x: f32, y: f32) -> Option<Scroll> {
-    let b = body_h(g, f, v);
+    let (b, vw) = (body_h(g, f, v), v.w);
     let y = y - TOP;
     match &v.screen {
         Screen::Results(r) if !r.scanning => match r.tab {
-            Tab::Folders if inside(&list_at(b), x, y) || inside(&map_at(b), x, y) => {
+            Tab::Folders if inside(&list_at(b, vw), x, y) || inside(&map_at(b, vw), x, y) => {
                 Some(Scroll::Folders)
             }
             Tab::Files if (BODY_Y - 6.0..bar_top(b)).contains(&y) => Some(Scroll::Files),
@@ -4107,10 +4220,13 @@ mod tests {
 
     #[test]
     fn the_list_and_treemap_sit_side_by_side_at_any_height() {
-        for b in [results_min(), H - TOP - 120.0, H - TOP, 1000.0] {
-            let (map, list) = (map_at(b), list_at(b));
+        for (b, vw) in [results_min(), H - TOP - 120.0, H - TOP, 1000.0]
+            .into_iter()
+            .flat_map(|b| [(b, W), (b, 1280.0), (b, 2560.0)])
+        {
+            let (map, list) = (map_at(b, vw), list_at(b, vw));
             assert!(map.2 < list.0, "the map stays left of the list");
-            assert!(list.2 <= W - X0);
+            assert!(list.2 <= vw - X0);
             assert_eq!(
                 list.3 - list.1,
                 (folder_rows(b) + 1) as f32 * ROW + 4.0,
@@ -4132,13 +4248,13 @@ mod tests {
 
     #[test]
     fn the_full_window_matches_the_frame() {
-        let b = H - TOP;
+        let (b, vw) = (H - TOP, W);
         assert_eq!(
             folder_rows(b),
             9,
             "nine folders and the tail row, as in frame 02"
         );
-        let m = map_at(b);
+        let m = map_at(b, vw);
         assert_eq!(
             (m.2 - m.0, m.3 - m.1),
             (300.0, 384.0),
@@ -4147,9 +4263,32 @@ mod tests {
         assert!(files_rows(b) > 7);
         assert!(review_rows(b) > 9);
         // disk.rs puts words only in these windows; they hold every row the lists can show.
-        assert!(FOLDER_WINDOW > folder_rows(b));
-        assert!(REVIEW_WINDOW >= review_rows(b));
-        assert!(DUPES_WINDOW as f32 * DUPE_HEAD >= bar_top(b) - DUPES_TOP);
+        for room in [480.0, H, 1400.0] {
+            let b = room.max(H) - TOP;
+            assert!(folder_window(room) > folder_rows(b));
+            assert!(review_window(room) >= review_rows(b));
+            assert!(dupes_window(room) as f32 * DUPE_HEAD >= bar_top(b) - DUPES_TOP);
+        }
+    }
+
+    #[test]
+    fn a_wider_window_shares_the_width_and_keeps_the_right_edge() {
+        let b = H - TOP;
+        for vw in [W, 1000.0, 2560.0] {
+            let (m, l) = (map_at(b, vw), list_at(b, vw));
+            assert_eq!(l.0 - m.2, 16.0, "16 px between the map and the list");
+            assert_eq!(l.2, vw - X0, "the list reaches the right margin");
+            let (_, _, size_r) = row_cols(vw);
+            assert_eq!(size_r, vw - X0 - 6.0, "sizes stay right-aligned");
+            assert_eq!(close_rect(vw).2, vw - 8.0);
+            assert!(max_rect(vw).2 < close_rect(vw).0);
+            assert_eq!(keep_rect(100.0, vw).2, vw - X0 - DATE_W - 12.0);
+        }
+        let (narrow, wide) = (map_at(b, W), map_at(b, 1512.0));
+        assert!(
+            wide.2 - wide.0 > 2.0 * (narrow.2 - narrow.0),
+            "the treemap grows with it"
+        );
     }
 
     #[test]
@@ -4163,12 +4302,13 @@ mod tests {
 
     #[test]
     fn number_columns_are_44_and_64_px_and_clear_the_name() {
-        let (bar_l, pct_r, size_r) = row_cols();
-        assert_eq!(size_r, LIST_R - 6.0);
+        let vw = W;
+        let (bar_l, pct_r, size_r) = row_cols(vw);
+        assert_eq!(size_r, x1(vw) - 6.0);
         assert_eq!(size_r - SIZE_W - 10.0, pct_r);
         assert_eq!(pct_r - PCT_W - 10.0 - MINI_W, bar_l);
         assert!(
-            bar_l - 10.0 - (LIST_L + 66.0) > 120.0,
+            bar_l - 10.0 - (list_l(vw) + 66.0) > 120.0,
             "the name keeps its room"
         );
     }
@@ -4198,10 +4338,11 @@ mod tests {
 
     #[test]
     fn capacity_segments_fill_the_bar_with_2px_gaps_and_a_4px_floor() {
+        let vw = W;
         let s = segs(&[182, 97, 52, 38, 31, 38, 38, 0]);
-        let p = seg_layout(&s);
+        let p = seg_layout(&s, vw);
         assert_eq!(p.first().unwrap().1, X0);
-        assert!((p.last().unwrap().2 - X1).abs() < 0.5, "{:?}", p.last());
+        assert!((p.last().unwrap().2 - x1(vw)).abs() < 0.5, "{:?}", p.last());
         for w in p.windows(2) {
             assert!(
                 (w[1].1 - w[0].2 - 2.0).abs() < 0.01,
@@ -4261,8 +4402,14 @@ mod tests {
 
     #[test]
     fn the_close_button_sits_in_the_band() {
-        let c = close_rect();
-        assert!(c.3 <= TOP && c.2 <= W && c.1 > 0.0);
+        let vw = W;
+        let c = close_rect(vw);
+        assert!(c.3 <= TOP && c.2 <= vw && c.1 > 0.0);
+        let m = max_rect(vw);
+        assert!(
+            m.3 <= TOP && m.2 < c.0,
+            "maximize sits in the band, left of close"
+        );
     }
 
     #[test]
@@ -4277,9 +4424,10 @@ mod tests {
 
     #[test]
     fn a_copy_row_keeps_room_for_its_path_keep_column_and_date() {
-        let k = keep_rect(100.0);
+        let vw = W;
+        let k = keep_rect(100.0, vw);
         assert!(
-            k.2 + 12.0 <= X1 - DATE_W + 0.01,
+            k.2 + 12.0 <= x1(vw) - DATE_W + 0.01,
             "the keep column clears the date"
         );
         assert!(k.0 - (X0 + 28.0) >= 400.0, "the path keeps most of the row");
@@ -4335,7 +4483,7 @@ mod tests {
         let b = H - TOP;
         let shown = dupe_visible(&d, b);
         assert!(
-            shown.len() <= DUPES_WINDOW,
+            shown.len() <= dupes_window(H),
             "the window covers every shown entry"
         );
         assert!(shown

@@ -16,15 +16,21 @@ use crate::disk_panel::{self as dp, Hit};
 use crate::gfx::Surface;
 use crate::hook::unpack;
 use crate::{
-    dial, disk, downloads, log_line, orb, panels, px, with_app, App, MSG_MOUSELEAVE, WM_APP_DISK,
+    dial, disk, downloads, frame, log_line, orb, panels, px, with_app, App, MSG_MOUSELEAVE,
+    WM_APP_DISK,
 };
 
 pub struct Win {
     pub hwnd: HWND,
     surface: Option<Surface>,
     pub open: bool,
-    /// The window height (logical px) the screen has room for, set when the window opens.
+    /// The window's width (logical px): `dp::W` when it opens, then whatever it is resized,
+    /// snapped or maximized to.
+    pub w: f32,
+    /// The window height (logical px) there is room for: from the screen when it opens, then the
+    /// window's own height once it is resized, snapped or maximized.
     pub room: f32,
+    pub max: bool,
     hover: Option<Hit>,
     /// The cursor in the window (logical px), so a redraw after new data keeps the hover right
     /// (and the treemap's label card follows it).
@@ -91,7 +97,9 @@ impl Default for Win {
             hwnd: HWND::default(),
             surface: None,
             open: false,
+            w: dp::W,
             room: dp::H,
+            max: false,
             hover: None,
             mouse: None,
             tracking: false,
@@ -105,8 +113,11 @@ impl Default for Win {
 fn room(app: &App) -> f32 {
     let wa = orb::work_area(app.hwnd);
     let tall = (wa.bottom - wa.top) as f32 / app.scale - 32.0;
-    tall.clamp(480.0, dp::H)
+    tall.clamp(MIN_ROOM, dp::H)
 }
+
+/// The least room: what a short screen opens at, and the least height a drag can make it.
+const MIN_ROOM: f32 = 480.0;
 
 /// Shows the window centred on the orb's screen, or brings it back to the front if it is open.
 pub fn show(app: &mut App) {
@@ -124,11 +135,20 @@ pub fn show(app: &mut App) {
         return;
     }
     app.disk.win.open = true;
-    app.disk.win.room = room(app);
     app.disk.win.hover = None;
     app.disk.win.mouse = None;
-    disk::prepare(app);
-    place(app, true);
+    // A window closed while maximized opens maximized again; otherwise it opens at its own size,
+    // centred on the orb's screen.
+    if frame::is_max(hwnd) {
+        sync_size(app);
+        disk::prepare(app);
+    } else {
+        app.disk.win.w = dp::W;
+        app.disk.win.room = room(app);
+        app.disk.win.max = false;
+        disk::prepare(app);
+        place(app, true);
+    }
     render(app);
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -174,10 +194,34 @@ fn place(app: &App, center: bool) {
     };
     unsafe {
         let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
-        let d = px(app, 32.0).round() as i32;
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
-        let _ = SetWindowRgn(hwnd, Some(rgn), true);
     }
+    frame::shape(hwnd, app.scale);
+}
+
+/// The panel's size from the window's (resized, snapped, maximized or restored).
+fn sync_size(app: &mut App) {
+    let hwnd = app.disk.win.hwnd;
+    let (cw, ch) = frame::client_size(hwnd);
+    let win = &mut app.disk.win;
+    win.w = cw as f32 / app.scale;
+    win.room = ch as f32 / app.scale;
+    win.max = frame::is_max(hwnd);
+}
+
+/// The window changed size from outside (a drag on an edge, a snap, maximize or restore): the
+/// treemap and the lists take the new size, and the hover follows what is now under the cursor.
+fn on_size(app: &mut App) {
+    sync_size(app);
+    frame::shape(app.disk.win.hwnd, app.scale);
+    refresh(app);
+}
+
+/// The least height the window can be dragged to: the screen's own minimum with its cards, and
+/// never under 480 (what a short screen opens at).
+pub fn min_height(app: &App) -> f32 {
+    let mut v = disk::view(app);
+    v.room = 0.0;
+    dp::size(&app.g, &app.fonts, &v).1.max(MIN_ROOM)
 }
 
 fn take_foreground(app: &App) {
@@ -196,13 +240,23 @@ fn render(app: &mut App) {
     // One view per frame: the size and the drawing both read it.
     let v = disk::view(app);
     let (lw, lh) = dp::size(&app.g, &app.fonts, &v);
-    let (w, h) = (px(app, lw).ceil() as u32, px(app, lh).ceil() as u32);
     let hwnd = app.disk.win.hwnd;
+    let (cw, ch) = frame::client_size(hwnd);
+    let (tw, th) = (px(app, lw).ceil() as i32, px(app, lh).ceil() as i32);
+    // The window follows what the screen needs (taller for a confirm sheet or more cards), unless
+    // it is maximized. Within a pixel it already is that size: a drag set it, and the room came
+    // from it (the screen's height rounds down to whole pixels).
+    let (w, h) = if app.disk.win.max || ((tw - cw).abs() <= 1 && (th - ch).abs() <= 1) {
+        (cw, ch)
+    } else {
+        place(app, false);
+        frame::client_size(hwnd)
+    };
+    let (w, h) = (w.max(1) as u32, h.max(1) as u32);
     match app.disk.win.surface.as_mut() {
         None => app.disk.win.surface = Surface::new(&app.g, hwnd, w, h, app.scale).ok(),
         Some(s) if s.w != w || s.h != h => {
             let _ = s.resize(&app.g, w, h);
-            place(app, false);
         }
         _ => {}
     }
@@ -295,16 +349,40 @@ pub unsafe extern "system" fn disk_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_GETMINMAXINFO {
+        // The App is busy while it sizes the window itself; the plain minimum does then.
+        let min_h = with_app(|app| min_height(app)).unwrap_or(MIN_ROOM);
+        return frame::nc_message(hwnd, msg, wparam, lparam, dp::W, min_h).unwrap_or_default();
+    }
+    if let Some(r) = frame::nc_message(hwnd, msg, wparam, lparam, dp::W, MIN_ROOM) {
+        return r;
+    }
     match msg {
         WM_NCHITTEST => {
-            // The title band's empty part drags the window.
+            // The edges resize; the title band's empty part drags the window (a double click on
+            // it maximizes or restores).
             let p = client_point(hwnd, lparam);
-            let caption = with_app(|app| {
+            let ht = with_app(|app| {
+                if let Some(e) = frame::edge_hit(hwnd, p, app.scale) {
+                    return e;
+                }
                 let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
-                y < dp::TOP && disk::hit(app, x, y).is_none()
+                if y < dp::TOP && disk::hit(app, x, y).is_none() {
+                    HTCAPTION
+                } else {
+                    HTCLIENT
+                }
             })
-            .unwrap_or(false);
-            return LRESULT(if caption { HTCAPTION } else { HTCLIENT } as isize);
+            .unwrap_or(HTCLIENT);
+            return LRESULT(ht as isize);
+        }
+        WM_SIZE if wparam.0 as u32 != SIZE_MINIMIZED => {
+            with_app(|app| {
+                if app.disk.win.open {
+                    on_size(app);
+                }
+            });
+            return LRESULT(0);
         }
         WM_MOUSEMOVE => {
             with_app(|app| {
@@ -410,7 +488,7 @@ pub fn make_window(hinst: HINSTANCE) -> windows::core::Result<HWND> {
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
             w!("OrbDisk"),
             w!("Orby disk"),
-            WS_POPUP,
+            frame::STYLE,
             0,
             0,
             dp::W as i32,
